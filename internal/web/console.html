@@ -1,0 +1,642 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CPA 用量管理</title>
+<style>
+:root{--bg:#f6f7f9;--panel:#fff;--text:#202124;--muted:#6b7280;--border:#e2e5ea;--accent:#2563eb;--danger:#dc2626;--ok:#16a34a}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--panel:#181b20;--text:#e6e8ec;--muted:#9aa1ab;--border:#2a2f38;--accent:#3b82f6;--danger:#f87171;--ok:#4ade80}}
+*{box-sizing:border-box}body{font:14px/1.5 system-ui,sans-serif;margin:0;color:var(--text);background:var(--bg)}
+header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--border);flex-wrap:wrap}
+header .brand{font-weight:700;font-size:15px}.muted{color:var(--muted)}
+nav{display:flex;gap:2px;flex-wrap:wrap}
+nav a{color:var(--muted);text-decoration:none;padding:6px 12px;border-radius:6px;cursor:pointer}
+nav a.active{color:var(--accent);background:rgba(37,99,235,.12);font-weight:600}
+button,input,select{font:inherit;color:inherit;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:6px 10px}
+button{cursor:pointer}button:hover{border-color:var(--accent)}button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+button.danger{color:var(--danger);border-color:var(--danger)}button.small{padding:2px 8px;font-size:12px}
+input:focus,select:focus,button:focus{outline:2px solid rgba(37,99,235,.35)}
+main{max-width:1200px;margin:0 auto;padding:16px}
+.tab{display:none}.tab.active{display:block}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:16px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px}
+.card .label{font-size:12px;color:var(--muted)}.card .value{font-size:20px;font-weight:700;margin-top:2px}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);white-space:nowrap}
+th{color:var(--muted);font-weight:600;cursor:pointer;user-select:none}
+th.sortable:hover{color:var(--accent)}
+td.num,th.num{text-align:right}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px}
+.tag.ok{background:rgba(22,163,74,.15);color:var(--ok)}.tag.bad{background:rgba(220,38,38,.15);color:var(--danger)}
+.tag.mut{background:rgba(107,114,128,.15);color:var(--muted)}
+.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+canvas{width:100%;height:300px;display:block}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:900px){.grid2{grid-template-columns:1fr}}
+form.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+label.f{display:flex;flex-direction:column;font-size:12px;color:var(--muted);gap:2px}
+label.f input,label.f select{min-width:110px}
+dialog{border:1px solid var(--border);border-radius:10px;padding:0;background:var(--panel);color:var(--text)}
+dialog .head{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--border);font-weight:600}
+dialog .body{padding:16px}dialog .foot{padding:12px 16px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end}
+pre{white-space:pre-wrap;word-break:break-all;background:var(--bg);padding:10px;border-radius:6px;font-size:12px}
+.pager{display:flex;gap:8px;align-items:center;margin-top:10px}
+.flex{display:flex;gap:8px;align-items:center}
+#login-screen{max-width:420px;margin:80px auto}
+#login-screen .panel{padding:28px}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:sp 1s linear infinite;vertical-align:-2px}
+@keyframes sp{to{transform:rotate(360deg)}}
+#toast{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:100}
+#toast div{background:var(--panel);border:1px solid var(--border);padding:10px 14px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.15)}
+#toast div.err{border-color:var(--danger);color:var(--danger)}
+.empty{color:var(--muted);text-align:center;padding:24px}
+</style>
+</head>
+<body>
+<div id="login-screen" hidden>
+  <div class="panel">
+    <h2 style="margin-top:0">CPA 用量管理</h2>
+    <p class="muted">请输入宿主管理密钥。密钥仅保存在当前会话（sessionStorage），
+      所有数据经 <code>/v0/management/plugins/cpa-usage-manager/*</code> 读取。</p>
+    <div class="flex" style="margin-top:12px">
+      <input id="mgmt-key" type="password" placeholder="管理密钥" autocomplete="off" style="flex:1">
+      <button id="login-btn" class="primary">登录</button>
+    </div>
+    <p id="login-status" class="muted"></p>
+  </div>
+</div>
+
+<div id="app" hidden>
+<header>
+  <span class="brand">CPA 用量管理</span>
+  <nav id="tabs">
+    <a data-tab="overview" class="active">概览</a>
+    <a data-tab="keys">密钥</a>
+    <a data-tab="usage">用量</a>
+    <a data-tab="pricing">价格</a>
+    <a data-tab="auth">认证额度</a>
+    <a data-tab="audit">审计</a>
+    <a data-tab="system">系统</a>
+  </nav>
+  <span style="flex:1"></span>
+  <select id="time-range">
+    <option value="today">今天</option>
+    <option value="5h">近 5 小时</option>
+    <option value="7d" selected>近 7 天</option>
+    <option value="30d">近 30 天</option>
+    <option value="month">本月</option>
+    <option value="custom">自定义</option>
+  </select>
+  <input id="from" type="datetime-local" hidden>
+  <input id="to" type="datetime-local" hidden>
+  <select id="lang"><option value="zh-CN" selected>简中</option><option value="zh-TW">繁中</option><option value="en">EN</option><option value="ru">RU</option></select>
+  <button id="refresh">刷新</button>
+  <button id="logout" class="small">退出</button>
+</header>
+
+<main>
+<div id="tab-overview" class="tab active">
+  <div class="cards" id="ov-cards"></div>
+  <div class="panel"><h3>用量趋势</h3><div class="toolbar">
+    <select id="ov-metric">
+      <option value="requests">请求数</option><option value="tokens">总 Token</option>
+      <option value="cost">费用</option>
+    </select>
+    <select id="ov-grain"><option value="minute">分钟</option><option value="hour">小时</option><option value="day" selected>日</option><option value="week">周</option><option value="month">月</option></select>
+  </div><canvas id="ov-chart" width="900" height="300"></canvas></div>
+  <div class="grid2">
+    <div class="panel"><h3>模型占比</h3><canvas id="ov-models" width="440" height="260"></canvas></div>
+    <div class="panel"><h3>按 Key 汇总</h3><div id="ov-keys"></div></div>
+  </div>
+</div>
+
+<div id="tab-keys" class="tab">
+  <div class="panel">
+    <h3>签发密钥</h3>
+    <form class="row" id="issue-form">
+      <label class="f">标签<input name="label" placeholder="可选"></label>
+      <label class="f">归属 caller<input name="caller_id" placeholder="default"></label>
+      <label class="f">总额度 ($)<input name="quota" type="number" min="0" step="0.000001" placeholder="不限"></label>
+      <label class="f">日额度 ($)<input name="daily" type="number" min="0" step="0.000001" placeholder="不限"></label>
+      <label class="f">周额度 ($)<input name="weekly" type="number" min="0" step="0.000001" placeholder="不限"></label>
+      <label class="f">月额度 ($)<input name="monthly" type="number" min="0" step="0.000001" placeholder="不限"></label>
+      <label class="f">最大并发<input name="max_conc" type="number" min="0" value="0"></label>
+      <label class="f">可用模型<input name="models" placeholder="逗号分隔，空=不限"></label>
+      <label class="f">过期时间<input name="expires" type="datetime-local"></label>
+      <button type="submit" class="primary">签发</button>
+    </form>
+    <div id="issue-result" hidden></div>
+  </div>
+  <div class="panel">
+    <h3>密钥列表</h3>
+    <div class="toolbar">
+      <input id="key-search" placeholder="搜索 kid/标签" style="width:200px">
+      <button id="key-search-btn">搜索</button>
+      <span style="flex:1"></span>
+      <span class="muted" id="key-count"></span>
+    </div>
+    <table><thead><tr>
+      <th>KID</th><th>标签</th><th>归属</th><th>状态</th>
+      <th class="num">总额度</th><th class="num">已用</th>
+      <th class="num">并发</th><th>操作</th>
+    </tr></thead><tbody id="key-rows"></tbody></table>
+    <div class="pager"><button id="key-prev" class="small">上一页</button><span id="key-page" class="muted"></span><button id="key-next" class="small">下一页</button></div>
+  </div>
+</div>
+
+<div id="tab-usage" class="tab">
+  <div class="grid2">
+    <div class="panel"><h3>按维度分组</h3>
+      <div class="toolbar"><select id="dim">
+        <option value="model">模型</option><option value="provider">提供方</option>
+        <option value="source">来源</option><option value="auth_type">认证类型</option>
+        <option value="result">结果</option><option value="key_id">Key</option>
+      </select><button id="dim-go">查询</button></div>
+      <div id="dim-table"></div>
+    </div>
+    <div class="panel"><h3>费用与价格覆盖率</h3><div id="costs"></div></div>
+  </div>
+  <div class="panel"><h3>请求明细</h3>
+    <div class="toolbar">
+      <input id="req-model" placeholder="模型" style="width:160px">
+      <input id="req-key" placeholder="Key ID" style="width:160px">
+      <button id="req-go">查询</button>
+      <span style="flex:1"></span>
+      <button id="export-csv" class="small">导出 CSV</button>
+    </div>
+    <div style="overflow-x:auto"><table><thead><tr>
+      <th>时间</th><th>Key</th><th>模型</th><th>提供方</th>
+      <th class="num">Token</th><th class="num">费用</th>
+      <th class="num">延迟 ms</th><th>结果</th>
+    </tr></thead><tbody id="req-rows"></tbody></table></div>
+    <div class="pager"><button id="req-prev" class="small">上一页</button><span id="req-page" class="muted"></span><button id="req-next" class="small">下一页</button></div>
+  </div>
+</div>
+
+<div id="tab-pricing" class="tab">
+  <div class="panel">
+    <h3>计价规则</h3>
+    <form class="row" id="pricing-form">
+      <label class="f">匹配<input name="match_kind" list="match-kinds" value="exact" style="width:80px">
+        <datalist id="match-kinds"><option value="exact"><option value="glob"><option value="regexp"></datalist></label>
+      <label class="f">模式<input name="pattern" placeholder="gpt-4o"></label>
+      <label class="f">优先级<input name="priority" type="number" value="10" style="width:70px"></label>
+      <label class="f">输入 $/M<input name="price_input" type="number" min="0" step="0.000001" value="0"></label>
+      <label class="f">输出 $/M<input name="price_output" type="number" min="0" step="0.000001" value="0"></label>
+      <label class="f">缓存读 $/M<input name="price_cache_read" type="number" min="0" step="0.000001" value="0"></label>
+      <label class="f">缓存写 $/M<input name="price_cache_creation" type="number" min="0" step="0.000001" value="0"></label>
+      <button type="submit" class="primary">保存</button>
+    </form>
+    <div class="toolbar">
+      <button id="pricing-sync">同步 models.dev</button>
+      <button id="exchange-refresh" class="small">刷新汇率</button>
+      <span class="muted" id="fx-info"></span>
+    </div>
+    <div style="overflow-x:auto"><table><thead><tr>
+      <th>匹配</th><th>模式</th><th>优先级</th><th>状态</th>
+      <th class="num">输入</th><th class="num">输出</th><th class="num">缓存读</th><th class="num">缓存写</th>
+      <th>来源</th><th>操作</th>
+    </tr></thead><tbody id="pricing-rows"></tbody></table></div>
+  </div>
+</div>
+
+<div id="tab-auth" class="tab">
+  <div class="panel">
+    <h3>OAuth 认证额度快照与本地预测</h3>
+    <div id="auth-rows" class="empty">加载中…</div>
+  </div>
+</div>
+
+<div id="tab-audit" class="tab">
+  <div class="panel"><h3>审计事件</h3>
+    <div style="overflow-x:auto"><table><thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>对象</th><th>实体</th><th>详情</th></tr></thead>
+    <tbody id="audit-rows"></tbody></table></div>
+  </div>
+</div>
+
+<div id="tab-system" class="tab">
+  <div class="cards" id="sys-cards"></div>
+  <div class="grid2">
+    <div class="panel"><h3>备份与恢复</h3>
+      <p class="muted">备份文件不含 key-peppers；恢复到新环境时必须同时带上 data_dir/key-peppers。</p>
+      <div class="flex">
+        <button id="backup-btn" class="primary">下载备份</button>
+        <label>恢复：<input type="file" id="restore-file"></label>
+        <button id="restore-btn" class="danger">恢复 (replace)</button>
+      </div>
+      <pre id="maintain-info"></pre>
+    </div>
+    <div class="panel"><h3>维护</h3>
+      <div class="flex">
+        <button id="maintain-btn">执行保留清理</button>
+        <button id="vacuum-btn">清理 + VACUUM</button>
+      </div>
+      <pre id="maintain-result"></pre>
+      <h3>重置统计</h3>
+      <p class="muted">清空逐请求明细、分钟聚合、已终结预占与 Key 计数器（审计保留）。</p>
+      <div class="flex"><input id="reset-confirm" placeholder="输入 reset 确认">
+        <button id="reset-btn" class="danger">重置</button></div>
+    </div>
+  </div>
+</div>
+</main>
+</div>
+
+<div id="toast"></div>
+
+<dialog id="dlg"><div class="head"><span id="dlg-title"></span><button class="small" id="dlg-close">✕</button></div><div class="body" id="dlg-body"></div><div class="foot"><button id="dlg-cancel">取消</button><button id="dlg-ok" class="primary">确定</button></div></dialog>
+
+<script>
+(()=>{
+const $=id=>document.getElementById(id);
+const API='/v0/management/plugins/cpa-usage-manager';
+const I18N={
+ 'zh-CN':{login:'请输入管理密钥',load:'加载中',fail:'鉴权失败',unauth:'未授权',err:'操作失败',ok:'成功',issued:'已签发',noData:'暂无数据',confirm:'确认',cancel:'取消'},
+ 'zh-TW':{login:'請輸入管理密鑰',load:'載入中',fail:'鑑權失敗',unauth:'未授權',err:'操作失敗',ok:'成功',issued:'已簽發',noData:'暫無數據',confirm:'確認',cancel:'取消'},
+ 'en':{login:'Enter management key',load:'Loading…',fail:'Auth failed',unauth:'Unauthorized',err:'Failed',ok:'OK',issued:'Issued',noData:'No data',confirm:'Confirm',cancel:'Cancel'},
+ 'ru':{login:'Введите ключ управления',load:'Загрузка…',fail:'Ошибка аутентификации',unauth:'Не авторизован',err:'Ошибка',ok:'OK',issued:'Выпущен',noData:'Нет данных',confirm:'Подтвердить',cancel:'Отмена'},
+};
+const T=i=>{const k=(I18N[$('lang').value]||I18N['zh-CN'])[i];return k||i;};
+const fmtUSD=m=>{if(m==null)return '不限';const neg=m<0;const a=Math.abs(m);const s=(Math.floor(a/1e6)+'.'+String(a%1e6).padStart(6,'0')).replace(/0+$/,'').replace(/\.$/,'');return (neg?'-$':'$')+s;};
+const fmtInt=n=>{const a=Math.abs(n);if(a>=1e9)return (n/1e9).toFixed(1)+'B';if(a>=1e6)return (n/1e6).toFixed(1)+'M';if(a>=1e3)return (n/1e3).toFixed(1)+'k';return String(n);};
+const fmtTok=n=>fmtInt(n);
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const toast=(msg,err)=>{const d=document.createElement('div');d.textContent=msg;if(err)d.className='err';$('toast').appendChild(d);setTimeout(()=>d.remove(),4000);};
+
+// ---------- API ----------
+let key=sessionStorage.getItem('cpa-management-key')||'';
+async function api(path,opts={}){
+  const h=opts.headers||{};
+  if(!opts.noAuth)h['Authorization']='Bearer '+key;
+  if(opts.body&&typeof opts.body==='string')h['Content-Type']='application/json';
+  const r=await fetch(API+path,{...opts,headers:h});
+  if(r.status===401){showLogin();throw new Error(T('unauth'));}
+  if(!r.ok){let m=T('err');try{m=(await r.json()).error||m}catch(e){}throw new Error(m);}
+  if(opts.raw)return r;
+  return r.json();
+}
+const qs=f=>Object.entries(f).filter(([,v])=>v!==''&&v!=null).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
+
+// ---------- 时间范围 ----------
+function timeRange(){
+  const v=$('time-range').value;const now=new Date();
+  if(v==='today'){const s=new Date(now);s.setHours(0,0,0,0);return {from:s.toISOString(),to:''};}
+  if(v==='5h')return {from:new Date(now-5*3600e3).toISOString(),to:''};
+  if(v==='30d')return {from:new Date(now-30*86400e3).toISOString(),to:''};
+  if(v==='month'){const s=new Date(now.getFullYear(),now.getMonth(),1);return {from:s.toISOString(),to:''};}
+  if(v==='custom'){const f=$('from').value,t=$('to').value;
+    return {from:f?new Date(f).toISOString():'',to:t?new Date(t).toISOString():''};}
+  return {from:new Date(now-7*86400e3).toISOString(),to:''}; // 7d
+}
+$('time-range').onchange=()=>{$('from').hidden=$('to').hidden=$('time-range').value!=='custom';refreshActive();};
+$('from').onchange=$('to').onchange=()=>refreshActive();
+
+// ---------- 登录 ----------
+function showLogin(){sessionStorage.removeItem('cpa-management-key');key='';$('app').hidden=true;$('login-screen').hidden=false;}
+function showApp(){ $('login-screen').hidden=true;$('app').hidden=false;loadAll();}
+$('login-btn').onclick=async()=>{
+  const k=$('mgmt-key').value.trim();if(!k)return;
+  $('login-status').textContent=T('load');try{
+    const r=await fetch(API+'/health',{headers:{Authorization:'Bearer '+k}});
+    if(!r.ok){$('login-status').textContent=T('fail');return;}
+    key=k;sessionStorage.setItem('cpa-management-key',k);showApp();
+  }catch(e){$('login-status').textContent=T('fail');}
+};
+$('mgmt-key').addEventListener('keydown',e=>{if(e.key==='Enter')$('login-btn').click();});
+$('logout').onclick=showLogin;
+
+// ---------- 页签 ----------
+let activeTab='overview';
+document.querySelectorAll('#tabs a').forEach(a=>a.onclick=()=>{
+  document.querySelectorAll('#tabs a').forEach(x=>x.classList.toggle('active',x===a));
+  document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.id==='tab-'+a.dataset.tab));
+  activeTab=a.dataset.tab;refreshActive();
+});
+function refreshActive(){ if(activeTab==='overview')loadOverview();else if(activeTab==='keys')loadKeys();else if(activeTab==='usage')loadUsage();else if(activeTab==='pricing')loadPricing();else if(activeTab==='auth')loadAuth();else if(activeTab==='audit')loadAudit();else if(activeTab==='system')loadSystem();}
+function loadAll(){loadOverview();loadKeys();loadUsage();loadPricing();loadAuth();loadAudit();loadSystem();}
+$('refresh').onclick=()=>{refreshActive();toast('已刷新');};
+
+// ---------- 概览 ----------
+async function loadOverview(){
+  try{
+    const tr=timeRange();
+    const [ov,trends,dim]=await Promise.all([
+      api('/overview'),
+      api('/trends?'+qs({grain:$('ov-grain').value,from:tr.from,to:tr.to})),
+      api('/usage/dimension?dimension=model&'+qs(tr)),
+    ]);
+    const u=ov.usage||{};
+    $('ov-cards').innerHTML=[
+      ['请求数',fmtInt(u.requests),0],['失败',fmtInt(u.failures),1],['总 Token',fmtTok(u.total_tokens),0],
+      ['费用',fmtUSD(u.cost_micro_usd),0],['输入 Token',fmtTok(u.input_tokens),0],
+      ['输出 Token',fmtTok(u.output_tokens),0],['缓存读',fmtTok(u.cache_read_tokens),0],
+      ['缓存写',fmtTok(u.cache_creation_tokens),0],
+    ].map(([l,v,b])=>`<div class="card"><div class="label">${l}</div><div class="value" ${b?'style="color:var(--danger)"':''}>${v}</div></div>`).join('');
+    drawTrends(trends);
+    drawBar('ov-models',(dim&&dim.rows?dim.rows:[]).slice(0,12),r=>r.value,r=>r.total_tokens);
+    const keysum=await api('/usage/summary?'+qs(tr));
+    $('ov-keys').innerHTML=keysum&&keysum.by_key&&keysum.by_key.length
+      ?'<table><thead><tr><th>Key</th><th class="num">请求</th><th class="num">Token</th><th class="num">费用</th></tr></thead><tbody>'+
+        keysum.by_key.slice(0,8).map(k=>`<tr><td>${esc(k.kid)}</td><td class="num">${fmtInt(k.requests)}</td><td class="num">${fmtTok(k.total_tokens)}</td><td class="num">${fmtUSD(k.cost_micro_usd)}</td></tr>`).join('')+'</tbody></table>'
+      :'<div class="empty">'+T('noData')+'</div>';
+  }catch(e){toast(e.message,true);}
+}
+$('ov-metric').onchange=$('ov-grain').onchange=()=>loadOverview();
+function drawTrends(points){
+  const c=$('ov-chart'),x=c.getContext('2d'),w=c.width,h=c.height;x.clearRect(0,0,w,h);
+  if(!points||!points.length){x.fillStyle='#9aa1ab';x.font='14px sans-serif';x.textAlign='center';x.fillText(T('noData'),w/2,h/2);return;}
+  const metric=$('ov-metric').value;
+  const keyMap={requests:'requests',tokens:'total_tokens',cost:'cost_micro_usd'};
+  const vals=points.map(p=>metric==='cost'?p.cost_micro_usd/1e6:metric==='tokens'?p.total_tokens:p.requests);
+  const max=Math.max(...vals,1);const pad=40;
+  x.strokeStyle='#e2e5ea';x.lineWidth=1;
+  for(let i=0;i<=4;i++){const y=pad+(h-2*pad)*i/4;x.beginPath();x.moveTo(pad,y);x.lineTo(w-10,y);x.stroke();
+    x.fillStyle='#9aa1ab';x.font='11px sans-serif';x.textAlign='right';x.fillText(fmtInt(max*(4-i)/4),pad-6,y+4);}
+  const n=points.length;
+  x.strokeStyle='#2563eb';x.lineWidth=2;x.beginPath();
+  points.forEach((p,i)=>{const px=pad+(w-pad-10)*i/Math.max(n-1,1),py=h-pad-(h-2*pad)*vals[i]/max;
+    i?x.lineTo(px,py):x.moveTo(px,py);});
+  x.stroke();
+  x.fillStyle='#6b7280';x.font='11px sans-serif';x.textAlign='center';
+  const step=Math.max(1,Math.floor(n/6));
+  points.forEach((p,i)=>{if(i%step)return;const px=pad+(w-pad-10)*i/Math.max(n-1,1);
+    x.fillText(new Date(p.bucket).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit'}),px,h-pad+16);});
+}
+function drawBar(canvasId,rows,labelFn,valFn){
+  const c=$(canvasId),x=c.getContext('2d'),w=c.width,h=c.height;x.clearRect(0,0,w,h);
+  if(!rows||!rows.length){x.fillStyle='#9aa1ab';x.font='14px sans-serif';x.textAlign='center';x.fillText(T('noData'),w/2,h/2);return;}
+  const vals=rows.map(valFn);const max=Math.max(...vals,1);const left=110,right=8,bottom=24,top=8;
+  const n=rows.length;const bw=Math.max(6,Math.min(26,(w-left-right)/n-4));
+  rows.forEach((r,i)=>{
+    const v=valFn(r);const bx=left+i*(bw+4);const by=h-bottom-(h-bottom-top)*v/max;
+    x.fillStyle='#2563eb';x.fillRect(bx,by,bw,h-bottom-by);
+    x.fillStyle='#6b7280';x.font='10px sans-serif';x.textAlign='right';
+    const lbl=String(labelFn(r));x.save();x.translate(left-6,by+(h-bottom-by)/2);x.rotate(-Math.PI/2);x.textAlign='right';
+    x.fillText(lbl.length>16?lbl.slice(0,15)+'…':lbl,0,0);x.restore();
+    x.textAlign='center';x.fillText(fmtInt(v),bx+bw/2,by-3);
+  });
+}
+
+// ---------- 密钥 ----------
+let keyPage=0,keyTotal=0,keyQuery='';
+$('key-search-btn').onclick=()=>{keyQuery=$('key-search').value.trim();keyPage=0;loadKeys();};
+$('key-search').addEventListener('keydown',e=>{if(e.key==='Enter')$('key-search-btn').click();});
+async function loadKeys(){
+  try{
+    const r=await api('/keys?'+qs({search:keyQuery,limit:20,offset:keyPage*20}));
+    keyTotal=r.total||0;
+    $('key-count').textContent='共 '+keyTotal+' 枚';
+    $('key-page').textContent='第 '+(keyPage+1)+' 页 / 共 '+Math.max(1,Math.ceil(keyTotal/20))+' 页';
+    $('key-prev').disabled=keyPage<=0;$('key-next').disabled=(keyPage+1)*20>=keyTotal;
+    $('key-rows').innerHTML=(r.items||[]).map(k=>{
+      const status=k.revoked_at?'<span class="tag bad">已撤销</span>':!k.enabled?'<span class="tag mut">已禁用</span>':(k.expires_at&&new Date(k.expires_at)<new Date())?'<span class="tag mut">已过期</span>':'<span class="tag ok">启用</span>';
+      const conc=k.max_concurrent_requests>0?(k.concurrent||0)+'/'+k.max_concurrent_requests:(k.concurrent||0);
+      return '<tr><td>'+esc(k.kid)+'</td><td>'+esc(k.label||'-')+'</td><td>'+esc(k.caller_id)+'</td><td>'+status+'</td>'+
+      '<td class="num">'+fmtUSD(k.quota_micro_usd)+'</td><td class="num">'+fmtUSD(k.spent_micro_usd)+'</td>'+
+      '<td class="num">'+conc+'</td><td>'+
+        '<button class="small" onclick="__keyEdit(\''+esc(k.kid)+'\')">编辑</button> '+
+        '<button class="small" onclick="__keyRotate(\''+esc(k.kid)+'\')">轮换</button> '+
+        '<button class="small" onclick="__keyReveal(\''+esc(k.kid)+'\')">查看</button> '+
+        '<button class="small danger" onclick="__keyRevoke(\''+esc(k.kid)+'\')">撤销</button> '+
+        '<button class="small danger" onclick="__keyDelete(\''+esc(k.kid)+'\')">删除</button>'+
+      '</td></tr>';
+    }).join('')||'<tr><td colspan="8" class="empty">'+T('noData')+'</td></tr>';
+  }catch(e){toast(e.message,true);}
+}
+$('key-prev').onclick=()=>{if(keyPage>0){keyPage--;loadKeys();}};
+$('key-next').onclick=()=>{if((keyPage+1)*20<keyTotal){keyPage++;loadKeys();}};
+
+$('issue-form').onsubmit=async e=>{
+  e.preventDefault();const f=new FormData(e.target);
+  const body={label:f.get('label')||'',caller_id:f.get('caller_id')||'default',
+    quota_micro_usd:f.get('quota')?Math.round(parseFloat(f.get('quota'))*1e6):null,
+    daily_micro_usd:f.get('daily')?Math.round(parseFloat(f.get('daily'))*1e6):null,
+    weekly_micro_usd:f.get('weekly')?Math.round(parseFloat(f.get('weekly'))*1e6):null,
+    monthly_micro_usd:f.get('monthly')?Math.round(parseFloat(f.get('monthly'))*1e6):null,
+    max_concurrent_requests:parseInt(f.get('max_conc'))||0,
+    allowed_models:f.get('models')?f.get('models').split(',').map(s=>s.trim()).filter(Boolean):null,
+    expires_at:f.get('expires')?new Date(f.get('expires')).toISOString():null,
+    actor:'console'};
+  try{
+    const r=await api('/keys/issue',{method:'POST',body:JSON.stringify(body)});
+    $('issue-result').hidden=false;
+    $('issue-result').innerHTML='<pre>'+T('issued')+'：\n'+esc(r.key)+'</pre>';
+    loadKeys();
+  }catch(e){toast(e.message,true);}
+};
+window.__keyEdit=kid=>{
+  openDlg('编辑密钥 '+kid,'<div class="flex">'+
+    '<label class="f">标签<input id="e-label"></label>'+
+    '<label class="f">启用<select id="e-enabled"><option value="">不改</option><option value="true">是</option><option value="false">否</option></select></label>'+
+    '<label class="f">总额度 ($)<input id="e-quota" placeholder="留空不改，null 清空"></label>'+
+    '<label class="f">最大并发<input id="e-conc" type="number" placeholder="不改"></label>'+
+    '<label class="f">可用模型<input id="e-models" placeholder="逗号分隔，null 清空"></label>'+
+  '</div>',async()=>{
+    const body={kid,actor:'console'};
+    const v=id=>$(id).value;
+    if(v('e-label')!=='')body.label=v('e-label');
+    if(v('e-enabled')!=='')body.enabled=v('e-enabled')==='true';
+    if(v('e-quota')!=='')body.quota_micro_usd=v('e-quota').toLowerCase()==='null'?null:Math.round(parseFloat(v('e-quota'))*1e6);
+    if(v('e-conc')!=='')body.max_concurrent_requests=parseInt(v('e-conc'));
+    if(v('e-models')!=='')body.allowed_models=v('e-models').toLowerCase()==='null'?null:v('e-models').split(',').map(s=>s.trim()).filter(Boolean);
+    await api('/keys/update',{method:'POST',body:JSON.stringify(body)});loadKeys();
+  });
+};
+window.__keyRotate=kid=>{
+  openDlg('轮换 '+kid,'轮换后旧 Key 立即失效，将显示新 Key 明文（仅此一次）。',async()=>{
+    const r=await api('/keys/rotate',{method:'POST',body:JSON.stringify({kid,actor:'console'})});
+    $('dlg-body').innerHTML+='<pre>新 Key：'+esc(r.key)+'</pre>';loadKeys();},true);
+};
+window.__keyReveal=kid=>{
+  openDlg('查看 '+kid,'解密密钥明文（仅当前会话）。',async()=>{
+    const r=await api('/keys/reveal',{method:'POST',body:JSON.stringify({kid,actor:'console'})});
+    $('dlg-body').innerHTML='<pre>'+esc(r.key)+'</pre>';},true);
+};
+window.__keyRevoke=kid=>{
+  openDlg('撤销 '+kid,'撤销不可逆，确认？',async()=>{
+    await api('/keys/revoke',{method:'POST',body:JSON.stringify({kid,actor:'console'})});loadKeys();},true);
+};
+window.__keyDelete=kid=>{
+  openDlg('删除 '+kid,'永久删除（保留历史用量），确认？',async()=>{
+    await api('/keys/delete',{method:'POST',body:JSON.stringify({kid,actor:'console'})});loadKeys();},true);
+};
+
+// ---------- 用量 ----------
+let reqPage=0,reqTotal=0;
+async function loadUsage(){
+  try{
+    const tr=timeRange();
+    const [dim,costs,req]=await Promise.all([
+      api('/usage/dimension?'+qs({dimension:$('dim').value,...tr})),
+      api('/costs?'+qs(tr)),
+      api('/requests?'+qs({limit:20,offset:reqPage*20,...tr,model:$('req-model').value,key_id:$('req-key').value})),
+    ]);
+    renderDim(dim);
+    $('costs').innerHTML=
+      '<div class="flex" style="margin-bottom:6px"><span>请求总数</span><b>'+fmtInt(costs.requests)+'</b></div>'+
+      '<div class="flex" style="margin-bottom:6px"><span>已计价请求</span><b>'+fmtInt(costs.priced_requests)+'</b></div>'+
+      '<div class="flex" style="margin-bottom:6px"><span>价格覆盖率</span><b>'+((costs.requests?Math.round(costs.priced_requests/costs.requests*100):0))+'%</b></div>'+
+      '<div class="flex"><span>总费用</span><b>'+fmtUSD(costs.cost_micro_usd)+'</b></div>';
+    reqTotal=req.total||0;
+    $('req-page').textContent='第 '+(reqPage+1)+' 页 / 共 '+Math.max(1,Math.ceil(reqTotal/20))+' 页';
+    $('req-prev').disabled=reqPage<=0;$('req-next').disabled=(reqPage+1)*20>=reqTotal;
+    $('req-rows').innerHTML=(req.items||[]).map(r=>'<tr>'+
+      '<td>'+new Date(r.ts).toLocaleString()+'</td><td>'+esc(r.key_id||'-')+'</td><td>'+esc(r.model||'-')+'</td>'+
+      '<td>'+esc(r.provider||'-')+'</td><td class="num">'+fmtTok(r.total_tokens)+'</td>'+
+      '<td class="num">'+fmtUSD(r.cost_micro_usd)+'</td><td class="num">'+(r.latency_ms||0)+'</td>'+
+      '<td>'+((r.result==='ok')?'<span class="tag ok">ok</span>':'<span class="tag bad">'+esc(r.result)+'</span>')+'</td></tr>').join('')
+      ||'<tr><td colspan="8" class="empty">'+T('noData')+'</td></tr>';
+  }catch(e){toast(e.message,true);}
+}
+function renderDim(dim){
+  if(!dim||!dim.rows||!dim.rows.length){$('dim-table').innerHTML='<div class="empty">'+T('noData')+'</div>';return;}
+  $('dim-table').innerHTML='<table><thead><tr><th>'+esc(dim.dimension)+'</th><th class="num">请求</th><th class="num">Token</th><th class="num">费用</th><th class="num">失败</th></tr></thead><tbody>'+
+    dim.rows.map(r=>'<tr><td>'+esc(r.value||'(空)')+'</td><td class="num">'+fmtInt(r.requests)+'</td><td class="num">'+fmtTok(r.total_tokens)+'</td><td class="num">'+fmtUSD(r.cost_micro_usd)+'</td><td class="num">'+(r.failures||0)+'</td></tr>').join('')+'</tbody></table>';
+}
+$('dim-go').onclick=()=>loadUsage();
+$('req-go').onclick=()=>{reqPage=0;loadUsage();};
+$('req-prev').onclick=()=>{if(reqPage>0){reqPage--;loadUsage();}};
+$('req-next').onclick=()=>{if((reqPage+1)*20<reqTotal){reqPage++;loadUsage();}};
+$('export-csv').onclick=async()=>{
+  const tr=timeRange();
+  try{const r=await api('/export/csv',{method:'POST',raw:true,body:JSON.stringify({kind:'requests',limit:10000,filter:tr})});
+    const blob=await r.blob();const u=URL.createObjectURL(blob);const a=document.createElement('a');
+    a.href=u;a.download='cpa-usage-manager_requests.csv';a.click();URL.revokeObjectURL(u);
+  }catch(e){toast(e.message,true);}
+};
+
+// ---------- 价格 ----------
+async function loadPricing(){
+  try{
+    const [r,fx]=await Promise.all([api('/pricing'),api('/exchange-rate')]);
+    $('fx-info').textContent=fx&&fx.usd_to_cny_micro?('USD→CNY: '+(fx.usd_to_cny_micro/1e6).toFixed(4)+' ('+(fx.source||'')+')'):'';
+    $('pricing-rows').innerHTML=(r.items||[]).map(p=>'<tr>'+
+      '<td><span class="tag mut">'+esc(p.match_kind)+'</span></td><td>'+esc(p.pattern)+'</td><td>'+p.priority+'</td>'+
+      '<td>'+((p.enabled)?'<span class="tag ok">启用</span>':'<span class="tag mut">停用</span>')+'</td>'+
+      '<td class="num">'+fmtUSD(p.price_input)+'</td><td class="num">'+fmtUSD(p.price_output)+'</td>'+
+      '<td class="num">'+fmtUSD(p.price_cache_read)+'</td><td class="num">'+fmtUSD(p.price_cache_creation)+'</td>'+
+      '<td>'+esc(p.source)+'</td>'+
+      '<td><button class="small danger" onclick="__pricingDel('+p.id+')">删除</button></td></tr>').join('')
+      ||'<tr><td colspan="10" class="empty">'+T('noData')+'</td></tr>';
+  }catch(e){toast(e.message,true);}
+}
+window.__pricingDel=id=>{
+  openDlg('删除计价规则 #'+id,'确认删除？',async()=>{
+    await api('/pricing/delete',{method:'POST',body:JSON.stringify({id,actor:'console'})});loadPricing();},true);
+};
+$('pricing-form').onsubmit=async e=>{
+  e.preventDefault();const f=new FormData(e.target);
+  const num=name=>{const v=f.get(name);return v?Math.round(parseFloat(v)*1e6):0;};
+  const body={match_kind:f.get('match_kind'),pattern:f.get('pattern')||'*',priority:parseInt(f.get('priority'))||0,
+    price_input:num('price_input'),price_output:num('price_output'),
+    price_cache_read:num('price_cache_read'),price_cache_creation:num('price_cache_creation'),
+    accounting_mode:'default',billing_mode:'token',per_image_micro_usd:0,source:'manual',enabled:true,actor:'console'};
+  try{await api('/pricing',{method:'POST',body:JSON.stringify(body)});e.target.reset();loadPricing();}catch(e){toast(e.message,true);}
+};
+$('pricing-sync').onclick=async()=>{
+  try{const r=await api('/pricing/sync',{method:'POST',body:JSON.stringify({actor:'console'})});
+    toast('models.dev 同步完成：应用 '+r.applied+'，跳过 '+r.skipped+'，移除 '+r.removed);loadPricing();
+  }catch(e){toast(e.message,true);}
+};
+$('exchange-refresh').onclick=async()=>{
+  try{await api('/exchange-rate',{method:'POST'});loadPricing();}catch(e){toast(e.message,true);}
+};
+
+// ---------- 认证额度 ----------
+async function loadAuth(){
+  try{
+    const r=await api('/auth-quotas');
+    const items=r.items||[];
+    if(!items.length){$('auth-rows').innerHTML='<div class="empty">'+T('noData')+'</div>';return;}
+    $('auth-rows').className='';
+    $('auth-rows').innerHTML='<table><thead><tr><th>提供方</th><th>账号</th><th>状态</th><th>抓取时间</th><th>窗口</th></tr></thead><tbody>'+
+      items.map(a=>'<tr><td>'+esc(a.provider)+'</td><td>'+esc(a.auth_id)+'</td>'+
+        '<td><span class="tag '+(a.status==='ok'?'ok':'mut')+'">'+esc(a.status||'unknown')+'</span></td>'+
+        '<td>'+(a.fetched_at?new Date(a.fetched_at).toLocaleString():'-')+'</td>'+
+        '<td>'+((a.windows||[]).map(w=>esc(w.window_id)+': '+fmtInt(w.observed)).join('<br>')||'-')+'</td></tr>').join('')+'</tbody></table>';
+  }catch(e){toast(e.message,true);}
+}
+
+// ---------- 审计 ----------
+async function loadAudit(){
+  try{
+    const r=await api('/audit?limit=100');
+    $('audit-rows').innerHTML=(r||[]).map(e=>'<tr>'+
+      '<td>'+new Date(e.ts).toLocaleString()+'</td><td>'+esc(e.actor||'-')+'</td>'+
+      '<td><span class="tag mut">'+esc(e.action)+'</span></td><td>'+esc(e.entity_type)+'</td>'+
+      '<td>'+esc(e.entity_id)+'</td><td style="white-space:normal;max-width:360px"><pre style="margin:0">'+esc(JSON.stringify(e.detail||{}))+'</pre></td></tr>').join('')
+      ||'<tr><td colspan="6" class="empty">'+T('noData')+'</td></tr>';
+  }catch(e){toast(e.message,true);}
+}
+
+// ---------- 系统 ----------
+async function loadSystem(){
+  try{
+    const h=await api('/health');
+    const s=h.stats||{};
+    $('sys-cards').innerHTML=[
+      ['库文件',fmtInt(s.file_bytes||0)+' B'],['请求',fmtInt(s.requests||0)],
+      ['聚合行',fmtInt(s.rollups||0)],['Key',fmtInt(s.keys||0)],
+      ['Caller',fmtInt(s.callers||0)],['计价规则',fmtInt(s.pricing_rules||0)],
+      ['审计',fmtInt(s.audit_events||0)],['在途预占',fmtInt(s.held_reservations||0)],
+    ].map(([l,v])=>'<div class="card"><div class="label">'+l+'</div><div class="value">'+v+'</div></div>').join('');
+    $('maintain-info').textContent='schema v'+(s.schema_version||'-')+' · 可写:'+(s.writable?'是':'否');
+  }catch(e){toast(e.message,true);}
+}
+$('backup-btn').onclick=async()=>{
+  try{const r=await api('/backup',{method:'GET',raw:true});
+    const blob=await r.blob();const u=URL.createObjectURL(blob);const a=document.createElement('a');
+    a.href=u;a.download='cpa-usage-manager-backup.db';a.click();URL.revokeObjectURL(u);
+  }catch(e){toast(e.message,true);}
+};
+$('restore-btn').onclick=async()=>{
+  const f=$('restore-file').files[0];if(!f){toast('请先选择备份文件',true);return;}
+  openDlg('恢复数据库','恢复将用备份文件替换当前库，确认继续？',async()=>{
+    const r=await fetch(API+'/restore',{method:'POST',headers:{Authorization:'Bearer '+key,'X-Confirm-Restore':'replace'},body:f});
+    if(!r.ok){const e=await r.json();throw new Error(e.error||T('err'));}
+    toast(T('ok'));loadSystem();
+  },true);
+};
+$('maintain-btn').onclick=async()=>{
+  try{const r=await api('/maintain',{method:'POST',body:JSON.stringify({vacuum:false,actor:'console'})});
+    $('maintain-result').textContent='清理完成：请求 '+r.requests+'，聚合 '+r.rollups+'，预占 '+r.reservations;
+  }catch(e){toast(e.message,true);}
+};
+$('vacuum-btn').onclick=async()=>{
+  try{const r=await api('/maintain',{method:'POST',body:JSON.stringify({vacuum:true,actor:'console'})});
+    $('maintain-result').textContent='清理 + VACUUM 完成：请求 '+r.requests+'，聚合 '+r.rollups;
+  }catch(e){toast(e.message,true);}
+};
+$('reset-btn').onclick=async()=>{
+  if($('reset-confirm').value!=='reset'){toast('请在输入框输入 reset',true);return;}
+  openDlg('重置统计','将清空统计（Key/计价规则保留，审计保留），确认？',async()=>{
+    const r=await api('/reset',{method:'POST',body:JSON.stringify({confirm:'reset',actor:'console'})});
+    toast('重置完成：请求 '+r.requests+'，聚合 '+r.rollups);loadSystem();
+  },true);
+};
+
+// ---------- 对话框 ----------
+let dlgOk=null;
+function openDlg(title,html,onOk,danger){
+  $('dlg-title').textContent=title;$('dlg-body').innerHTML=html;
+  dlgOk=onOk;$('dlg-ok').className='primary'+(danger?' danger':'');
+  $('dlg-ok').onclick=async()=>{if(!dlgOk)return;$('dlg-ok').disabled=true;
+    try{await dlgOk();$('dlg').close();}catch(e){toast(e.message,true);}$('dlg-ok').disabled=false;};
+  $('dlg-cancel').onclick=()=>$('dlg').close();
+  $('dlg-close').onclick=()=>$('dlg').close();
+  $('dlg').showModal();
+}
+
+// ---------- 语言 ----------
+$('lang').onchange=()=>{localStorage.setItem('cpa-lang',$('lang').value);refreshActive();};
+
+// ---------- 启动 ----------
+(function init(){
+  $('lang').value=localStorage.getItem('cpa-lang')||'zh-CN';
+  if(key)showApp();else showLogin();
+})();
+})();
+</script>
+</body>
+</html>

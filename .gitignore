@@ -1,0 +1,10 @@
+# 构建产物（c-shared 动态库 + 生成的 C 头文件）
+cpa-usage-manager.so
+cpa-usage-manager.dll
+cpa-usage-manager.dylib
+cpa-usage-manager.h
+
+# 冒烟/临时文件
+abi-smoke
+abi-smoke.exe
+*.tmp

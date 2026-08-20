@@ -1,0 +1,324 @@
+# cpa-usage-manager 设计文档
+
+面向 CLIProxyAPI 的**全新插件**，吸取 `cap-token-usage-tracker`（token 用量统计）与 `credit-manager`（插件 Key 额度管理）两插件的能力与经验，**从头重新编写**为一个内聚的单一插件，不做代码合并，也不保留其「普通模式/完整模式」双页面与会话令牌体系。
+
+- 插件 ID：`cpa-usage-manager`（宿主按动态库文件名派生 ID）
+- Go module：`github.com/drowsylazy/cpa-usage-manager`
+- 定位：**以插件 Key（`cum-...`）额度管理为核心**，单一管理面板（`/console`）展示用量/额度/价格/审计
+- 默认行为：`quota.enabled=true`，接管前端鉴权；可关闭退回纯统计模式
+- **无公开页面、无会话令牌**：全部数据仅通过宿主管理密钥访问
+
+---
+
+## 1. 能力清单
+
+### 1.1 额度管理（核心）
+
+- 签发/管理 `cum-<kid>-<secret>` 插件 Key：总/日/周/月额度（micro-USD）、最大并发、可用模型、标签、归属（caller）、禁用/启用/撤销/轮换/删除
+- 请求前**严格预占**（保守 Token 上限 × 计价 → 原子扣占），余额不足 fail-closed 拒绝
+- 按实际 usage **结算**（流式/非流式、多协议：OpenAI/Claude/Gemini/Responses 等），缺失 usage 有兜底策略
+- 周期额度按 UTC 自然周期（日/周一起点周一/月）；并发按在途未结请求计数
+- 明文仅签发时返回一次；数据库只存 HMAC 哈希 + 可恢复的 AES-GCM 密文 + pepper ID + 指纹
+- pepper 体系（环境变量 / `key-peppers` 文件 / 自动生成，支持轮换）
+- 审计事件、OAuth 认证额度快照 + 本地用量预测
+
+### 1.2 用量统计
+
+- 逐请求元数据 + 分钟级聚合（趋势、维度分组、请求明细）
+- 维度：模型/提供方/来源/认证账号/认证类型/服务层级/推理强度/失败状态（认证字段做凭据清洗后保存）
+- 指标：请求数、失败数、输入/输出/推理/缓存 Token、延迟、TTFT、生成时长、TPS、缓存命中率
+- 时间范围：今天/近5小时/近7天/近30天/本月/自定义；趋势粒度 分钟/时/日/周/月 + 缩放平移
+- 模型占比、费用趋势、模型效率、按 Key 筛选的用量视图
+- 表格分页/排序/列偏好持久化、USD/CNY 汇率、全值/k/m 单位切换
+- CSV/PNG 导出、数据库备份恢复、模型价格簿 + models.dev 同步、gzip 压缩、多语言/主题跟随
+
+### 1.3 明确不做的事（简化边界）
+
+- **无公开只读仪表盘**、**无 Key 自助查询页**：全部数据必须经宿主管理密钥
+- **无「普通/完整模式」双前端**、**无 `X-Full-Mode-Session` 会话体系**：面板直接用宿主管理密钥调用管理接口
+- **不存上游 API Key 密文**：不提供上游 Key 的明文回显/标签功能；只保存清洗后的认证账号展示信息用于分组
+
+---
+
+## 2. 总体架构
+
+```
+┌─ main package ──────────────────────────────────────────────────────┐
+│  ABI 导出（cliproxy_plugin_init / PluginCall / Free / Shutdown）     │
+│  handleMethod 调度：usage.handle / management.handle / auth / exec   │
+├─────────────────────────────────────────────────────────────────────┤
+│  internal/config   统一配置解析（内联 YAML + config_file + 环境变量） │
+├─────────────────────────────────────────────────────────────────────┤
+│  internal/service  核心服务层（运行时持有，可安全重配/热切换）          │
+│   ├─ keys/pepper 签发·校验·加密        ├─ quota 预占/结算/审计        │
+│   ├─ usage 记录入库 + 聚合             ├─ pricing 计价/规则/models.dev │
+│   ├─ analytics 统计查询（趋势/维度/明细）└─ backup/restore/export      │
+├─────────────────────────────────────────────────────────────────────┤
+│  internal/store    单一 SQLite（WAL + 单写者 + 跨进程锁 + handover）  │
+│  internal/money    整数 micro-USD 算术                               │
+│  internal/usageparse  多协议 usage 解析                              │
+│  internal/fx       USD/CNY 汇率                                       │
+├─────────────────────────────────────────────────────────────────────┤
+│  internal/httpapi  路由注册（management + resource）+ 管理密钥鉴权    │
+├─────────────────────────────────────────────────────────────────────┤
+│  internal/web     单一管理 SPA（嵌入 HTML）                           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.1 请求路径（quota.enabled=true）
+
+```
+客户端  Authorization: Bearer cum-…
+  → frontend_auth.authenticate  校验 Key（pepper HMAC，常量时间比较）
+  → model.route / executor.execute(_stream)
+      预占（保守上限 × 计价，周期/并发额度原子校验，fail-closed）
+      → host.model.execute(_stream) 透明转发（宿主跳过自身避免递归）
+      → 解析 usage → 结算 + 写逐请求记录 + 写聚合 + 审计
+```
+
+### 2.2 被动统计路径（quota.enabled=false）
+
+不注册鉴权/执行器能力；仅 `usage.handle` 接收宿主用量记录入库统计。
+
+### 2.3 读路径
+
+唯一入口 `/console`（管理面板，HTML 壳不含数据）；所有数据经 `/v0/management/plugins/cpa-usage-manager/*`（宿主管理密钥鉴权）。无其他公开读取面。
+
+---
+
+## 3. 单一数据模型（SQLite）
+
+单一数据库 `cpa-usage-manager.db`（默认 `<data_dir>/cpa-usage-manager.db`），迁移版本化（`schema_migrations`）。
+
+### 3.1 核心表
+
+| 表 | 关键列 | 说明 |
+|---|---|---|
+| `callers` | id, display_name, enabled | 归属记录（组织/团队），不承载额度 |
+| `plugin_keys` | kid, key_hash, encrypted_material, pepper_id, fingerprint, principal, caller_scope, caller_id, label, enabled, revoked_at, expires_at, quota/daily/weekly/monthly_micro_usd, max_concurrent_requests, allowed_models_json, last_used_at | 签发策略与安全材料 |
+| `pricing_rules` | id, match_kind(exact/glob/regexp), pattern, priority, enabled, price_input/output/reasoning/cached/cache_read/cache_creation, accounting_mode, billing_mode, per_image_micro_usd, source(manual/models_dev), models_dev_id | 统一计价表，结算与展示共用 |
+| `reservations` | id, key_id, caller_id, model, idempotency_key, status(held/settled/released), held/settled_micro_usd, reserved_tokens, expires_at, heartbeat_at | 预占与在途 |
+| `requests` | id, key_id, caller_id, model, provider, source, auth_*, tier, result, ts, input/output/reasoning/cached/cache_read/cache_creation_tokens, total_tokens, latency_ms, ttft_ms, generation_ms, tps, thinking_intensity, cost_micro_usd, reservation_id | 逐请求记录 |
+| `usage_rollups` | bucket_minute, model, key_id, caller_id, provider, source, auth_type, tier, result, req_count, fail_count, in/out/reasoning/cached/cache_read/cache_creation_tokens, latency_sum, ttft_sum, generation_sum, tps_sum, cost_micro_usd | 分钟聚合，面板快速加载 |
+| `audit_events` | ts, actor, action, entity_type, entity_id, detail_json | 审计 |
+| `auth_quota_snapshots` | provider, auth_id, snapshot_json, fetched_at, status | OAuth 额度快照 |
+| `auth_quota_window_baselines` | provider, auth_id, window_id, cycle_key, observed/baseline | 用量预测基线 |
+| `preferences` | k, v | 面板偏好 |
+| `meta` | k, v | 汇率缓存、models.dev 同步元数据 |
+
+### 3.2 关键语义
+
+- **金额**：整数 micro-USD，各 Token 类别费用向上取整后相加；只对 Input/Output/Cache Read/Cache Creation 计价
+- **周期额度**：已结算 + 当期在途预占；日/周（周一）/月按 UTC；超额结算允许（余额可为负），后续请求 fail-closed
+- **并发额度**：未结算/未释放的在途请求数，预占事务内原子校验
+- **保留策略**：`requests` 与 `usage_rollups` 按 `retention_days` 清理；`plugin_keys`/`callers`/`pricing_rules`/`audit_events` 长期保留
+- **认证字段**：来源/auth 字段做凭据清洗（疑似 Key/Bearer 的值不原样保存），只保留可用于分组的展示信息
+- **备份/恢复**：整个数据库单文件备份；恢复需 `X-Confirm-Restore: replace`
+
+### 3.3 旧数据迁移（不做）
+
+**锁定决策：不提供从旧 credit-manager / tracker 导入数据的迁移工具。** 本插件是全新产品，不承诺与上游两插件的历史数据兼容。以下内容已明确排除在范围之外，后续任何阶段都不得实现：
+
+- 不提供 `scripts/migrate_legacy.go` 或任何等价的旧数据导入脚本
+- 不解析旧 credit-manager SQLite（keys/ledger/callers/pricing）
+- 不解析旧 tracker bbolt（聚合/价格/偏好）
+- 不迁移旧 pepper 文件，也不兼容旧 key_hash/密文格式
+- 旧数据需用户自行按新库格式重建（重新签发 Key、重配计价、重新接入后自然积累用量）
+
+> 注意：本节「不做迁移」仅针对**旧插件数据导入**。`schema_migrations` 的**版本化 schema 升级**属于存储层核心能力（见 §3.1 与 §9），始终保留。
+
+---
+
+## 4. 插件 ABI 与能力
+
+单文件 `main.go` 内联实现 C ABI（沿用两插件已验证的 ABI 结构，无 cgo 构建标签）。
+
+能力注册按 `quota.enabled` 动态计算（`reconfigure` 时重算）：
+
+| 能力 | 默认（on） | quota.enabled=false |
+|---|---|---|
+| `usage_plugin` | ✔ | ✔ |
+| `management_api` | ✔ | ✔ |
+| `frontend_auth_provider` (exclusive) | ✔ | ✘ |
+| `model_router` / `executor`（scope both，含 image/video 格式） | ✔ | ✘ |
+| `request_interceptor` / `request_lifecycle_plugin` | ✔ | ✘ |
+
+RPC schema 1–3 + 原生 ABI 1，schema 协商取 min(host, 自身)。
+
+---
+
+## 5. API 设计
+
+统一前缀 `cpa-usage-manager`。**鉴权仅一层：所有数据接口走宿主管理密钥。**
+
+- 管理路由 `/v0/management/plugins/cpa-usage-manager/*` → 宿主管理密钥
+- 资源路由 `/v0/resource/plugins/cpa-usage-manager/*` → 仅 `/console`（SPA HTML 壳，不含数据）
+
+### 5.1 管理路由
+
+```
+health                  GET   状态/版本
+overview                GET   面板总览（keys/pricing/usage 摘要）
+callers                 POST/GET  创建/列出归属
+callers/enabled         POST  启停归属
+keys                    POST  签发（明文仅此一次，Cache-Control: no-store）
+keys                    GET   列出（不含明文）
+keys/update             POST  更新标签/状态/额度/并发/可用模型
+keys/rotate             POST  轮换（旧 Key 原子失效）
+keys/revoke             POST  撤销
+keys/reveal             POST  解密可恢复密文（no-store）
+keys/delete             POST  永久删除（保留历史）
+pricing                 POST/GET  新增/更新/列出计价规则
+pricing/delete          POST  删除规则
+pricing/sync            POST  models.dev 同步（优先级/忽略后缀/显式映射）
+balance                 GET   查询 Key 剩余额度
+usage                   GET   用量流水（按 key_id/model 过滤，分页）
+usage/summary           GET   按 Key/模型汇总
+requests                GET   逐请求明细（分页/排序/筛选）
+trends                  GET   聚合趋势（按 分钟/时/日/周/月）
+costs                   GET   费用统计与价格覆盖率
+audit                   GET   审计事件
+auth-quotas             GET   OAuth 认证额度快照 + 本地预测（no-store）
+preferences             GET/POST  面板偏好
+exchange-rate           GET   USD/CNY 汇率（缓存）
+export/csv              POST  导出当前筛选为 CSV
+export/png              POST  导出当前面板为 PNG
+backup                  GET   下载数据库备份（≤64 MiB）
+restore                 POST  分段上传恢复（X-Confirm-Restore: replace）
+reset                   POST  重置统计（body {"confirm":"reset"}）
+```
+
+### 5.2 资源路由
+
+```
+/console   统一管理面板（SPA HTML 壳，侧栏菜单「CPA 用量管理」）
+```
+
+路由表在 `internal/httpapi` 集中声明 + 注册期校验唯一性。
+
+---
+
+## 6. 配置设计
+
+统一 YAML：
+
+```yaml
+data_dir: ./data/cpa-usage-manager   # 库 + pepper 文件所在目录（0700）
+database_file: cpa-usage-manager.db  # SQLite 文件名
+busy_timeout: 5s
+retention_days: 365                  # 逐请求/聚合保留天数（1-3650）
+
+quota:                               # 额度子系统（默认开启）
+  enabled: true
+  keys:
+    pepper_env: CPA_USAGE_MANAGER_KEY_PEPPERS
+    pepper_file: key-peppers
+    active_pepper_id: active
+  limits:
+    max_token_estimate: 1000000      # 单请求预占 Token 上限
+    default_output_reserve: 4096     # 无 max_tokens 时的输出预占
+    require_estimate: false
+  settlement:
+    missing_usage: settle_reserved   # settle_reserved | release
+    host_usage_wait: 1500ms          # 等待宿主 usage 回调的时间窗
+  stream:
+    max_buffer_bytes: 4194304        # 流式结算本地缓冲上限
+    stale_reservation_timeout: 2h    # 无心跳在途预占自动释放
+
+pricing:
+  unknown_policy: allow              # deny | allow | default
+  models_dev_sync:
+    enabled: true
+    provider_priority: []            # 提供方优先级
+    ignore_suffixes: []
+    model_mappings: {}
+
+response_compression: true
+response_compression_min_bytes: 1024
+```
+
+- 配置注入：宿主 `plugins.items.cpa-usage-manager.config`（内联 YAML）→ 可选 `config_file` 或环境变量 `CPA_USAGE_MANAGER_CONFIG_FILE`；内联覆盖文件，禁止嵌套递归
+- pepper 解析：环境变量优先 → 文件 → 首次启动自动生成（0600）
+
+---
+
+## 7. 前端设计（单一管理 SPA）
+
+单文件 HTML（内联 CSS/JS + echarts CDN，无前端构建链），主题/语言跟随（简中/繁中/英文/俄文）。**登录宿主管理密钥后（sessionStorage，仅当前会话），全部数据调用 `/v0/management/plugins/cpa-usage-manager/*`。**
+
+```
+┌ 顶部：品牌 · 主题/语言 · 时间范围 · 刷新 · [登录管理密钥] ┐
+├ 页签（路由 hash）─────────────────────────────────────────┤
+│ 概览      总 token/请求/费用（按 Key、模型、时间筛选）；     │
+│           趋势图（缩放平移）、模型占比、效率指标            │
+│ 密钥      签发 cum- Key（额度/并发/模型/标签/caller）；     │
+│           列表（余额/周期用量/并发占用/状态）筛选分页排序；  │
+│           更新/禁用/撤销/轮换/删除/解密查看                │
+│ 用量      维度表（模型/提供方/来源/认证账号/结果）、         │
+│           逐请求明细（分页/列偏好）、费用与价格覆盖率       │
+│ 价格      计价规则管理（exact/glob/regexp+优先级）+          │
+│           models.dev 同步 + 汇率                           │
+│ 认证额度  OAuth 快照 + 本地预测（no-store）                 │
+│ 审计      事件流                                           │
+│ 系统      备份/恢复/重置统计/导出 CSV/PNG                  │
+└───────────────────────────────────────────────────────────┘
+```
+
+- 未登录时仅显示登录界面，页面壳不含任何数据
+- 所有敏感操作（签发/解密/备份/恢复/重置）均为管理密钥鉴权，响应 `Cache-Control: no-store`
+- 无公开页、无自助页、无会话令牌
+
+---
+
+## 8. 构建与发布
+
+| 项 | 说明 |
+|---|---|
+| Go | 1.26.x，`CGO_ENABLED=1`（SQLite 用 modernc 纯 Go，CGO 仅用于 c-shared） |
+| 平台 | Linux amd64/arm64、Windows amd64、macOS arm64 |
+| 构建 | `go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=<ver>" -o cpa-usage-manager.{so,dll,dylib} .` |
+| 脚本 | `scripts/build.ps1`/`build.sh`/`deploy.ps1`（部署到 `plugins/<goos>/<goarch>/`） |
+| CI | `release.yml` 五平台矩阵，`v*` 标签正式版 / 分支推送 alpha；产物 `cpa-usage-manager_<ver>_<goos>_<goarch>.zip` + `checksums.txt` |
+| 本地验证 | `gofmt -w .`、`go vet ./...`、`go test ./...`、`go run ./scripts/smoke.go`、`scripts/abi-smoke.c` |
+
+---
+
+## 9. 测试策略
+
+| 层 | 用例 |
+|---|---|
+| store | 版本化 schema 迁移（非旧数据导入）、CRUD、配额原子性、单写者锁 + handover、保留清理 |
+| service | 签发/鉴权/轮换/撤销、预占边界（周期/并发/模型）、结算（各协议解析、缺失 usage 兜底）、审计 |
+| pricing | 规则匹配优先级、micro-USD 取整、accounting/billing 模式、models.dev 同步合并语义 |
+| analytics | 聚合正确性、趋势下采样、维度分组、逐请求分页排序 |
+| httpapi | 路由表唯一性、管理密钥鉴权矩阵、gzip、备份恢复、no-store 语义 |
+| web | `/console` 可达、主题/语言、关键交互冒烟 |
+| e2e | `smoke.go`：签发→鉴权→预占→结算→统计入库→审计 全链路；`abi-smoke.c` 校验导出符号 |
+
+---
+
+## 10. 实施阶段
+
+| 阶段 | 内容 | 出口标准 |
+|---|---|---|
+| P0 | 模块初始化、目录骨架、单一 SQLite schema + 迁移、config、money、fx、usageparse | store/config/money 测试绿 |
+| P1 | keys/pepper 服务 + quota 预占/结算 + 审计 + pricing 规则 | service 层测试绿（smoke.go 验证） |
+| P2 | usage 入库（逐请求 + 聚合 + 账本一次写入）+ analytics 查询 | 统计查询正确性测试绿 |
+| P3 | main.go ABI + 能力注册 + httpapi 全部路由 + 管理密钥鉴权 | 路由/鉴权测试绿，可被宿主加载注册 |
+| P4 | 单一管理 SPA（/console） | 手工冒烟 + web 测试 |
+| P5 | 构建脚本、CI、README、四平台产物 | 四平台可构建，CI 通过 |
+
+评审本设计后从 P0 开始。实施时不搬运两插件源码文件，按本设计重新编写；两仓库实现细节仅作参考（已克隆在本地临时目录）。
+
+---
+
+## 11. 风险与缓解
+
+| 风险 | 缓解 |
+|---|---|
+| 重写工作量大、回归风险 | 用两插件现有测试用例作为行为基准逐项移植为新测试 |
+| 单一 SQLite 承载高吞吐流式结算 + 聚合 | 单写者 + WAL + 批量 flush + 分钟聚合与逐请求分离，聚合查询不阻塞写入 |
+| 无公开/自助读取面可能影响部分使用场景 | 明确为设计决策；所有查询统一经管理面板 |
+| 计价模型统一引入行为差异 | 结算与展示共用一张表、一套取整规则；不提供旧数据迁移，历史账本一致性由用户自行重建 |
+| 独占鉴权影响存量宿主 | 文档明示；`quota.enabled=false` 提供纯统计模式 |
+| 前端单文件体积 | 沿用两插件做法，echarts CDN + 多语言按需内联 |

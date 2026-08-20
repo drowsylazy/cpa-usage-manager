@@ -1,0 +1,542 @@
+// Package service 实现 P1 的密钥、额度、计价和审计业务语义。
+package service
+
+import (
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/drowsylazy/cpa-usage-manager/internal/config"
+	"github.com/drowsylazy/cpa-usage-manager/internal/fx"
+	"github.com/drowsylazy/cpa-usage-manager/internal/money"
+	"github.com/drowsylazy/cpa-usage-manager/internal/store"
+	"github.com/drowsylazy/cpa-usage-manager/internal/usageparse"
+	"github.com/google/uuid"
+)
+
+var (
+	ErrInvalidKey          = errors.New("service: Key 格式或密钥不正确")
+	ErrQuotaExceeded       = errors.New("service: 额度不足")
+	ErrConcurrencyExceeded = errors.New("service: 并发额度不足")
+	ErrModelNotAllowed     = errors.New("service: 模型不在 Key 允许清单")
+	ErrUnknownPricing      = errors.New("service: 模型没有计价规则")
+)
+
+type Pepper struct {
+	ID    string
+	Value []byte
+}
+type PepperSet struct {
+	Active string
+	Items  map[string]Pepper
+}
+
+// LoadPeppers 读取环境变量或 key-peppers 文件。格式支持 JSON 对象、id=base64 行，
+// 以及单个原始值（使用 active_pepper_id）。缺失时自动生成并以 0600 写入文件。
+func LoadPeppers(c config.Config, lookup func(string) (string, bool)) (PepperSet, error) {
+	if lookup == nil {
+		lookup = os.LookupEnv
+	}
+	ps := PepperSet{Active: c.Quota.Keys.ActivePepperID, Items: map[string]Pepper{}}
+	raw, ok := lookup(c.Quota.Keys.PepperEnv)
+	if !ok || strings.TrimSpace(raw) == "" {
+		b, err := os.ReadFile(c.PepperFilePath())
+		if err == nil {
+			raw = string(b)
+			ok = true
+		}
+	}
+	if ok {
+		if err := parsePeppers(raw, ps.Active, &ps); err != nil {
+			return PepperSet{}, err
+		}
+	}
+	if len(ps.Items) == 0 {
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			return PepperSet{}, err
+		}
+		ps.Items[ps.Active] = Pepper{ID: ps.Active, Value: b}
+		if err := c.EnsureDataDir(); err != nil {
+			return PepperSet{}, err
+		}
+		data := base64.RawStdEncoding.EncodeToString(b) + "\n"
+		if err := os.WriteFile(c.PepperFilePath(), []byte(data), config.PepperFilePerm); err != nil {
+			return PepperSet{}, fmt.Errorf("写入 pepper 文件失败: %w", err)
+		}
+	}
+	if _, ok := ps.Items[ps.Active]; !ok {
+		return PepperSet{}, fmt.Errorf("active pepper %q 不存在", ps.Active)
+	}
+	return ps, nil
+}
+func parsePeppers(raw, active string, ps *PepperSet) error {
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "{") {
+		var m map[string]string
+		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			return err
+		}
+		for id, v := range m {
+			b, e := decodePepper(v)
+			if e != nil {
+				return e
+			}
+			ps.Items[id] = Pepper{ID: id, Value: b}
+		}
+		return nil
+	}
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		id, val := active, line
+		if i := strings.IndexByte(line, '='); i > 0 {
+			id, val = strings.TrimSpace(line[:i]), strings.TrimSpace(line[i+1:])
+		}
+		b, e := decodePepper(val)
+		if e != nil {
+			return e
+		}
+		ps.Items[id] = Pepper{ID: id, Value: b}
+	}
+	return nil
+}
+func decodePepper(v string) ([]byte, error) {
+	if b, e := base64.StdEncoding.DecodeString(v); e == nil && len(b) >= 16 {
+		return b, nil
+	}
+	if b, e := base64.RawStdEncoding.DecodeString(v); e == nil && len(b) >= 16 {
+		return b, nil
+	}
+	if b, e := hex.DecodeString(v); e == nil && len(b) >= 16 {
+		return b, nil
+	}
+	if len(v) >= 16 {
+		return []byte(v), nil
+	}
+	return nil, errors.New("pepper 长度至少 16 字节")
+}
+
+type Service struct {
+	st      *store.Store
+	cfg     config.Config
+	peppers PepperSet
+	mu      sync.RWMutex
+	// fxSvc 懒初始化，只在面板请求汇率时创建。
+	fxSvc *fx.Service
+}
+
+// Config 返回当前生效的配置副本，供 httpapi 读取展示项与开关。
+func (s *Service) Config() config.Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg
+}
+
+// Store 暴露底层存储句柄，供 httpapi 直接调用只读/维护接口。
+func (s *Service) Store() *store.Store { return s.st }
+
+func New(st *store.Store, c config.Config, ps PepperSet) *Service {
+	return &Service{st: st, cfg: c, peppers: ps}
+}
+func (s *Service) pepper(id string) (Pepper, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p, ok := s.peppers.Items[id]
+	return p, ok
+}
+
+type IssueRequest struct {
+	Principal             string       `json:"principal"`
+	CallerID              string       `json:"caller_id"`
+	CallerScope           string       `json:"caller_scope"`
+	Label                 string       `json:"label"`
+	ExpiresAt             *time.Time   `json:"expires_at"`
+	QuotaMicroUSD         *money.Micro `json:"quota_micro_usd"`
+	DailyMicroUSD         *money.Micro `json:"daily_micro_usd"`
+	WeeklyMicroUSD        *money.Micro `json:"weekly_micro_usd"`
+	MonthlyMicroUSD       *money.Micro `json:"monthly_micro_usd"`
+	MaxConcurrentRequests int          `json:"max_concurrent_requests"`
+	AllowedModels         []string     `json:"allowed_models"`
+	Actor                 string       `json:"actor"`
+}
+type IssuedKey struct {
+	Key         string
+	KID         string
+	Fingerprint string
+	Record      store.PluginKey
+}
+
+func (s *Service) IssueKey(ctx context.Context, r IssueRequest) (IssuedKey, error) {
+	if r.CallerID == "" {
+		r.CallerID = store.DefaultCallerID
+	}
+	if r.CallerScope == "" {
+		r.CallerScope = store.CallerScopeCaller
+	}
+	p := s.peppers.Items[s.peppers.Active]
+	kid := randomID(8)
+	secret := randomSecret(32)
+	plain := "cum-" + kid + "-" + secret
+	hash := hashKey(p.Value, plain)
+	enc, err := encrypt(p.Value, []byte(plain))
+	if err != nil {
+		return IssuedKey{}, err
+	}
+	rec, err := s.st.InsertKey(ctx, store.InsertKeyParams{KID: kid, KeyHash: hash, EncryptedMaterial: enc, PepperID: p.ID, Fingerprint: fingerprint(plain), Principal: r.Principal, CallerScope: r.CallerScope, CallerID: r.CallerID, Label: r.Label, ExpiresAt: r.ExpiresAt, QuotaMicroUSD: r.QuotaMicroUSD, DailyMicroUSD: r.DailyMicroUSD, WeeklyMicroUSD: r.WeeklyMicroUSD, MonthlyMicroUSD: r.MonthlyMicroUSD, MaxConcurrentRequests: r.MaxConcurrentRequests, AllowedModels: r.AllowedModels})
+	if err != nil {
+		return IssuedKey{}, err
+	}
+	_ = s.st.AppendAudit(ctx, store.AuditEvent{Actor: r.Actor, Action: "key.issue", EntityType: "key", EntityID: kid, Detail: map[string]any{"fingerprint": rec.Fingerprint}})
+	return IssuedKey{Key: plain, KID: kid, Fingerprint: rec.Fingerprint, Record: rec}, nil
+}
+
+type AuthenticatedKey struct {
+	Record    store.PluginKey
+	Plaintext string
+}
+
+func (s *Service) Authenticate(ctx context.Context, plain string) (AuthenticatedKey, error) {
+	kid, _, ok := parseKey(plain)
+	if !ok {
+		return AuthenticatedKey{}, ErrInvalidKey
+	}
+	k, err := s.st.GetKey(ctx, kid)
+	if err != nil {
+		return AuthenticatedKey{}, ErrInvalidKey
+	}
+	p, ok := s.pepper(k.PepperID)
+	if !ok {
+		return AuthenticatedKey{}, ErrInvalidKey
+	}
+	got := hashKey(p.Value, plain)
+	if subtle.ConstantTimeCompare(got, k.KeyHash) != 1 || !k.Usable(time.Now().UTC()) {
+		return AuthenticatedKey{}, ErrInvalidKey
+	}
+	_ = s.st.TouchKeyLastUsed(ctx, kid, time.Now())
+	return AuthenticatedKey{Record: k, Plaintext: plain}, nil
+}
+func parseKey(v string) (string, string, bool) {
+	if !strings.HasPrefix(v, "cum-") {
+		return "", "", false
+	}
+	x := strings.SplitN(strings.TrimPrefix(v, "cum-"), "-", 2)
+	if len(x) != 2 || x[0] == "" || x[1] == "" {
+		return "", "", false
+	}
+	return x[0], x[1], true
+}
+
+func (s *Service) RotateKey(ctx context.Context, kid, actor string) (IssuedKey, error) {
+	k, err := s.st.GetKey(ctx, kid)
+	if err != nil {
+		return IssuedKey{}, err
+	}
+	p := s.peppers.Items[s.peppers.Active]
+	secret := randomSecret(32)
+	plain := "cum-" + kid + "-" + secret
+	enc, err := encrypt(p.Value, []byte(plain))
+	if err != nil {
+		return IssuedKey{}, err
+	}
+	fp := fingerprint(plain)
+	if err := s.st.RotateKeyMaterial(ctx, kid, hashKey(p.Value, plain), enc, p.ID, fp); err != nil {
+		return IssuedKey{}, err
+	}
+	k, err = s.st.GetKey(ctx, kid)
+	if err == nil {
+		_ = s.st.AppendAudit(ctx, store.AuditEvent{Actor: actor, Action: "key.rotate", EntityType: "key", EntityID: kid, Detail: map[string]any{"fingerprint": fp}})
+	}
+	return IssuedKey{Key: plain, KID: kid, Fingerprint: fp, Record: k}, err
+}
+func (s *Service) RevealKey(ctx context.Context, kid, actor string) (string, error) {
+	k, err := s.st.GetKey(ctx, kid)
+	if err != nil {
+		return "", err
+	}
+	p, ok := s.pepper(k.PepperID)
+	if !ok {
+		return "", ErrInvalidKey
+	}
+	plain, err := decrypt(p.Value, k.EncryptedMaterial)
+	if err == nil {
+		_ = s.st.AppendAudit(ctx, store.AuditEvent{Actor: actor, Action: "key.reveal", EntityType: "key", EntityID: kid, Detail: map[string]any{"fingerprint": k.Fingerprint}})
+	}
+	return string(plain), err
+}
+
+type ReservationRequest struct {
+	KeyID, CallerID, Model, IdempotencyKey string
+	EstimatedTokens                        int64
+	EstimatedImages                        int64
+	Actor                                  string
+	ExpiresAt                              time.Time
+}
+
+func (s *Service) Reserve(ctx context.Context, r ReservationRequest) (store.Reservation, error) {
+	k, err := s.st.GetKey(ctx, r.KeyID)
+	if err != nil {
+		return store.Reservation{}, err
+	}
+	now := time.Now().UTC()
+	if !k.Usable(now) {
+		return store.Reservation{}, ErrInvalidKey
+	}
+	if !k.ModelAllowed(r.Model) {
+		return store.Reservation{}, ErrModelNotAllowed
+	}
+	if r.EstimatedTokens < 0 || r.EstimatedTokens > s.cfg.Quota.Limits.MaxTokenEstimate {
+		return store.Reservation{}, fmt.Errorf("%w: token estimate", ErrQuotaExceeded)
+	}
+	if r.EstimatedImages < 0 {
+		return store.Reservation{}, fmt.Errorf("%w: image estimate", ErrQuotaExceeded)
+	}
+	rule, priced, err := s.matchPricing(ctx, r.Model)
+	if err != nil {
+		return store.Reservation{}, err
+	}
+	if r.EstimatedTokens == 0 && r.EstimatedImages == 0 && s.cfg.Quota.Limits.RequireEstimate {
+		return store.Reservation{}, fmt.Errorf("%w: 缺少用量估算", ErrQuotaExceeded)
+	}
+	if r.EstimatedTokens == 0 && rule.BillingMode == store.BillingModeToken {
+		r.EstimatedTokens = s.cfg.Quota.Limits.DefaultOutputReserve
+	}
+	maxPrice := rule.PriceInput
+	for _, p := range []money.Price{rule.PriceOutput, rule.PriceCacheRead, rule.PriceCacheCreation} {
+		if p > maxPrice {
+			maxPrice = p
+		}
+	}
+	cost, err := money.CostForTokens(r.EstimatedTokens, maxPrice)
+	if err != nil {
+		return store.Reservation{}, err
+	}
+	if rule.BillingMode == store.BillingModeFree {
+		cost = 0
+	}
+	if rule.BillingMode == store.BillingModePerImage {
+		cost, err = multiplyMicro(rule.PerImageMicroUSD, r.EstimatedImages)
+		if err != nil {
+			return store.Reservation{}, err
+		}
+	}
+	if !priced && s.cfg.Pricing.UnknownPolicy == config.UnknownPolicyDeny {
+		return store.Reservation{}, ErrUnknownPricing
+	}
+	if r.ExpiresAt.IsZero() {
+		r.ExpiresAt = now.Add(s.cfg.Quota.Stream.StaleReservationTimeout.Std())
+	}
+	res, _, err := s.st.HoldReservation(ctx, store.HoldReservationParams{ID: uuid.NewString(), KeyID: r.KeyID, CallerID: r.CallerID, Model: r.Model, IdempotencyKey: r.IdempotencyKey, HeldMicroUSD: cost, ReservedTokens: r.EstimatedTokens, ExpiresAt: r.ExpiresAt, Now: now})
+	if err == nil {
+		_ = s.st.AppendAudit(ctx, store.AuditEvent{Actor: r.Actor, Action: "quota.reserve", EntityType: "reservation", EntityID: res.ID, Detail: map[string]any{"key_id": r.KeyID, "cost_micro_usd": cost}})
+	}
+	return res, err
+}
+func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req *store.Request) (store.Reservation, error) {
+	r, err := s.st.GetReservation(ctx, id)
+	if err != nil {
+		return store.Reservation{}, err
+	}
+	rule, priced, e := s.matchPricing(ctx, r.Model)
+	if e != nil {
+		return store.Reservation{}, e
+	}
+	if !priced && s.cfg.Pricing.UnknownPolicy == config.UnknownPolicyDeny && !u.IsZero() {
+		return store.Reservation{}, ErrUnknownPricing
+	}
+	var cost money.Micro
+	if u.IsZero() {
+		if s.cfg.Quota.Settlement.MissingUsage == config.MissingUsageRelease {
+			return s.st.ReleaseReservation(ctx, id, time.Now())
+		}
+		cost = r.HeldMicroUSD
+	} else {
+		cost, e = costForRule(rule, u, u.ImageCount)
+		if e != nil {
+			return store.Reservation{}, e
+		}
+	}
+	if req != nil {
+		req.InputTokens = u.InputTokens
+		req.OutputTokens = u.OutputTokens
+		req.ReasoningTokens = u.ReasoningTokens
+		req.CachedTokens = u.CachedTokens
+		req.CacheReadTokens = u.CacheReadTokens
+		req.CacheCreationTokens = u.CacheCreationTokens
+		req.TotalTokens = u.EffectiveTotal()
+		req.CostMicroUSD = cost
+		req.Priced = priced
+	}
+	out, err := s.st.SettleReservation(ctx, id, cost, time.Now(), req)
+	if err == nil {
+		_ = s.st.AppendAudit(ctx, store.AuditEvent{Action: "quota.settle", EntityType: "reservation", EntityID: id, Detail: map[string]any{"cost_micro_usd": cost}})
+	}
+	return out, err
+}
+func (s *Service) Release(ctx context.Context, id string) (store.Reservation, error) {
+	out, err := s.st.ReleaseReservation(ctx, id, time.Now())
+	if err == nil {
+		_ = s.st.AppendAudit(ctx, store.AuditEvent{Action: "quota.release", EntityType: "reservation", EntityID: id})
+	}
+	return out, err
+}
+
+// UpdateKey、RevokeKey、DeleteKey 是管理面调用的薄封装，并统一写审计。
+func (s *Service) UpdateKey(ctx context.Context, kid string, u store.KeyUpdate, actor string) (store.PluginKey, error) {
+	k, err := s.st.UpdateKey(ctx, kid, u)
+	if err == nil {
+		_ = s.st.AppendAudit(ctx, store.AuditEvent{Actor: actor, Action: "key.update", EntityType: "key", EntityID: kid})
+	}
+	return k, err
+}
+
+func (s *Service) RevokeKey(ctx context.Context, kid, actor string) error {
+	err := s.st.RevokeKey(ctx, kid)
+	if err == nil {
+		_ = s.st.AppendAudit(ctx, store.AuditEvent{Actor: actor, Action: "key.revoke", EntityType: "key", EntityID: kid})
+	}
+	return err
+}
+
+func (s *Service) DeleteKey(ctx context.Context, kid, actor string) error {
+	err := s.st.DeleteKey(ctx, kid)
+	if err == nil {
+		_ = s.st.AppendAudit(ctx, store.AuditEvent{Actor: actor, Action: "key.delete", EntityType: "key", EntityID: kid})
+	}
+	return err
+}
+
+func (s *Service) matchPricing(ctx context.Context, model string) (store.PricingRule, bool, error) {
+	rules, err := s.st.ListPricingRules(ctx, true)
+	if err != nil {
+		return store.PricingRule{}, false, err
+	}
+	store.SortRulesForMatching(rules)
+	for _, r := range rules {
+		if r.Matches(model) {
+			return r, !r.IsFallback(), nil
+		}
+	}
+	return store.PricingRule{}, false, nil
+}
+func (s *Service) Price(model string, u usageparse.Usage) (money.Micro, bool, error) {
+	r, p, e := s.matchPricing(context.Background(), model)
+	if e != nil {
+		return 0, false, e
+	}
+	if !p && s.cfg.Pricing.UnknownPolicy == config.UnknownPolicyDeny {
+		return 0, false, ErrUnknownPricing
+	}
+	c, e := costForRule(r, u, u.ImageCount)
+	return c, p, e
+}
+
+func billableForRule(r store.PricingRule, u usageparse.Usage) usageparse.Billable {
+	switch r.AccountingMode {
+	case store.AccountingModeInputInclusive:
+		u.InputIncludesCache = true
+	case store.AccountingModeInputExclusive:
+		u.InputIncludesCache = false
+	}
+	return u.Billable()
+}
+
+func costForRule(r store.PricingRule, u usageparse.Usage, images int64) (money.Micro, error) {
+	switch r.BillingMode {
+	case store.BillingModeFree:
+		return 0, nil
+	case store.BillingModePerImage:
+		return multiplyMicro(r.PerImageMicroUSD, images)
+	}
+	b := billableForRule(r, u)
+	parts := make([]money.Micro, 0, 4)
+	for _, x := range []struct {
+		t int64
+		p money.Price
+	}{{b.Input, r.PriceInput}, {b.Output, r.PriceOutput}, {b.CacheRead, r.PriceCacheRead}, {b.CacheCreation, r.PriceCacheCreation}} {
+		v, err := money.CostForTokens(x.t, x.p)
+		if err != nil {
+			return 0, err
+		}
+		parts = append(parts, v)
+	}
+	return money.SumCeil(parts...)
+}
+
+func multiplyMicro(unit money.Micro, count int64) (money.Micro, error) {
+	if unit < 0 || count < 0 {
+		return 0, money.ErrNegative
+	}
+	if count == 0 || unit == 0 {
+		return 0, nil
+	}
+	if int64(unit) > int64(^uint64(0)>>1)/count {
+		return 0, money.ErrOverflow
+	}
+	return unit * money.Micro(count), nil
+}
+
+func hashKey(pepper []byte, plain string) []byte {
+	h := hmac.New(sha256.New, pepper)
+	_, _ = h.Write([]byte(plain))
+	return h.Sum(nil)
+}
+func fingerprint(v string) string {
+	h := sha256.Sum256([]byte(v))
+	return hex.EncodeToString(h[:])[:16]
+}
+func randomID(n int) string { b := make([]byte, n); _, _ = rand.Read(b); return hex.EncodeToString(b) }
+func randomSecret(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+func aesKey(pepper []byte) []byte {
+	h := sha256.Sum256(append([]byte("cpa-usage-manager/aes\x00"), pepper...))
+	return h[:]
+}
+func encrypt(pepper, plain []byte) ([]byte, error) {
+	b, e := aes.NewCipher(aesKey(pepper))
+	if e != nil {
+		return nil, e
+	}
+	g, e := cipher.NewGCM(b)
+	if e != nil {
+		return nil, e
+	}
+	nonce := make([]byte, g.NonceSize())
+	if _, e = rand.Read(nonce); e != nil {
+		return nil, e
+	}
+	return g.Seal(nonce, nonce, plain, nil), nil
+}
+func decrypt(pepper, ciphertext []byte) ([]byte, error) {
+	b, e := aes.NewCipher(aesKey(pepper))
+	if e != nil {
+		return nil, e
+	}
+	g, e := cipher.NewGCM(b)
+	if e != nil {
+		return nil, e
+	}
+	n := g.NonceSize()
+	if len(ciphertext) < n {
+		return nil, ErrInvalidKey
+	}
+	return g.Open(nil, ciphertext[:n], ciphertext[n:], nil)
+}
