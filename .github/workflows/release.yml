@@ -26,11 +26,15 @@ jobs:
           gcc -O2 -Wall -Wextra -o /tmp/abi-smoke scripts/abi-smoke.c -ldl
           /tmp/abi-smoke ./cpa-usage-manager.so
       - name: Package
-        run: zip -j "cpa-usage-manager_${GITHUB_REF_NAME#v}_linux_amd64.zip" cpa-usage-manager.so
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          archive="cpa-usage-manager_${ver}_linux_amd64.zip"
+          zip -j "$archive" cpa-usage-manager.so
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
         with:
           name: cpa-usage-manager-linux-amd64
-          path: cpa-usage-manager_${GITHUB_REF_NAME#v}_linux_amd64.zip
+          path: ${{ env.ARCHIVE }}
 
   linux-arm64:
     runs-on: ubuntu-latest
@@ -49,11 +53,15 @@ jobs:
           CC: aarch64-linux-gnu-gcc
         run: go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o cpa-usage-manager.so .
       - name: Package
-        run: zip -j "cpa-usage-manager_${GITHUB_REF_NAME#v}_linux_arm64.zip" cpa-usage-manager.so
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          archive="cpa-usage-manager_${ver}_linux_arm64.zip"
+          zip -j "$archive" cpa-usage-manager.so
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
         with:
           name: cpa-usage-manager-linux-arm64
-          path: cpa-usage-manager_${GITHUB_REF_NAME#v}_linux_arm64.zip
+          path: ${{ env.ARCHIVE }}
 
   windows-amd64:
     runs-on: windows-latest
@@ -111,11 +119,15 @@ jobs:
           CC: clang
         run: go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o cpa-usage-manager.dylib .
       - name: Package
-        run: zip -j "cpa-usage-manager_${GITHUB_REF_NAME#v}_darwin_arm64.zip" cpa-usage-manager.dylib
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          archive="cpa-usage-manager_${ver}_darwin_arm64.zip"
+          zip -j "$archive" cpa-usage-manager.dylib
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
         with:
           name: cpa-usage-manager-darwin-arm64
-          path: cpa-usage-manager_${GITHUB_REF_NAME#v}_darwin_arm64.zip
+          path: ${{ env.ARCHIVE }}
 
   release:
     needs: [linux-amd64, linux-arm64, windows-amd64, darwin-arm64]
