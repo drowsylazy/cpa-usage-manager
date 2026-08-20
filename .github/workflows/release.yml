@@ -58,10 +58,16 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
-      - name: Install MinGW
-        uses: egor-tensin/setup-mingw@v2
-        with:
-          platform: x64
+      - name: Install MinGW (winlibs portable)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/brechtsanders/winlibs_mingw/releases/download/16.1.0posix-14.0.0-ucrt-r1/winlibs-x86_64-posix-seh-gcc-16.1.0-mingw-w64ucrt-14.0.0-r1.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "winlibs.zip"
+          Invoke-WebRequest -UseBasicParsing $url -OutFile $zip
+          Expand-Archive -LiteralPath $zip -DestinationPath $env:RUNNER_TEMP -Force
+          $bin = Join-Path $env:RUNNER_TEMP "mingw64\bin"
+          [IO.File]::AppendAllText($env:GITHUB_PATH, "$bin`n")
+          gcc --version
       - name: Build
         env:
           GOOS: windows
@@ -69,7 +75,10 @@ jobs:
           CGO_ENABLED: "1"
           CC: gcc
         shell: pwsh
-        run: go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=${env:GITHUB_REF_NAME}.Substring(1)" -o cpa-usage-manager.dll .
+        run: |
+          $ver = $env:GITHUB_REF_NAME
+          if ($ver.StartsWith("v")) { $ver = $ver.Substring(1) }
+          go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=$ver" -o cpa-usage-manager.dll .
       - uses: actions/upload-artifact@v4
         with:
           name: cpa-usage-manager-windows-amd64

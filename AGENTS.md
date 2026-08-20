@@ -2,7 +2,7 @@
 
 ## 项目状态
 
-实施中（v0.0.1 尚未发布）。`DESIGN.md` 是本插件的权威设计规范，所有实现必须遵守其中的锁定决策。仓库已有可构建代码：`internal/{config, service, store, money, usageparse, fx, httpapi, web}` 与入口 `main.go`（内联 C ABI）。请求路径实时额度强制（model_router/executor/request_interceptor/request_lifecycle_plugin）与被动统计模式均已在 `main.go` + `internal/service/requestpath.go` 实现；发布 v0.0.1 前需跑通全量回归（`go test ./...`、`scripts/smoke.go`、`scripts/abi-smoke.c`、`scripts/devserver.go`）。
+实施中（已发布 v0.0.1，v0.0.2 发布中）。`DESIGN.md` 是本插件的权威设计规范，所有实现必须遵守其中的锁定决策。仓库已有可构建代码：`internal/{config, service, store, money, usageparse, fx, httpapi, web}` 与入口 `main.go`（内联 C ABI）。请求路径实时额度强制（model_router/executor/request_interceptor/request_lifecycle_plugin）与被动统计模式均已在 `main.go` + `internal/service/requestpath.go` 实现；每次发布前需跑通全量回归（`go test ./...`、`scripts/smoke.go`、`scripts/abi-smoke.c`、`scripts/devserver.go`）。v0.0.1 Windows 构建失败原因：egor-tensin/setup-mingw 依赖的 chocolatey mingw 包安装脚本故障（libpthread.dll.a 缺失），已改为 CI 直接下载 winlibs 便携 MinGW（16.1.0posix-14.0.0-ucrt-r1）。
 
 ## 这是什么
 
