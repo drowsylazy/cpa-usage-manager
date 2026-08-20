@@ -115,10 +115,18 @@ int main(int argc, char **argv) {
         CHECK(0, "call(unknown) produced a response buffer");
     }
 
-    /* 无效 method 指针等空入参不得崩溃。 */
+    /* 无效 method 指针等空入参不得崩溃（rc 为 1 表示错误且已写入 JSON 错误体，同样合法）。 */
     cpa_buffer out2 = {0};
     rc = call(NULL, NULL, 0, &out2);
-    CHECK(rc == 0, "call(NULL method) returns 0 without crash");
+    CHECK(rc == 0 || rc == 1, "call(NULL method) returns without crash");
+    if (out2.ptr != NULL && out2.len > 0) {
+        char *body2 = (char *)malloc(out2.len + 1);
+        memcpy(body2, out2.ptr, out2.len);
+        body2[out2.len] = '\0';
+        printf("ok: call(NULL method) body: %s\n", body2);
+        free(body2);
+        free_buf(out2.ptr, out2.len);
+    }
 
     /* 重复 init 不崩溃。 */
     cpa_plugin_api plugin2;

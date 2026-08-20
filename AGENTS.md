@@ -2,7 +2,7 @@
 
 ## 项目状态
 
-设计阶段，仓库内尚无代码（只有 `DESIGN.md`）。`DESIGN.md` 是本插件的权威设计规范，实施前必须先读它并遵守其中的锁定决策。开始写代码前，需先与用户确认进入哪个实施阶段（P0 起）。
+实施中（v0.0.1 尚未发布）。`DESIGN.md` 是本插件的权威设计规范，所有实现必须遵守其中的锁定决策。仓库已有可构建代码：`internal/{config, service, store, money, usageparse, fx, httpapi, web}` 与入口 `main.go`（内联 C ABI）。请求路径实时额度强制（model_router/executor/request_interceptor/request_lifecycle_plugin）与被动统计模式均已在 `main.go` + `internal/service/requestpath.go` 实现；发布 v0.0.1 前需跑通全量回归（`go test ./...`、`scripts/smoke.go`、`scripts/abi-smoke.c`、`scripts/devserver.go`）。
 
 ## 这是什么
 

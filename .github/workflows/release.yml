@@ -3,22 +3,7 @@ on:
   push:
     tags: ["v*"]
 jobs:
-  build:
-    strategy:
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-            ext: so
-          - goos: linux
-            goarch: arm64
-            ext: so
-          - goos: windows
-            goarch: amd64
-            ext: dll
-          - goos: darwin
-            goarch: arm64
-            ext: dylib
+  linux-amd64:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,15 +13,83 @@ jobs:
       - name: Install cross compiler
         run: sudo apt-get update && sudo apt-get install -y gcc-multilib
       - name: Test
-        run: CGO_ENABLED=0 go test ./...
+        run: go test ./...
       - name: Build
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
+          GOOS: linux
+          GOARCH: amd64
           CGO_ENABLED: "1"
-        run: go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o "cpa-usage-manager.${{ matrix.ext }}" .
-      - name: ABI smoke (linux amd64)
-        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+          CC: gcc
+        run: go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o cpa-usage-manager.so .
+      - name: ABI smoke
         run: |
           gcc -O2 -Wall -Wextra -o /tmp/abi-smoke scripts/abi-smoke.c -ldl
           /tmp/abi-smoke ./cpa-usage-manager.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpa-usage-manager-linux-amd64
+          path: cpa-usage-manager.so
+
+  linux-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: Install cross compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: "1"
+          CC: aarch64-linux-gnu-gcc
+        run: go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o cpa-usage-manager.so .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpa-usage-manager-linux-arm64
+          path: cpa-usage-manager.so
+
+  windows-amd64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: Install MinGW
+        uses: egor-tensin/setup-mingw@v2
+        with:
+          platform: x64
+      - name: Build
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "1"
+          CC: gcc
+        shell: pwsh
+        run: go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=${env:GITHUB_REF_NAME}.Substring(1)" -o cpa-usage-manager.dll .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpa-usage-manager-windows-amd64
+          path: cpa-usage-manager.dll
+
+  darwin-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: Build
+        env:
+          GOOS: darwin
+          GOARCH: arm64
+          CGO_ENABLED: "1"
+          CC: clang
+        run: go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o cpa-usage-manager.dylib .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpa-usage-manager-darwin-arm64
+          path: cpa-usage-manager.dylib

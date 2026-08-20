@@ -242,6 +242,12 @@ func parseKey(v string) (string, string, bool) {
 	return x[0], x[1], true
 }
 
+// ParseKeyID 返回 cum-<kid>-<secret> 形式明文中的 kid。非本插件 Key 返回 false。
+func ParseKeyID(plain string) (string, bool) {
+	kid, _, ok := parseKey(plain)
+	return kid, ok
+}
+
 func (s *Service) RotateKey(ctx context.Context, kid, actor string) (IssuedKey, error) {
 	k, err := s.st.GetKey(ctx, kid)
 	if err != nil {

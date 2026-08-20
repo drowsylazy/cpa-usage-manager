@@ -194,6 +194,24 @@ func (s *Store) GetKey(ctx context.Context, kid string) (PluginKey, error) {
 	return k, nil
 }
 
+// FindKeyByCallerScope 按 caller_scope 读取一个启用中的 Key（caller 归属模式）。
+func (s *Store) FindKeyByCallerScope(ctx context.Context, scope string) (PluginKey, error) {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return PluginKey{}, fmt.Errorf("%w: 缺少 caller_scope", ErrNotFound)
+	}
+	row := s.readDB.QueryRowContext(ctx,
+		`SELECT `+keyColumns+` FROM plugin_keys WHERE caller_scope = ? ORDER BY created_at DESC, kid LIMIT 1`, scope)
+	k, err := scanKey(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PluginKey{}, fmt.Errorf("%w: caller_scope %q", ErrNotFound, scope)
+	}
+	if err != nil {
+		return PluginKey{}, fmt.Errorf("读取 caller_scope %q 的 Key 失败: %w", scope, err)
+	}
+	return k, nil
+}
+
 // KeyFilter 是列出 Key 的筛选条件。
 type KeyFilter struct {
 	CallerID string

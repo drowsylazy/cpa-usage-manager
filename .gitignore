@@ -8,3 +8,6 @@ cpa-usage-manager.h
 abi-smoke
 abi-smoke.exe
 *.tmp
+
+# 本地运行产生的数据目录
+data/

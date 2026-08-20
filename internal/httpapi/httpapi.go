@@ -32,11 +32,8 @@ func New(svc *service.Service, st *store.Store, managementKey string) *API {
 const base = "/v0/management/plugins/cpa-usage-manager"
 
 func (a *API) register() {
-	a.mux.HandleFunc("/console", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(web.ConsoleHTML())
-	})
+	a.mux.HandleFunc("/console", a.console)
+	a.mux.HandleFunc("/v0/resource/plugins/cpa-usage-manager/console", a.console)
 	a.mux.HandleFunc(base+"/health", a.auth(a.health))
 	a.mux.HandleFunc(base+"/overview", a.auth(a.overview))
 
@@ -76,6 +73,11 @@ func (a *API) register() {
 	a.mux.HandleFunc(base+"/maintain", a.auth(a.maintain))
 }
 func (a *API) Handler() http.Handler { return a.gzip(a.mux) }
+func (a *API) console(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(web.ConsoleHTML())
+}
 func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if a.managementKey != "" && r.Header.Get("Authorization") != "Bearer "+a.managementKey {
