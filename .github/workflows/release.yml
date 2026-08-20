@@ -25,10 +25,12 @@ jobs:
         run: |
           gcc -O2 -Wall -Wextra -o /tmp/abi-smoke scripts/abi-smoke.c -ldl
           /tmp/abi-smoke ./cpa-usage-manager.so
+      - name: Package
+        run: zip -j "cpa-usage-manager_${GITHUB_REF_NAME#v}_linux_amd64.zip" cpa-usage-manager.so
       - uses: actions/upload-artifact@v4
         with:
           name: cpa-usage-manager-linux-amd64
-          path: cpa-usage-manager.so
+          path: cpa-usage-manager_${GITHUB_REF_NAME#v}_linux_amd64.zip
 
   linux-arm64:
     runs-on: ubuntu-latest
@@ -46,10 +48,12 @@ jobs:
           CGO_ENABLED: "1"
           CC: aarch64-linux-gnu-gcc
         run: go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o cpa-usage-manager.so .
+      - name: Package
+        run: zip -j "cpa-usage-manager_${GITHUB_REF_NAME#v}_linux_arm64.zip" cpa-usage-manager.so
       - uses: actions/upload-artifact@v4
         with:
           name: cpa-usage-manager-linux-arm64
-          path: cpa-usage-manager.so
+          path: cpa-usage-manager_${GITHUB_REF_NAME#v}_linux_arm64.zip
 
   windows-amd64:
     runs-on: windows-latest
@@ -79,10 +83,18 @@ jobs:
           $ver = $env:GITHUB_REF_NAME
           if ($ver.StartsWith("v")) { $ver = $ver.Substring(1) }
           go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=$ver" -o cpa-usage-manager.dll .
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = $env:GITHUB_REF_NAME
+          if ($ver.StartsWith("v")) { $ver = $ver.Substring(1) }
+          $archive = "cpa-usage-manager_${ver}_windows_amd64.zip"
+          Compress-Archive -Path cpa-usage-manager.dll -DestinationPath $archive
+          Add-Content -Path $env:GITHUB_ENV -Value "ARCHIVE=$archive"
       - uses: actions/upload-artifact@v4
         with:
           name: cpa-usage-manager-windows-amd64
-          path: cpa-usage-manager.dll
+          path: ${{ env.ARCHIVE }}
 
   darwin-arm64:
     runs-on: macos-latest
@@ -98,10 +110,12 @@ jobs:
           CGO_ENABLED: "1"
           CC: clang
         run: go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o cpa-usage-manager.dylib .
+      - name: Package
+        run: zip -j "cpa-usage-manager_${GITHUB_REF_NAME#v}_darwin_arm64.zip" cpa-usage-manager.dylib
       - uses: actions/upload-artifact@v4
         with:
           name: cpa-usage-manager-darwin-arm64
-          path: cpa-usage-manager.dylib
+          path: cpa-usage-manager_${GITHUB_REF_NAME#v}_darwin_arm64.zip
 
   release:
     needs: [linux-amd64, linux-arm64, windows-amd64, darwin-arm64]
@@ -114,14 +128,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
-      - name: Prepare release assets
+          merge-multiple: true
+      - name: Create checksums.txt
         run: |
-          set -e
-          mv dist/cpa-usage-manager-linux-amd64/cpa-usage-manager.so   dist/cpa-usage-manager-linux-amd64.so
-          mv dist/cpa-usage-manager-linux-arm64/cpa-usage-manager.so   dist/cpa-usage-manager-linux-arm64.so
-          mv dist/cpa-usage-manager-windows-amd64/cpa-usage-manager.dll dist/cpa-usage-manager-windows-amd64.dll
-          mv dist/cpa-usage-manager-darwin-arm64/cpa-usage-manager.dylib dist/cpa-usage-manager-darwin-arm64.dylib
-          ls -la dist
+          cd dist
+          sha256sum *.zip > checksums.txt
+          cat checksums.txt
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
