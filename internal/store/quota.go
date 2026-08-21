@@ -12,11 +12,14 @@ import (
 )
 
 // HoldReservation 原子检查并写入一条在途预占。额度检查由 service 计算上限后传入。
+// SweepStaleBefore 非零时，事务内先释放心跳/过期早于该时刻的陈旧预占，
+// 使并发与额度统计基于干净数据；零值跳过清扫。
 type HoldReservationParams struct {
 	ID, KeyID, CallerID, Model, IdempotencyKey string
 	HeldMicroUSD                               money.Micro
 	ReservedTokens                             int64
 	ExpiresAt, Now                             time.Time
+	SweepStaleBefore                           time.Time
 }
 
 // HoldReservation 写入 held 预占；idempotency_key 已存在时返回原记录且不重复扣占。
@@ -36,6 +39,15 @@ func (s *Store) HoldReservation(ctx context.Context, p HoldReservationParams) (R
 	var out Reservation
 	existing := false
 	err := s.Write(ctx, func(tx *sql.Tx) error {
+		if !p.SweepStaleBefore.IsZero() {
+			// 先清僵尸预占再做额度统计：崩溃/重启残留的 held 行若不清，
+			// 会永久占用该 Key 的并发名额与周期额度。
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE reservations SET status='released',released_at=? WHERE status='held' AND (heartbeat_at < ? OR expires_at < ?)`,
+				p.Now.UTC().UnixMilli(), p.SweepStaleBefore.UTC().UnixMilli(), p.SweepStaleBefore.UTC().UnixMilli()); err != nil {
+				return fmt.Errorf("清扫陈旧预占失败: %w", err)
+			}
+		}
 		if p.IdempotencyKey != "" {
 			row := tx.QueryRowContext(ctx, `SELECT id,key_id,caller_id,model,idempotency_key,status,held_micro_usd,settled_micro_usd,reserved_tokens,created_at,expires_at,heartbeat_at,settled_at,released_at FROM reservations WHERE idempotency_key = ?`, p.IdempotencyKey)
 			r, err := scanReservation(row)

@@ -247,7 +247,6 @@ quota:                               # 额度子系统（默认开启）
     missing_usage: settle_reserved   # settle_reserved | release
     host_usage_wait: 1500ms          # 流式兜底：关流后等宿主 usage 回调的窗口（非流式不等待）
   stream:
-    max_buffer_bytes: 4194304        # 流式结算本地缓冲上限
     stale_reservation_timeout: 2h    # 无心跳在途预占自动释放
 
 pricing:

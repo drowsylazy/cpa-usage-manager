@@ -257,7 +257,6 @@ func TestValidationRejectsBadValues(t *testing.T) {
 		{"max_token_estimate 非正", "quota:\n  limits:\n    max_token_estimate: 0\n", "max_token_estimate"},
 		{"输出预占为负", "quota:\n  limits:\n    default_output_reserve: -1\n", "default_output_reserve"},
 		{"输出预占超上限", "quota:\n  limits:\n    max_token_estimate: 100\n    default_output_reserve: 200\n", "default_output_reserve"},
-		{"缓冲过小", "quota:\n  stream:\n    max_buffer_bytes: 10\n", "max_buffer_bytes"},
 		{"在途超时非正", "quota:\n  stream:\n    stale_reservation_timeout: 0s\n", "stale_reservation_timeout"},
 		{"database_file 含路径", "database_file: sub/dir.db\n", "database_file"},
 		{"pepper_file 含路径", "quota:\n  keys:\n    pepper_file: ../escape\n", "pepper_file"},
@@ -429,7 +428,6 @@ quota:
     missing_usage: settle_reserved
     host_usage_wait: 1500ms
   stream:
-    max_buffer_bytes: 4194304
     stale_reservation_timeout: 2h
 
 pricing:
@@ -446,9 +444,6 @@ response_compression_min_bytes: 1024
 	cfg, err := Load(inline, noEnv)
 	if err != nil {
 		t.Fatalf("DESIGN.md 示例配置加载失败: %v", err)
-	}
-	if cfg.Quota.Stream.MaxBufferBytes != 4194304 {
-		t.Errorf("max_buffer_bytes = %d", cfg.Quota.Stream.MaxBufferBytes)
 	}
 	if cfg.Quota.Limits.RequireEstimate {
 		t.Error("require_estimate 应为 false")

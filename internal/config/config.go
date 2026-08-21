@@ -138,7 +138,6 @@ type SettlementConfig struct {
 
 // StreamConfig 是流式结算配置。
 type StreamConfig struct {
-	MaxBufferBytes          int64    `yaml:"max_buffer_bytes"`
 	StaleReservationTimeout Duration `yaml:"stale_reservation_timeout"`
 }
 
@@ -180,7 +179,6 @@ func Default() Config {
 				HostUsageWait: Duration(1500 * time.Millisecond),
 			},
 			Stream: StreamConfig{
-				MaxBufferBytes:          4 << 20,
 				StaleReservationTimeout: Duration(2 * time.Hour),
 			},
 		},
@@ -327,9 +325,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Quota.Settlement.HostUsageWait.Std() < 0 {
 		errs = append(errs, fmt.Errorf("quota.settlement.host_usage_wait 不能为负，当前 %s", c.Quota.Settlement.HostUsageWait.Std()))
-	}
-	if c.Quota.Stream.MaxBufferBytes < 1024 {
-		errs = append(errs, fmt.Errorf("quota.stream.max_buffer_bytes 至少 1024，当前 %d", c.Quota.Stream.MaxBufferBytes))
 	}
 	if c.Quota.Stream.StaleReservationTimeout.Std() <= 0 {
 		errs = append(errs, fmt.Errorf("quota.stream.stale_reservation_timeout 必须为正，当前 %s", c.Quota.Stream.StaleReservationTimeout.Std()))

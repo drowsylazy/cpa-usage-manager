@@ -197,6 +197,11 @@ func (s *Service) Maintain(ctx context.Context, vacuum bool, actor string) (stor
 	if err != nil {
 		return store.RetentionResult{}, err
 	}
+	// 顺带释放陈旧预占：崩溃/重启残留的 held 行没有定时清扫方，
+	// 借维护入口兜底，让面板「清理」也能在无流量时归零在途读数。
+	if _, err := s.st.ReleaseStaleReservations(ctx, now.Add(-cfg.Quota.Stream.StaleReservationTimeout.Std())); err != nil {
+		return store.RetentionResult{}, fmt.Errorf("释放陈旧预占失败（保留清理已完成）: %w", err)
+	}
 	// 对账窗口跟随保留期：更早的行已被上一步删掉，扫描它们没有意义。
 	since := now.AddDate(0, 0, -maxInt(1, cfg.RetentionDays))
 	deduped, derr := s.st.DedupeRequests(ctx, since)

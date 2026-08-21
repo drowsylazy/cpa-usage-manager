@@ -68,11 +68,16 @@ type imageHold struct {
 	plan        service.ReservePlan
 	stopHeart   func()
 	claim       *usageClaim
+	created     time.Time
 }
 
 var (
 	imageHoldsMu sync.Mutex
 	imageHolds   = map[string]imageHold{}
+	// imageHoldMaxAge 是拦截器持有条目的存活上限。request.complete 丢失时
+	// （如宿主/插件中途重启），条目会连同其心跳 goroutine 一起泄漏，
+	// 登记新条目时按该阈值回收。
+	imageHoldMaxAge = time.Hour
 )
 
 // ---------- RPC 信封 ----------
@@ -627,7 +632,6 @@ func pluginRegistration(schema uint32) rpcRegistration {
 				{Name: "quota.limits.require_estimate", Type: "boolean", Description: "true 时缺少用量估算的请求拒绝预占。"},
 				{Name: "quota.settlement.missing_usage", Type: "enum", EnumValues: []string{"settle_reserved", "release"}, Description: "上游未返回 usage 时的结算策略。"},
 				{Name: "quota.settlement.host_usage_wait", Type: "string", Description: "流式结算在上游未给 usage 时，关闭客户端流后等待宿主 usage.handle 的时长（0 关闭；非流式不等待）。"},
-				{Name: "quota.stream.max_buffer_bytes", Type: "integer", Description: "流式结算本地缓冲上限。"},
 				{Name: "quota.stream.stale_reservation_timeout", Type: "string", Description: "无心跳在途预占自动释放时长。"},
 				{Name: "pricing.unknown_policy", Type: "enum", EnumValues: []string{"deny", "allow", "default"}, Description: "无计价规则命中时的策略。"},
 				{Name: "pricing.models_dev_sync.enabled", Type: "boolean", Description: "是否启用 models.dev 价格同步。"},
@@ -959,8 +963,6 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 	defer func() { _ = closeHostModelStream(stream.StreamID) }()
 
 	acc := &usageparse.Accumulator{}
-	maxBuffer := int(svc.Config().Quota.Stream.MaxBufferBytes)
-	var buf []byte
 	var firstChunkAt, completedAt time.Time
 	for {
 		chunkRaw, errRead := callHost("host.model.stream_read", rpcHostModelStreamReadRequest{StreamID: stream.StreamID})
@@ -984,10 +986,8 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 			return fmt.Errorf("%s", chunk.Error)
 		}
 		if len(chunk.Payload) > 0 {
-			if len(buf) < maxBuffer {
-				remain := minInt(maxBuffer-len(buf), len(chunk.Payload))
-				buf = append(buf, chunk.Payload[:remain]...)
-			}
+			// 用量逐块增量解析，不在本地留存流副本（旧版曾缓冲整条流用于
+			// 结算兜底，每请求最多数 MB，是内存占用的主要来源）。
 			acc.FeedChunk(chunk.Payload)
 			if firstChunkAt.IsZero() {
 				firstChunkAt = time.Now()
@@ -1274,11 +1274,20 @@ func interceptAfter(body []byte) ([]byte, error) {
 		return okEnvelope(rejectResponse(http.StatusTooManyRequests, err.Error()))
 	}
 	imageHoldsMu.Lock()
+	for id, h := range imageHolds {
+		if h.created.Before(time.Now().Add(-imageHoldMaxAge)) {
+			delete(imageHolds, id)
+			if h.stopHeart != nil {
+				h.stopHeart() // 停掉残留条目的心跳 ticker，回收 goroutine
+			}
+		}
+	}
 	imageHolds[requestID] = imageHold{
 		reservation: reservation,
 		plan:        plan,
 		stopHeart:   startReservationHeartbeat(svc, reservation.ID),
 		claim:       registerUsageClaim(key.KID, plan.Model, req.Model, req.RequestedModel),
+		created:     time.Now(),
 	}
 	imageHoldsMu.Unlock()
 	return okEnvelope(rpcRequestInterceptResponse{})
@@ -1739,13 +1748,6 @@ func usageRecordToRequest(st *store.Store, u rpcUsageRecord) store.Request {
 		req.CallerID = store.DefaultCallerID
 	}
 	return req
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 var version = "0.0.1"

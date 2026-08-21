@@ -35,6 +35,10 @@ var (
 	ErrUnknownPricing      = errors.New("service: 模型没有计价规则")
 )
 
+// maxPlausibleTPSMilli 是自算 TPS 的可信上限（3000 token/s，单位毫 TPS）。
+// 当下最快的商用推理 API 峰值也远低于此；超过即为缓冲整转导致的坏测量。
+const maxPlausibleTPSMilli = 3_000_000
+
 type Pepper struct {
 	ID    string
 	Value []byte
@@ -352,7 +356,7 @@ func (s *Service) Reserve(ctx context.Context, r ReservationRequest) (store.Rese
 	if r.ExpiresAt.IsZero() {
 		r.ExpiresAt = now.Add(s.cfg.Quota.Stream.StaleReservationTimeout.Std())
 	}
-	res, _, err := s.st.HoldReservation(ctx, store.HoldReservationParams{ID: uuid.NewString(), KeyID: r.KeyID, CallerID: r.CallerID, Model: r.Model, IdempotencyKey: r.IdempotencyKey, HeldMicroUSD: cost, ReservedTokens: r.EstimatedTokens, ExpiresAt: r.ExpiresAt, Now: now})
+	res, _, err := s.st.HoldReservation(ctx, store.HoldReservationParams{ID: uuid.NewString(), KeyID: r.KeyID, CallerID: r.CallerID, Model: r.Model, IdempotencyKey: r.IdempotencyKey, HeldMicroUSD: cost, ReservedTokens: r.EstimatedTokens, ExpiresAt: r.ExpiresAt, Now: now, SweepStaleBefore: now.Add(-s.cfg.Quota.Stream.StaleReservationTimeout.Std())})
 	if err == nil {
 		_ = s.st.AppendAudit(ctx, store.AuditEvent{Actor: r.Actor, Action: "quota.reserve", EntityType: "reservation", EntityID: res.ID, Detail: map[string]any{"key_id": r.KeyID, "cost_micro_usd": cost}})
 	}
@@ -393,8 +397,13 @@ func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req
 		req.CostMicroUSD = cost
 		req.Priced = priced
 		// 上游不回 TPS 时按 输出token/生成时长 自算（毫单位整数，避免浮点）。
+		// 宿主把整段响应缓冲后一次转发时 generation 只有几毫秒，算出的 TPS
+		// 物理上不可能（数千上万），会污染维度聚合均值；超过 3000 token/s
+		// 视为不可信测量，不落库（面板显示 "-"）。
 		if req.TPSMilli == 0 && req.OutputTokens > 0 && req.GenerationMS > 0 {
-			req.TPSMilli = req.OutputTokens * 1_000_000 / req.GenerationMS
+			if tps := req.OutputTokens * 1_000_000 / req.GenerationMS; tps <= maxPlausibleTPSMilli {
+				req.TPSMilli = tps
+			}
 		}
 	}
 	out, err := s.st.SettleReservation(ctx, id, cost, time.Now(), req)

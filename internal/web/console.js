@@ -386,6 +386,11 @@ function cacheHit(r) {
   return Math.max((Number(r.cache_read_tokens) || 0) + (Number(r.cache_creation_tokens) || 0),
     Number(r.cached_tokens) || 0);
 }
+// cacheReadOf 统一两种上游口径的「缓存读」：Claude 的 cache_read 独立于输入，
+// OpenAI/Gemini 的 cached 含在输入内。取较大者，避免双计，与缓存命中率同口径。
+function cacheReadOf(r) {
+  return Math.max(Number(r.cache_read_tokens) || 0, Number(r.cached_tokens) || 0);
+}
 
 loaders.overview = async () => {
   if (!trend.grainManual) $('trend-grain').value = autoGrain();
@@ -436,7 +441,7 @@ function renderReadouts(total, costs) {
     + readout('总费用', fmtUSD(total.cost_micro_usd),
       '计价覆盖 <b>' + cover + '%</b>' + esc(cny))
     + readout('缓存命中率', hitPct < 0 ? '—' : hitPct.toFixed(1) + '%',
-      '读 <b>' + fmtTok(total.cache_read_tokens) + '</b> · 写 <b>' + fmtTok(total.cache_creation_tokens)
+      '读 <b>' + fmtTok(cacheReadOf(total)) + '</b> · 写 <b>' + fmtTok(total.cache_creation_tokens)
       + '</b>' + ((total.cached_tokens || 0) > (total.cache_read_tokens || 0) + (total.cache_creation_tokens || 0)
         ? ' · 含上游缓存口径' : ''));
 }
@@ -620,7 +625,7 @@ function trendSeries() {
   return [
     { key: 'input', label: '输入', color: cssVar('--signal'), tok: true, val: p => p.input_tokens },
     { key: 'output', label: '输出', color: cssVar('--trace'), tok: true, val: p => p.output_tokens },
-    { key: 'cache-read', label: '缓存读', color: cssVar('--live'), tok: true, val: p => p.cache_read_tokens || 0 },
+    { key: 'cache-read', label: '缓存读', color: cssVar('--live'), tok: true, val: p => cacheReadOf(p) },
     { key: 'cache-creation', label: '缓存写', color: cssVar('--warn'), tok: true, val: p => p.cache_creation_tokens || 0 },
   ];
 }
@@ -1090,13 +1095,16 @@ loaders.usage = async () => {
 async function loadDim() {
   const dim = $('dim').value;
   const r = await api('/usage/dimension?' + new URLSearchParams({ dimension: dim, ...rangeParams() }));
-  const rows = (r.rows || []).slice().sort((a, b) => b.cost_micro_usd - a.cost_micro_usd);
+  // 费用相同时（如全部未计价）按请求数降序，保证视觉排序稳定。
+  const rows = (r.rows || []).slice()
+    .sort((a, b) => b.cost_micro_usd - a.cost_micro_usd || (b.requests || 0) - (a.requests || 0));
   if (!rows.length) {
     $('dim-body').innerHTML = '<div class="empty"><p class="empty-title">暂无数据</p>'
       + '<p class="empty-hint">所选时间范围内没有请求记录</p></div>';
     return;
   }
-  const maxReq = rows[0].requests || 1;
+  // 占比分母取全量最大值：行序按费用排，首行请求数未必最大，用它会算出 >100%。
+  const maxReq = Math.max(1, ...rows.map(row => row.requests || 0));
   $('dim-body').innerHTML = '<div class="table-wrap"><table class="data"><thead><tr>'
     + '<th class="w-grow">' + esc($('dim').selectedOptions[0].textContent) + '</th>'
     + '<th class="num">请求</th><th class="num">失败</th><th class="num">Token</th><th class="num">费用</th>'
@@ -1158,7 +1166,7 @@ async function loadRequests() {
     + esc(x.result) + '</span></td>'
     + '<td class="num">' + fmtTok(x.input_tokens) + '</td>'
     + '<td class="num">' + fmtTok(x.output_tokens) + '</td>'
-    + '<td class="num">' + fmtTok(x.cache_read_tokens) + '</td>'
+    + '<td class="num">' + fmtTok(cacheReadOf(x)) + '</td>'
     + '<td class="num">' + tokenCell + '</td>'
     + '<td class="num">' + fmtUSD(x.cost_micro_usd) + '</td>'
     + '<td class="num">' + fmtSec(x.ttft_ms) + '</td>'
@@ -1207,7 +1215,7 @@ $('req-rows').addEventListener('click', e => {
       + fact('认证账号', x.auth_label || x.auth_id || '-') + fact('认证类型', x.auth_type || '-')
       + fact('档位', x.tier || '-') + fact('思考强度', x.thinking_intensity || '-')
       + fact('输入 Token', fmtTok(x.input_tokens)) + fact('输出 Token', fmtTok(x.output_tokens))
-      + fact('推理 Token', fmtTok(x.reasoning_tokens)) + fact('缓存读', fmtTok(x.cache_read_tokens))
+      + fact('推理 Token', fmtTok(x.reasoning_tokens)) + fact('缓存读', fmtTok(cacheReadOf(x)))
       + fact('缓存写', fmtTok(x.cache_creation_tokens)) + fact('总 Token', fmtTok(effTokens(x)))
       + (!(+x.input_tokens || 0) && !(+x.output_tokens || 0) && (+x.cost_micro_usd || 0) > 0
         ? fact('用量捕获', '上游未返回用量，费用按预占估算扣费') : '')
