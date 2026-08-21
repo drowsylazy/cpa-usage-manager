@@ -30,6 +30,7 @@
 
 ## 约定
 
+- 推送后**不**监控 GitHub Actions workflow 与发布资产，由维护者自行确认
 - 仓库文档与用户沟通使用**中文**
 - 空数据库默认自动建 `default` caller、全模型免费计价规则（`unknown_policy: allow`），但不自动签发任何 Key
 - pepper 只在环境变量或 `data_dir/key-peppers`（0600），绝不入库/入日志/入 API 响应
