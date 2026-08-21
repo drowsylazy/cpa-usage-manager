@@ -1251,12 +1251,14 @@ $('req-export').addEventListener('click', async () => {
 });
 
 // ---------- 价格 ----------
+const pricingCache = { items: [] };
 loaders.pricing = async () => {
   const [r, fx] = await Promise.all([api('/pricing'), api('/exchange-rate')]);
   S.fx = fx;
   $('fx-info').textContent = fx && fx.usd_to_cny_micro
     ? 'USD→CNY ' + (fx.usd_to_cny_micro / 1e6).toFixed(4) + ' · ' + fx.source + (fx.fallback ? '（兜底）' : '') : '';
   const items = (r.items || []).slice().sort((a, b) => b.priority - a.priority || a.id - b.id);
+  pricingCache.items = items;
   $('pricing-rows').innerHTML = items.map(p => '<tr>'
     + '<td class="num cell-mono">' + p.priority + '</td>'
     + '<td><span class="pill signal mono">' + esc(p.match_kind) + '</span></td>'
@@ -1267,53 +1269,89 @@ loaders.pricing = async () => {
     + '<td class="num">' + fmtPrice(p.price_cache_read) + '</td>'
     + '<td class="num">' + fmtPrice(p.price_cache_creation) + '</td>'
     + '<td class="cell-dim">' + esc(p.source === 'models_dev' ? 'models.dev' : '手动') + '</td>'
-    + '<td class="w-act"><button type="button" class="btn small danger" data-id="' + p.id + '">删除</button></td></tr>').join('')
+    + '<td class="w-act"><button type="button" class="btn small" data-edit="' + p.id + '">编辑</button>'
+    + '<button type="button" class="btn small danger" data-id="' + p.id + '">删除</button></td></tr>').join('')
     || '<tr><td colspan="10"><div class="empty"><p class="empty-title">还没有计价规则</p>'
     + '<p class="empty-hint">新增规则，或在上方搜索 models.dev 后按条添加</p></div></td></tr>';
   stamp();
 };
 $('pricing-rows').addEventListener('click', e => {
-  const b = e.target.closest('button[data-id]');
-  if (!b) return;
-  confirmSheet('删除计价规则 #' + b.dataset.id,
+  const del = e.target.closest('button[data-id]');
+  if (!del) return;
+  confirmSheet('删除计价规则 #' + del.dataset.id,
     '删除后相关模型将回落到兜底规则（通常免费）。',
     async () => {
-      await post('/pricing/delete', { id: parseInt(b.dataset.id, 10), actor: 'console' });
+      await post('/pricing/delete', { id: parseInt(del.dataset.id, 10), actor: 'console' });
       loaders.pricing().catch(() => {});
     });
 });
+// micro-USD/百万 token → 弹窗里的 $/M 数值文本。
+const priceInputVal = v => String((Number(v) || 0) / 1e6);
+function pricingFormBody(p) {
+  const sel = (kind, cur) => '<option value="' + kind + '"' + (kind === cur ? ' selected' : '') + '>' + kind + '</option>';
+  const kindSel = p
+    ? ['exact', 'glob', 'regexp'].map(k => sel(k, p.match_kind)).join('')
+    : '<option value="exact">exact 完全匹配</option><option value="glob" selected>glob 通配</option><option value="regexp">regexp 正则</option>';
+  return '<div class="form-grid">'
+    + fieldRow('匹配方式', '<select id="p-kind">' + kindSel + '</select>')
+    + fieldRow('优先级', '<input id="p-priority" type="number" value="' + (p ? p.priority : 100) + '">')
+    + fieldRow('模式', '<input id="p-pattern" value="' + (p ? esc(p.pattern) : '') + '" placeholder="如 gpt-* 或 claude-sonnet-4" spellcheck="false">')
+    + fieldRow('输入价 $/M', '<input id="p-in" inputmode="decimal" value="' + (p ? priceInputVal(p.price_input) : '') + '" placeholder="0">')
+    + fieldRow('输出价 $/M', '<input id="p-out" inputmode="decimal" value="' + (p ? priceInputVal(p.price_output) : '') + '" placeholder="0">')
+    + fieldRow('推理价 $/M', '<input id="p-reasoning" inputmode="decimal" value="' + (p ? priceInputVal(p.price_reasoning) : '') + '" placeholder="0">')
+    + fieldRow('缓存价 $/M', '<input id="p-cached" inputmode="decimal" value="' + (p ? priceInputVal(p.price_cached) : '') + '" placeholder="0">')
+    + fieldRow('缓存读 $/M', '<input id="p-cache-read" inputmode="decimal" value="' + (p ? priceInputVal(p.price_cache_read) : '') + '" placeholder="0">')
+    + fieldRow('缓存写 $/M', '<input id="p-cache-create" inputmode="decimal" value="' + (p ? priceInputVal(p.price_cache_creation) : '') + '" placeholder="0">')
+    + fieldRow('状态', '<select id="p-enabled"><option value="true"' + (!p || p.enabled ? ' selected' : '') + '>启用</option>'
+      + '<option value="false"' + (p && !p.enabled ? ' selected' : '') + '>停用</option></select>')
+    + '</div>';
+}
+function pricingSubmit() {
+  const num = id => Math.round((parseFloat($(id).value) || 0) * 1e6);
+  return {
+    match_kind: $('p-kind').value,
+    pattern: $('p-pattern').value.trim() || '*',
+    priority: parseInt($('p-priority').value, 10) || 0,
+    enabled: $('p-enabled').value === 'true',
+    price_input: num('p-in'), price_output: num('p-out'),
+    price_reasoning: num('p-reasoning'), price_cached: num('p-cached'),
+    price_cache_read: num('p-cache-read'), price_cache_creation: num('p-cache-create'),
+    accounting_mode: 'default', billing_mode: 'token', per_image_micro_usd: 0,
+    source: 'manual',
+  };
+}
 $('pricing-add').addEventListener('click', () => {
   openSheet({
     title: '新增计价规则', okText: '保存',
-    body: '<div class="form-grid">'
-      + fieldRow('匹配方式', '<select id="p-kind"><option value="exact">exact 完全匹配</option>'
-        + '<option value="glob" selected>glob 通配</option><option value="regexp">regexp 正则</option></select>')
-      + fieldRow('优先级', '<input id="p-priority" type="number" value="100">')
-      + fieldRow('模式', '<input id="p-pattern" placeholder="如 gpt-* 或 claude-sonnet-4" spellcheck="false">')
-      + fieldRow('输入价 $/M', '<input id="p-in" inputmode="decimal" placeholder="0">')
-      + fieldRow('输出价 $/M', '<input id="p-out" inputmode="decimal" placeholder="0">')
-      + fieldRow('推理价 $/M', '<input id="p-reasoning" inputmode="decimal" placeholder="0">')
-      + fieldRow('缓存价 $/M', '<input id="p-cached" inputmode="decimal" placeholder="0">')
-      + fieldRow('缓存读 $/M', '<input id="p-cache-read" inputmode="decimal" placeholder="0">')
-      + fieldRow('缓存写 $/M', '<input id="p-cache-create" inputmode="decimal" placeholder="0">')
-      + fieldRow('状态', '<select id="p-enabled"><option value="true" selected>启用</option>'
-        + '<option value="false">停用</option></select>')
-      + '</div>',
+    body: pricingFormBody(null),
     note: '单价为每百万 Token 的美元金额；同匹配方式同模式重复添加将覆盖原规则。',
     onOk: async () => {
-      const num = id => Math.round((parseFloat($(id).value) || 0) * 1e6);
-      await post('/pricing', {
-        match_kind: $('p-kind').value,
-        pattern: $('p-pattern').value.trim() || '*',
-        priority: parseInt($('p-priority').value, 10) || 0,
-        enabled: $('p-enabled').value === 'true',
-        price_input: num('p-in'), price_output: num('p-out'),
-        price_reasoning: num('p-reasoning'), price_cached: num('p-cached'),
-        price_cache_read: num('p-cache-read'), price_cache_creation: num('p-cache-create'),
-        accounting_mode: 'default', billing_mode: 'token', per_image_micro_usd: 0,
-        source: 'manual',
-      });
+      await post('/pricing', pricingSubmit());
       toast('规则已保存', 'ok');
+      loaders.pricing().catch(() => {});
+    },
+  });
+});
+$('pricing-rows').addEventListener('click', e => {
+  const b = e.target.closest('button[data-edit]');
+  if (!b) return;
+  const p = pricingCache.items.find(x => x.id === parseInt(b.dataset.edit, 10));
+  if (!p) return;
+  openSheet({
+    title: '编辑计价规则 #' + p.id, okText: '保存',
+    body: pricingFormBody(p),
+    note: '修改匹配方式或模式会按新键生效；若新键已存在，两条将合并为一条。计价口径与来源保持原值。',
+    onOk: async () => {
+      const body = pricingSubmit();
+      body.id = p.id;
+      // 口径字段不在表单里，保留原值避免把按张计价 / models.dev 规则改坏。
+      body.accounting_mode = p.accounting_mode;
+      body.billing_mode = p.billing_mode;
+      body.per_image_micro_usd = p.per_image_micro_usd;
+      body.source = p.source;
+      body.models_dev_id = p.models_dev_id;
+      await post('/pricing', body);
+      toast('规则已更新', 'ok');
       loaders.pricing().catch(() => {});
     },
   });

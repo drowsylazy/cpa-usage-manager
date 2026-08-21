@@ -466,6 +466,26 @@ func (a *Accumulator) FeedSSE(chunk []byte) {
 	}
 }
 
+// FeedChunk 喂入宿主 stream_read 交付的一段流载荷。
+//
+// 宿主交付的形状不止一种：openai→openai 直通翻译会剥掉 SSE 的 data: 前缀并
+// 丢弃 [DONE]（裸 JSON 对象），其他协议组合则保留完整 SSE 帧，载荷还可能在
+// 帧边界被拆分。这里先按整段解析（JSON 或 SSE），失败再逐行重试，
+// 覆盖多个裸 JSON 对象拼接在同一段载荷里的情况。merge 取较大值，重复喂入无害。
+func (a *Accumulator) FeedChunk(payload []byte) {
+	if u, ok := Parse(payload); ok {
+		a.usage.merge(u)
+		a.found = true
+		return
+	}
+	for _, line := range bytes.Split(payload, []byte("\n")) {
+		if u, ok := Parse(bytes.TrimSpace(line)); ok {
+			a.usage.merge(u)
+			a.found = true
+		}
+	}
+}
+
 // Result 返回累积结果；ok=false 表示整个流都没有用量信息。
 func (a *Accumulator) Result() (Usage, bool) {
 	if !a.found {

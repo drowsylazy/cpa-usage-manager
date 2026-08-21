@@ -509,6 +509,39 @@ func TestAccumulatorMergeNeverDecreases(t *testing.T) {
 	}
 }
 
+func TestFeedChunkBareJSONStream(t *testing.T) {
+	// 宿主 openai→openai 直通翻译会剥掉 data: 前缀并丢弃 [DONE]，
+	// stream_read 交付的是裸 JSON 对象；末帧只含 usage（choices 为空）。
+	// 回归点：FeedSSE 只认 data: 行，对裸载荷解析出零 token。
+	var acc Accumulator
+	acc.FeedChunk([]byte(`{"id":"c1","object":"chat.completion.chunk","choices":[{"delta":{"content":"hi"}}]}`))
+	if _, ok := acc.Result(); ok {
+		t.Error("无 usage 的裸载荷不应计入")
+	}
+	acc.FeedChunk([]byte(`{"id":"c1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":1149,"completion_tokens":494,"total_tokens":1643,"prompt_tokens_details":{"cached_tokens":64}}}`))
+	u, ok := acc.Result()
+	if !ok {
+		t.Fatal("usage 帧应被解析")
+	}
+	if u.InputTokens != 1149 || u.OutputTokens != 494 || u.TotalTokens != 1643 || u.CachedTokens != 64 {
+		t.Errorf("裸 JSON 流累积 = %+v", u)
+	}
+
+	// 完整 SSE 帧仍走原路径。
+	acc.Reset()
+	acc.FeedChunk([]byte("data: {\"usage\":{\"prompt_tokens\":7}}\n\ndata: [DONE]\n\n"))
+	if u, ok := acc.Result(); !ok || u.InputTokens != 7 {
+		t.Errorf("SSE 帧解析失败: %+v ok=%v", u, ok)
+	}
+
+	// 多个裸 JSON 对象拼在同一段载荷（逐行重试路径）。
+	acc.Reset()
+	acc.FeedChunk([]byte("{\"usage\":{\"prompt_tokens\":11}}\n{\"usage\":{\"completion_tokens\":13}}"))
+	if u, ok := acc.Result(); !ok || u.InputTokens != 11 || u.OutputTokens != 13 {
+		t.Errorf("拼接载荷解析失败: %+v ok=%v", u, ok)
+	}
+}
+
 func TestParseAutoDetect(t *testing.T) {
 	// JSON 形态
 	if u, ok := Parse([]byte(`{"usage":{"prompt_tokens":3,"completion_tokens":4}}`)); !ok || u.InputTokens != 3 {

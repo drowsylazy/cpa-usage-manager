@@ -85,7 +85,9 @@ func ValidBillingMode(m string) error {
 }
 
 // UpsertPricingRule 新增或更新一条计价规则。
-// (match_kind, pattern) 唯一，重复写入即为更新。
+// 不带 ID 时按 (match_kind, pattern) 唯一键 upsert，重复写入即为更新；
+// 带 ID 时按 ID 编辑已存在条目：键未变原位更新（id 与创建时间保持稳定），
+// 键变更则删除旧行后写入新键——新键已存在时合并为一条。
 func (s *Store) UpsertPricingRule(ctx context.Context, r PricingRule) (PricingRule, error) {
 	r.MatchKind = strings.ToLower(strings.TrimSpace(r.MatchKind))
 	r.Pattern = strings.TrimSpace(r.Pattern)
@@ -110,6 +112,47 @@ func (s *Store) UpsertPricingRule(ctx context.Context, r PricingRule) (PricingRu
 
 	now := nowMillis()
 	err := s.Write(ctx, func(tx *sql.Tx) error {
+		if r.ID > 0 {
+			old, e := scanPricingRule(tx.QueryRowContext(ctx,
+				`SELECT `+pricingColumns+` FROM pricing_rules WHERE id = ?`, r.ID))
+			if errors.Is(e, sql.ErrNoRows) {
+				return fmt.Errorf("%w: 计价规则 #%d", ErrNotFound, r.ID)
+			}
+			if e != nil {
+				return fmt.Errorf("读取计价规则 #%d 失败: %w", r.ID, e)
+			}
+			if old.MatchKind == r.MatchKind && old.Pattern == r.Pattern {
+				if _, e := tx.ExecContext(ctx,
+					`UPDATE pricing_rules SET
+						priority             = ?,
+						enabled              = ?,
+						price_input          = ?,
+						price_output         = ?,
+						price_reasoning      = ?,
+						price_cached         = ?,
+						price_cache_read     = ?,
+						price_cache_creation = ?,
+						accounting_mode      = ?,
+						billing_mode         = ?,
+						per_image_micro_usd  = ?,
+						source               = ?,
+						models_dev_id        = ?,
+						updated_at           = ?
+					WHERE id = ?`,
+					r.Priority, boolInt(r.Enabled),
+					int64(r.PriceInput), int64(r.PriceOutput), int64(r.PriceReasoning), int64(r.PriceCached),
+					int64(r.PriceCacheRead), int64(r.PriceCacheCreation),
+					r.AccountingMode, r.BillingMode, int64(r.PerImageMicroUSD),
+					r.Source, r.ModelsDevID, now, r.ID); e != nil {
+					return fmt.Errorf("更新计价规则 #%d 失败: %w", r.ID, e)
+				}
+				return nil
+			}
+			// 键变更：先移除旧行，再落到下方的新键 upsert。
+			if _, e := tx.ExecContext(ctx, `DELETE FROM pricing_rules WHERE id = ?`, r.ID); e != nil {
+				return fmt.Errorf("移除旧计价规则 #%d 失败: %w", r.ID, e)
+			}
+		}
 		_, err := tx.ExecContext(ctx,
 			`INSERT INTO pricing_rules (
 				match_kind, pattern, priority, enabled,

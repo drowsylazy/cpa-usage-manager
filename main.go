@@ -988,7 +988,7 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 				remain := minInt(maxBuffer-len(buf), len(chunk.Payload))
 				buf = append(buf, chunk.Payload[:remain]...)
 			}
-			acc.FeedSSE(chunk.Payload)
+			acc.FeedChunk(chunk.Payload)
 			if firstChunkAt.IsZero() {
 				firstChunkAt = time.Now()
 			}
