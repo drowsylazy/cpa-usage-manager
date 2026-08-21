@@ -231,6 +231,22 @@ func (s *Store) DeletePricingRule(ctx context.Context, id int64) error {
 	})
 }
 
+// ResetPricingRules 清空全部非兜底计价规则，恢复到仅剩全模型免费兜底规则的初始状态。
+// 返回删除的规则数。兜底规则（glob:*）与单删一致地保留。
+func (s *Store) ResetPricingRules(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.Write(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`DELETE FROM pricing_rules WHERE NOT (match_kind = 'glob' AND pattern = '*')`)
+		if err != nil {
+			return fmt.Errorf("清空计价规则失败: %w", err)
+		}
+		n, _ = res.RowsAffected()
+		return nil
+	})
+	return n, err
+}
+
 // SetPricingRuleEnabled 启用/停用规则。
 func (s *Store) SetPricingRuleEnabled(ctx context.Context, id int64, enabled bool) error {
 	return s.Write(ctx, func(tx *sql.Tx) error {

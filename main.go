@@ -655,6 +655,8 @@ func managementRegistration() rpcManagementRegistration {
 		{Method: "GET", Path: base + "/pricing", Description: "计价规则列表"},
 		{Method: "POST", Path: base + "/pricing", Description: "新建/更新计价规则"},
 		{Method: "POST", Path: base + "/pricing/delete", Description: "删除计价规则"},
+		{Method: "GET", Path: base + "/pricing/search", Description: "models.dev 计价搜索"},
+		{Method: "POST", Path: base + "/pricing/reset", Description: "清空计价规则（保留免费兜底）"},
 		{Method: "POST", Path: base + "/pricing/sync", Description: "models.dev 同步"},
 		{Method: "GET", Path: base + "/usage", Description: "请求明细"},
 		{Method: "GET", Path: base + "/usage/summary", Description: "用量汇总"},

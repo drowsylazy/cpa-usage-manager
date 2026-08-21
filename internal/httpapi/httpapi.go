@@ -51,6 +51,7 @@ func (a *API) register() {
 	a.mux.HandleFunc(base+"/pricing", a.auth(a.pricing))
 	a.mux.HandleFunc(base+"/pricing/delete", a.auth(a.pricingDelete))
 	a.mux.HandleFunc(base+"/pricing/search", a.auth(a.pricingSearch))
+	a.mux.HandleFunc(base+"/pricing/reset", a.auth(a.pricingReset))
 	a.mux.HandleFunc(base+"/pricing/sync", a.auth(a.pricingSync))
 
 	a.mux.HandleFunc(base+"/usage", a.auth(a.usage))
@@ -436,6 +437,20 @@ func (a *API) pricingSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOut(w, v, 200)
+}
+func (a *API) pricingReset(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Actor string `json:"actor"`
+	}
+	_ = decode(r, &in)
+	n, e := a.st.ResetPricingRules(r.Context())
+	if e != nil {
+		jsonOut(w, map[string]string{"error": e.Error()}, 500)
+		return
+	}
+	noStore(w)
+	_ = a.st.AppendAudit(r.Context(), store.AuditEvent{Actor: in.Actor, Action: "pricing.reset", EntityType: "pricing", EntityID: strconv.FormatInt(n, 10)})
+	jsonOut(w, map[string]any{"ok": true, "deleted": n}, 200)
 }
 func (a *API) pricingSync(w http.ResponseWriter, r *http.Request) {
 	var in struct {

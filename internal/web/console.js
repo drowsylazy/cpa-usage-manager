@@ -611,7 +611,7 @@ function renderTrend() {
   const y = v => padT + ih - (v / ymax) * ih;
   const n = pts.length;
   const slot = iw / n;                 // 每个桶的槽宽
-  const barW = Math.max(2, Math.min(36, slot * 0.72));
+  const barW = Math.max(2, Math.min(44, slot * 0.85));
   const cx = i => padL + slot * i + slot / 2;
 
   let grid = '', labels = '';
@@ -681,8 +681,8 @@ function renderTrend() {
     tip.innerHTML = '<div class="tip-head">' + esc(bucketLabel(p.bucket, grain)) + '</div>' + rows;
     tip.hidden = false;
     const px = cx(idx) / W * rect.width;
-    tip.style.left = Math.max(84, Math.min(rect.width - 84, px)) + 'px';
-    tip.style.top = '6px';
+    tip.style.left = Math.max(90, Math.min(rect.width - 90, px)) + 'px';
+    tip.style.top = '10px';
   });
   svg.addEventListener('mouseleave', () => {
     tip.hidden = true;
@@ -1282,6 +1282,19 @@ async function pricingSearchRun() {
 $('pricing-search-btn').addEventListener('click', pricingSearchRun);
 $('pricing-search-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') { e.preventDefault(); pricingSearchRun(); }
+});
+$('pricing-reset').addEventListener('click', () => {
+  openSheet({
+    title: '清空计价规则',
+    okText: '清空', danger: true,
+    body: '<p>将删除全部自定义计价规则，只保留全模型免费兜底规则（glob:*）。'
+      + '密钥额度与用量数据不受影响。此操作不可撤销，确定继续吗？</p>',
+    onOk: async () => {
+      const r = await post('/pricing/reset', { actor: 'console' });
+      toast('已清空 ' + (r.deleted || 0) + ' 条计价规则', 'ok');
+      loaders.pricing().catch(() => {});
+    },
+  });
 });
 $('pricing-search-results').addEventListener('click', async e => {
   const b = e.target.closest('button[data-si]');
