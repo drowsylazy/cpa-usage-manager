@@ -8,12 +8,20 @@ import (
 func TestConsoleHTML(t *testing.T) {
 	html := string(ConsoleHTML())
 
+	// 组装后必须是自包含单文件：CSS / JS 已注入占位符。
+	if strings.Contains(html, "/*@console.css*/") || strings.Contains(html, "/*@console.js*/") {
+		t.Error("CSS/JS 占位符未被注入")
+	}
+	if !strings.Contains(html, "--signal") || !strings.Contains(html, "sessionStorage") {
+		t.Error("组装结果缺少样式或脚本内容")
+	}
+
 	// 必须包含各页签与关键能力元素。
 	expected := []string{
 		"CPA 用量管理", "概览", "密钥", "用量", "价格", "认证额度", "审计", "系统",
-		"cpa-management-key", "sessionStorage", "mgmt-key", "ov-chart",
-		"issue-form", "key-rows", "dim-table", "pricing-rows", "auth-rows",
-		"audit-rows", "backup-btn", "restore-btn", "reset-btn",
+		"cpa-management-key", "gate-key", "trend-chart",
+		"key-rows", "dim-body", "pricing-rows", "auth-body",
+		"audit-body", "backup-btn", "restore-btn", "reset-btn",
 		"/v0/management/plugins/cpa-usage-manager",
 	}
 	for _, e := range expected {

@@ -443,8 +443,28 @@ func (a *API) pricingSync(w http.ResponseWriter, r *http.Request) {
 
 // ---------- usage / analytics ----------
 
+// parseFilter 把 URL query 解析成统一筛选条件，语义与导出接口的
+// QueryFilter 完全一致（时间接受 RFC3339 / 日期 / Unix 毫秒）。
+func parseFilter(r *http.Request) service.UsageFilter {
+	q := r.URL.Query()
+	f := service.UsageFilter{
+		KeyID:    q.Get("key_id"),
+		CallerID: q.Get("caller_id"),
+		Model:    q.Get("model"),
+		Provider: q.Get("provider"),
+		Result:   q.Get("result"),
+	}
+	if from := service.ParseTime(q.Get("from")); !from.IsZero() {
+		f.From = from
+	}
+	if to := service.ParseTime(q.Get("to")); !to.IsZero() {
+		f.To = to
+	}
+	return f
+}
+
 func (a *API) usage(w http.ResponseWriter, r *http.Request) {
-	f := service.UsageFilter{KeyID: r.URL.Query().Get("key_id"), Model: r.URL.Query().Get("model")}
+	f := parseFilter(r)
 	v, e := a.svc.ListRequests(r.Context(), f, atoi(r.URL.Query().Get("limit")), atoi(r.URL.Query().Get("offset")), r.URL.Query().Get("sort"), r.URL.Query().Get("order"))
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 500)
@@ -453,13 +473,7 @@ func (a *API) usage(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, v, 200)
 }
 func (a *API) usageDimension(w http.ResponseWriter, r *http.Request) {
-	f := service.UsageFilter{KeyID: r.URL.Query().Get("key_id"), Model: r.URL.Query().Get("model"), CallerID: r.URL.Query().Get("caller_id"), Provider: r.URL.Query().Get("provider"), Result: r.URL.Query().Get("result")}
-	if from := service.ParseTime(r.URL.Query().Get("from")); !from.IsZero() {
-		f.From = from
-	}
-	if to := service.ParseTime(r.URL.Query().Get("to")); !to.IsZero() {
-		f.To = to
-	}
+	f := parseFilter(r)
 	v, e := a.svc.GroupByDimension(r.Context(), f, r.URL.Query().Get("dimension"), atoi(r.URL.Query().Get("limit")))
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 400)
@@ -476,7 +490,7 @@ func (a *API) usageSummary(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, v, 200)
 }
 func (a *API) trends(w http.ResponseWriter, r *http.Request) {
-	v, e := a.svc.Trends(r.Context(), service.UsageFilter{KeyID: r.URL.Query().Get("key_id")}, r.URL.Query().Get("grain"))
+	v, e := a.svc.Trends(r.Context(), parseFilter(r), r.URL.Query().Get("grain"))
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 400)
 		return
@@ -484,7 +498,7 @@ func (a *API) trends(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, v, 200)
 }
 func (a *API) costs(w http.ResponseWriter, r *http.Request) {
-	v, e := a.svc.Costs(r.Context(), service.UsageFilter{KeyID: r.URL.Query().Get("key_id")})
+	v, e := a.svc.Costs(r.Context(), parseFilter(r))
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 500)
 		return
