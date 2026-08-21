@@ -244,6 +244,7 @@ type UsageBackfill struct {
 	CacheReadTokens     int64
 	CacheCreationTokens int64
 	TotalTokens         int64
+	TTFTMS              int64
 }
 
 // Request 是一条逐请求记录（tracker 明细与 credit-manager 账本合并）。

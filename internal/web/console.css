@@ -374,6 +374,16 @@ tr.detail>td{background:var(--sunken);padding:14px 16px;white-space:normal;borde
 .legend-item[aria-pressed="false"]{color:var(--fg4)}
 .legend-item[aria-pressed="false"] .swatch{background:var(--line3)!important}
 
+/* 指标切换分段控件 */
+.seg{display:inline-flex;flex:none;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{
+  appearance:none;border:0;background:none;color:var(--fg3);
+  font:inherit;font-size:11.5px;font-weight:600;padding:5px 10px;cursor:pointer;
+}
+.seg button + button{border-left:1px solid var(--line)}
+.seg button:hover{color:var(--fg)}
+.seg button.on{background:var(--sunken);color:var(--fg)}
+
 /* ── 认证额度卡 ───────────────────────────────────────────────── */
 .auth-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
 .auth-card{padding:13px 14px;border:1px solid var(--line);border-radius:10px;background:var(--sunken);display:grid;gap:10px}

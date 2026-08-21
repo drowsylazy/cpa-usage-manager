@@ -1293,20 +1293,35 @@ func handleUsage(body []byte) ([]byte, error) {
 	// quota 模式：cum- 密钥流量已由执行器/拦截器在结算路径一次性入库，
 	// 不重复写；原生 API Key / 匿名流量不经过插件执行器，这里被动记录。
 	if cfg.Quota.Enabled {
+		bf := store.UsageBackfill{
+			InputTokens:         u.Detail.InputTokens,
+			OutputTokens:        u.Detail.OutputTokens,
+			ReasoningTokens:     u.Detail.ReasoningTokens,
+			CachedTokens:        u.Detail.CachedTokens,
+			CacheReadTokens:     u.Detail.CacheReadTokens,
+			CacheCreationTokens: u.Detail.CacheCreationTokens,
+			TotalTokens:         u.Detail.TotalTokens,
+			TTFTMS:              u.TTFT.Milliseconds(),
+		}
+		hasDetail := bf.InputTokens > 0 || bf.OutputTokens > 0 || bf.TotalTokens > 0
+		models := modelCandidates(u.Model, u.Alias)
 		if kid, isCum := service.ParseKeyID(u.APIKey); isCum {
 			// 宿主用量观察（usage.handle）是权威口径：执行器的流式解析可能
 			// 拿不到上游用量（部分 OpenAI 兼容上游不在流里回 usage），
 			// 这里给最近一条零用量记录回填 token 明细，避免统计失真。
-			if u.Detail.InputTokens > 0 || u.Detail.OutputTokens > 0 || u.Detail.TotalTokens > 0 {
-				if _, err := svc.BackfillRequestUsage(context.Background(), kid, u.Model, u.RequestedAt, store.UsageBackfill{
-					InputTokens:         u.Detail.InputTokens,
-					OutputTokens:        u.Detail.OutputTokens,
-					ReasoningTokens:     u.Detail.ReasoningTokens,
-					CachedTokens:        u.Detail.CachedTokens,
-					CacheReadTokens:     u.Detail.CacheReadTokens,
-					CacheCreationTokens: u.Detail.CacheCreationTokens,
-					TotalTokens:         u.Detail.TotalTokens,
-				}); err != nil {
+			if hasDetail {
+				if _, err := svc.BackfillRequestUsage(context.Background(), kid, models, u.RequestedAt, bf); err != nil {
+					return nil, err
+				}
+			}
+			return okEnvelope(map[string]any{})
+		}
+		// APIKey 不是插件 Key 的回调（部分兼容渠道把上游凭据放进该字段）：
+		// 若能按 时间+延迟+模型 关联到执行器已入库的记录，视为同一请求，
+		// 不再被动入库（否则统计翻倍），仅回填缺失用量。
+		if id, dup, err := svc.FindDuplicateExecutor(context.Background(), models, u.RequestedAt, u.Latency.Milliseconds()); err == nil && dup {
+			if hasDetail {
+				if err := svc.BackfillRequestUsageByID(context.Background(), id, bf); err != nil {
 					return nil, err
 				}
 			}
@@ -1335,13 +1350,37 @@ func usageFromRecord(u rpcUsageRecord) usageparse.Usage {
 	}
 }
 
+// modelCandidates 归并宿主上报的模型名候选：别名、原始模型、去渠道前缀的裸名。
+// 执行器落库常用「渠道/模型」别名，而 usage.handle 上报原始模型，判重需按候选集匹配。
+func modelCandidates(model, alias string) []string {
+	out := make([]string, 0, 3)
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return
+		}
+		for _, v := range out {
+			if v == s {
+				return
+			}
+		}
+		out = append(out, s)
+	}
+	add(alias)
+	add(model)
+	if i := strings.LastIndex(model, "/"); i >= 0 && i+1 < len(model) {
+		add(model[i+1:])
+	}
+	return out
+}
+
 func usageRecordToRequest(st *store.Store, u rpcUsageRecord) store.Request {
 	req := store.Request{
 		ID:                  uuid.NewString(),
 		TS:                  u.RequestedAt,
 		Model:               u.Model,
 		Provider:            u.Provider,
-		Source:              u.Source,
+		Source:              store.RedactSource(u.Source),
 		AuthID:              u.AuthID,
 		AuthType:            u.AuthType,
 		Tier:                u.ServiceTier,

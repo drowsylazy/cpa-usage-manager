@@ -414,8 +414,18 @@ func (s *Service) Release(ctx context.Context, id string) (store.Reservation, er
 // BackfillRequestUsage 用宿主 usage.handle 的权威用量回填最近的零用量记录。
 // 执行器流式解析拿不到上游用量时（费用按预占估算入账），token 明细在此补齐；
 // 分钟聚合不回填，属可接受的统计口径差异。
-func (s *Service) BackfillRequestUsage(ctx context.Context, kid, model string, near time.Time, b store.UsageBackfill) (bool, error) {
-	return s.st.BackfillRequestUsage(ctx, kid, model, near, b)
+func (s *Service) BackfillRequestUsage(ctx context.Context, kid string, models []string, near time.Time, b store.UsageBackfill) (bool, error) {
+	return s.st.BackfillRequestUsage(ctx, kid, models, near, b)
+}
+
+// FindDuplicateExecutor 按 时间+延迟+模型 关联执行器已入库的记录，用于判重。
+func (s *Service) FindDuplicateExecutor(ctx context.Context, models []string, near time.Time, latencyMS int64) (string, bool, error) {
+	return s.st.FindDuplicateExecutor(ctx, models, near, latencyMS)
+}
+
+// BackfillRequestUsageByID 按 ID 回填宿主上报的用量明细。
+func (s *Service) BackfillRequestUsageByID(ctx context.Context, id string, b store.UsageBackfill) error {
+	return s.st.BackfillRequestUsageByID(ctx, id, b)
 }
 
 // UpdateKey、RevokeKey、DeleteKey 是管理面调用的薄封装，并统一写审计。

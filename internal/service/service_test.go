@@ -92,7 +92,7 @@ func TestBackfillRequestUsage(t *testing.T) {
 		InputTokens: 100, OutputTokens: 50, ReasoningTokens: 10,
 		CachedTokens: 0, CacheReadTokens: 20, CacheCreationTokens: 5, TotalTokens: 185,
 	}
-	ok, err := s.BackfillRequestUsage(ctx, issued.KID, "gpt-test", ts, b)
+	ok, err := s.BackfillRequestUsage(ctx, issued.KID, []string{"gpt-test"}, ts, b)
 	if err != nil || !ok {
 		t.Fatalf("回填失败: ok=%v err=%v", ok, err)
 	}
@@ -108,13 +108,47 @@ func TestBackfillRequestUsage(t *testing.T) {
 		t.Fatalf("回填不应改动费用: %s", got.CostMicroUSD)
 	}
 	// 已有用量与窗口外的记录都不应再被回填。
-	again, err := s.BackfillRequestUsage(ctx, issued.KID, "gpt-test", ts, b)
+	again, err := s.BackfillRequestUsage(ctx, issued.KID, []string{"gpt-test"}, ts, b)
 	if err != nil || again {
 		t.Fatalf("二次回填应无匹配: ok=%v err=%v", again, err)
 	}
-	far, err := s.BackfillRequestUsage(ctx, issued.KID, "gpt-test", ts.Add(time.Hour), b)
+	far, err := s.BackfillRequestUsage(ctx, issued.KID, []string{"gpt-test"}, ts.Add(time.Hour), b)
 	if err != nil || far {
 		t.Fatalf("窗口外回填应无匹配: ok=%v err=%v", far, err)
+	}
+}
+
+func TestFindDuplicateAndBackfillByID(t *testing.T) {
+	s, st := testService(t)
+	ctx := context.Background()
+	ts := time.Now().UTC().Add(-2 * time.Second)
+	exec := store.Request{
+		ID: "req-exec", TS: ts, KeyID: "abc123", CallerID: store.DefaultCallerID,
+		Model: "stepfun/step-3.7-flash", Provider: "openai", Result: store.ResultOK,
+		LatencyMS: 2805,
+	}
+	if err := st.RecordUsage(ctx, exec); err != nil {
+		t.Fatal(err)
+	}
+	// 延迟差 3ms、模型用裸名（宿主上报口径）→ 应命中执行器记录。
+	id, dup, err := s.FindDuplicateExecutor(ctx, []string{"step-3.7-flash"}, ts, 2808)
+	if err != nil || !dup || id != "req-exec" {
+		t.Fatalf("判重失败: id=%q dup=%v err=%v", id, dup, err)
+	}
+	// 延迟差异过大 → 不应命中。
+	if _, dup, err := s.FindDuplicateExecutor(ctx, []string{"step-3.7-flash"}, ts, 9999); err != nil || dup {
+		t.Fatalf("延迟不匹配不应判重: dup=%v err=%v", dup, err)
+	}
+	bf := store.UsageBackfill{InputTokens: 14, OutputTokens: 91, TotalTokens: 105, TTFTMS: 867}
+	if err := s.BackfillRequestUsageByID(ctx, id, bf); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetRequest(ctx, "req-exec")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.InputTokens != 14 || got.OutputTokens != 91 || got.TotalTokens != 105 || got.TTFTMS != 867 {
+		t.Fatalf("按 ID 回填数据不符: %+v", got)
 	}
 }
 

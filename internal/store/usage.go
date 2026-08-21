@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/drowsylazy/cpa-usage-manager/internal/money"
@@ -137,29 +138,54 @@ func (s *Store) GetRequest(ctx context.Context, id string) (Request, error) {
 	return r, nil
 }
 
-// BackfillRequestUsage 给 key+model 在 near 前后 15 秒内最近一条零用量记录
-// 补写宿主 usage.handle 上报的 token 明细。返回是否找到并更新了记录。
+// BackfillRequestUsage 给 key+model 候选在 near 前后 15 秒内最近一条零用量记录
+// 补写宿主 usage.handle 上报的 token 明细（执行器落库的模型可能是别名，
+// 因此按候选列表匹配：原始模型 / 别名 / 「渠道/模型」后缀）。返回是否更新。
 // 只补逐请求行，分钟聚合不回填（可接受的口径差异）。
-func (s *Store) BackfillRequestUsage(ctx context.Context, kid, model string, near time.Time, b UsageBackfill) (bool, error) {
+// modelMatchFragment 生成「model IN (…) OR model LIKE '渠道/模型'」的匹配片段。
+// 执行器落库常用「渠道/模型」别名，宿主上报原始模型，需按候选集 + 后缀双匹配。
+func modelMatchFragment(models []string) (string, []any) {
+	in := placeholders(len(models))
+	like := strings.TrimSuffix(strings.Repeat("OR model LIKE ? ESCAPE '\\' ,", len(models)), ",")
+	frag := "(model IN (" + in + ") " + like + ")"
+	args := make([]any, 0, len(models)*2)
+	for _, m := range models {
+		args = append(args, m)
+	}
+	for _, m := range models {
+		args = append(args, "%/"+escapeLike(m))
+	}
+	return frag, args
+}
+
+// escapeLike 转义 LIKE 通配符。
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	return strings.ReplaceAll(s, `_`, `\_`)
+}
+
+func (s *Store) BackfillRequestUsage(ctx context.Context, kid string, models []string, near time.Time, b UsageBackfill) (bool, error) {
+	if len(models) == 0 {
+		return false, nil
+	}
+	frag, margs := modelMatchFragment(models)
+	args := make([]any, 0, len(margs)+3)
+	args = append(args, kid)
+	args = append(args, margs...)
+	args = append(args, near.Add(-15*time.Second).UnixMilli(), near.Add(15*time.Second).UnixMilli())
 	var id string
 	err := s.Write(ctx, func(tx *sql.Tx) error {
 		row := tx.QueryRowContext(ctx,
 			`SELECT id FROM requests
-			 WHERE key_id = ? AND model = ?
+			 WHERE key_id = ? AND `+frag+`
 			   AND input_tokens = 0 AND output_tokens = 0 AND total_tokens = 0
 			   AND ts BETWEEN ? AND ?
-			 ORDER BY ts DESC LIMIT 1`,
-			kid, model, near.Add(-15*time.Second).UnixMilli(), near.Add(15*time.Second).UnixMilli())
+			 ORDER BY ts DESC LIMIT 1`, args...)
 		if e := row.Scan(&id); e != nil {
 			return e
 		}
-		_, e := tx.ExecContext(ctx,
-			`UPDATE requests SET input_tokens=?, output_tokens=?, reasoning_tokens=?,
-			    cached_tokens=?, cache_read_tokens=?, cache_creation_tokens=?, total_tokens=?
-			 WHERE id = ? AND total_tokens = 0`,
-			b.InputTokens, b.OutputTokens, b.ReasoningTokens,
-			b.CachedTokens, b.CacheReadTokens, b.CacheCreationTokens, b.TotalTokens, id)
-		return e
+		return backfillRequestTx(ctx, tx, id, b)
 	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -170,6 +196,66 @@ func (s *Store) BackfillRequestUsage(ctx context.Context, kid, model string, nea
 	return true, nil
 }
 
+// FindDuplicateExecutor 按 时间±15s + 延迟±150ms + 模型候选 关联执行器已入库的记录。
+// 宿主 usage.handle 的 APIKey 字段在部分兼容渠道里是上游凭据而非插件 Key，
+// 无法用 kid 判重；同一请求的两次回调延迟仅差几毫秒，该组合足以唯一对应。
+func (s *Store) FindDuplicateExecutor(ctx context.Context, models []string, near time.Time, latencyMS int64) (string, bool, error) {
+	if len(models) == 0 {
+		return "", false, nil
+	}
+	frag, margs := modelMatchFragment(models)
+	args := make([]any, 0, len(margs)+4)
+	args = append(args, margs...)
+	args = append(args, latencyMS-150, latencyMS+150,
+		near.Add(-15*time.Second).UnixMilli(), near.Add(15*time.Second).UnixMilli())
+	var id string
+	row := s.readDB.QueryRowContext(ctx,
+		`SELECT id FROM requests
+		 WHERE key_id <> '' AND `+frag+`
+		   AND latency_ms BETWEEN ? AND ?
+		   AND ts BETWEEN ? AND ?
+		 ORDER BY ts DESC LIMIT 1`, args...)
+	if err := row.Scan(&id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return id, true, nil
+}
+
+// BackfillRequestUsageByID 按 ID 回填宿主上报的用量明细（含首字延迟兜底）。
+func (s *Store) BackfillRequestUsageByID(ctx context.Context, id string, b UsageBackfill) error {
+	return s.Write(ctx, func(tx *sql.Tx) error {
+		return backfillRequestTx(ctx, tx, id, b)
+	})
+}
+
+func backfillRequestTx(ctx context.Context, tx *sql.Tx, id string, b UsageBackfill) error {
+	_, err := tx.ExecContext(ctx,
+		`UPDATE requests SET
+		    input_tokens = ?, output_tokens = ?, reasoning_tokens = ?,
+		    cached_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?,
+		    total_tokens = ?,
+		    ttft_ms = CASE WHEN ttft_ms = 0 THEN ? ELSE ttft_ms END
+		 WHERE id = ?`,
+		b.InputTokens, b.OutputTokens, b.ReasoningTokens,
+		b.CachedTokens, b.CacheReadTokens, b.CacheCreationTokens,
+		b.TotalTokens, b.TTFTMS, id)
+	if err != nil {
+		return fmt.Errorf("回填请求 %s 用量失败: %w", id, err)
+	}
+	return nil
+}
+
+// placeholders 生成 n 个 SQL 占位符。
+func placeholders(n int) string {
+	if n <= 0 {
+		return "''"
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
 // requestColumns 是 requests 表的完整列清单。
 const requestColumns = `id, ts, key_id, caller_id, model, provider, source,
 	auth_id, auth_label, auth_type, tier, result,
@@ -177,6 +263,33 @@ const requestColumns = `id, ts, key_id, caller_id, model, provider, source,
 	cache_read_tokens, cache_creation_tokens, total_tokens,
 	latency_ms, ttft_ms, generation_ms, tps_milli,
 	thinking_intensity, cost_micro_usd, priced, reservation_id`
+
+// RedactSource 清洗疑似上游凭据的来源字段。
+// 部分兼容渠道会把上游 API Key 填进 Source；这类值绝不入库/外显：
+// - sk- 前缀的凭据；
+// - 32 位以上纯字母数字单 token（正常来源是 openai、openai-compatible-xxx 等短标签）。
+func RedactSource(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(s, "sk-") && len(s) >= 16 {
+		return ""
+	}
+	if len(s) >= 32 && !strings.ContainsAny(s, "-./_ ") && isAlnum(s) {
+		return ""
+	}
+	return s
+}
+
+func isAlnum(s string) bool {
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') {
+			return false
+		}
+	}
+	return len(s) > 0
+}
 
 // scanRequest 从一行结果扫描 Request。
 func scanRequest(sc interface{ Scan(...any) error }) (Request, error) {
@@ -197,5 +310,6 @@ func scanRequest(sc interface{ Scan(...any) error }) (Request, error) {
 	r.TS = time.UnixMilli(ts).UTC()
 	r.CostMicroUSD = money.Micro(cost)
 	r.Priced = priced != 0
+	r.Source = RedactSource(r.Source)
 	return r, nil
 }

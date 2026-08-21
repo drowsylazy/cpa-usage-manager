@@ -116,9 +116,9 @@ function logout() {
 const S = { fx: null, stats: null };
 
 // ---------- 主题 ----------
-// 偏好存 localStorage（auto/light/dark）；DOM 上始终落成解析后的 light/dark。
-// auto 且嵌入宿主时镜像 management.html 的深浅色：class / data-theme / 背景亮度
-// 三重探测，MutationObserver 实时跟随；独立打开时回退系统偏好。
+// 无手动切换：始终跟随宿主页面（嵌入时镜像 management.html 的深浅色：
+// class / data-theme / 背景亮度三重探测，MutationObserver 实时跟随）；
+// 独立打开时回退系统偏好。
 function parentDoc() {
   try { return window.parent && window.parent !== window ? window.parent.document : null; }
   catch (_) { return null; } // 跨域 iframe
@@ -146,29 +146,11 @@ function detectParentDark() {
   }
   return null;
 }
-function resolveDark() {
-  const pref = localStorage.getItem('console-theme') || 'auto';
-  if (pref === 'dark') return true;
-  if (pref === 'light') return false;
-  const p = detectParentDark();
-  if (p !== null) return p;
-  return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
-}
 function applyTheme() {
-  const dark = resolveDark();
+  let dark = detectParentDark();
+  if (dark === null) dark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
   document.documentElement.dataset.theme = dark ? 'dark' : 'light';
-  const pref = localStorage.getItem('console-theme') || 'auto';
-  const embedded = !!parentDoc();
-  const t = { auto: '主题：跟随' + (embedded ? '宿主' : '系统'), light: '主题：浅色', dark: '主题：深色' }[pref];
-  $('theme-btn').title = t;
-  $('theme-btn').setAttribute('aria-label', t);
 }
-$('theme-btn').addEventListener('click', () => {
-  const cur = localStorage.getItem('console-theme') || 'auto';
-  localStorage.setItem('console-theme', cur === 'auto' ? 'light' : cur === 'light' ? 'dark' : 'auto');
-  applyTheme();
-  if (activeTab === 'overview' && trend.points.length) renderTrend();
-});
 (function watchParentTheme() {
   const doc = parentDoc();
   if (!doc) return;
@@ -385,9 +367,11 @@ loaders.overview = async () => {
   ]);
   if (!S.fx) { S.fx = await api('/exchange-rate').catch(() => null); }
   trend.points = Array.isArray(points) ? points : [];
+  ovCache.models = dimModel.rows || [];
+  ovCache.keys = dimKey.rows || [];
   renderReadouts(dimModel.total || {}, costs);
-  renderModels(dimModel.rows || []);
-  renderKeySpend(dimKey.rows || []);
+  renderModels(ovCache.models);
+  renderKeySpend(ovCache.keys);
   renderTrend();
   stamp();
 };
@@ -398,12 +382,19 @@ function readout(label, value, sub, alarm) {
     + '<div class="readout-value">' + value + '</div>'
     + (sub ? '<div class="readout-sub">' + sub + '</div>' : '') + '</div>';
 }
+// cacheHitRate 缓存命中率 = 命中 token / (输入 + 缓存读 + 缓存写)。
+// OpenAI 口径的 cached_tokens 已含在输入内，Claude 口径的 cache_read 独立，分母对两者均成立。
+function cacheHitRate(t) {
+  const denom = (+t.input_tokens || 0) + (+t.cache_read_tokens || 0) + (+t.cache_creation_tokens || 0);
+  return denom > 0 ? cacheHit(t) / denom * 100 : -1;
+}
 function renderReadouts(total, costs) {
   const failRate = total.requests ? (total.failures / total.requests * 100).toFixed(1) + '%' : '0%';
   const cover = costs.requests ? Math.round(costs.priced_requests / costs.requests * 100) : 0;
   const rate = S.fx;
   const cny = rate && total.cost_micro_usd
     ? ' ≈ ¥' + fmtUSD(Math.round(total.cost_micro_usd * rate.usd_to_cny_micro / 1e6)).slice(1) : '';
+  const hitPct = cacheHitRate(total);
   $('ov-readouts').innerHTML =
     readout('请求总数', fmtInt(total.requests),
       '失败 <b>' + fmtInt(total.failures) + '</b> · 失败率 ' + failRate,
@@ -413,7 +404,7 @@ function renderReadouts(total, costs) {
       + '</b> · 缓存命中 <b>' + fmtInt(cacheHit(total)) + '</b>')
     + readout('总费用', fmtUSD(total.cost_micro_usd),
       '计价覆盖 <b>' + cover + '%</b>' + esc(cny))
-    + readout('缓存 Token', fmtInt(cacheHit(total)),
+    + readout('缓存命中率', hitPct < 0 ? '—' : hitPct.toFixed(1) + '%',
       '读 <b>' + fmtInt(total.cache_read_tokens) + '</b> · 写 <b>' + fmtInt(total.cache_creation_tokens)
       + '</b>' + ((total.cached_tokens || 0) > (total.cache_read_tokens || 0) + (total.cache_creation_tokens || 0)
         ? ' · 含上游缓存口径' : ''));
@@ -431,25 +422,60 @@ function barList(rows, max, nameText, nameHtml, valFn, valText, color) {
       + '<span style="width:' + pct.toFixed(1) + '%"></span></div></div>';
   }).join('');
 }
+// ---------- 概览占比卡：指标切换（费用 / Token / 请求） ----------
+const ovCache = { models: [], keys: [] };
+const ovMetric = {
+  models: localStorage.getItem('ov-models-metric') || 'tokens',
+  keys: localStorage.getItem('ov-keys-metric') || 'cost',
+};
+function metricVal(r, m) {
+  if (m === 'cost') return Number(r.cost_micro_usd) || 0;
+  if (m === 'requests') return Number(r.requests) || 0;
+  return effTokens(r);
+}
+function metricText(v, m) {
+  return m === 'cost' ? fmtUSD(v) : fmtInt(v);
+}
+const METRIC_SUBS = { tokens: '按 Token 计量', cost: '按费用计量', requests: '按请求次数计量' };
+function bindMetricSeg(id, key, apply) {
+  const seg = $(id);
+  seg.querySelectorAll('button').forEach(b =>
+    b.classList.toggle('on', b.dataset.m === ovMetric[key]));
+  seg.addEventListener('click', e => {
+    const b = e.target.closest('button[data-m]');
+    if (!b || b.dataset.m === ovMetric[key]) return;
+    ovMetric[key] = b.dataset.m;
+    localStorage.setItem(id, b.dataset.m);
+    seg.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+    apply();
+  });
+}
+bindMetricSeg('ov-models-metric', 'models', () => renderModels(ovCache.models));
+bindMetricSeg('ov-keys-metric', 'keys', () => renderKeySpend(ovCache.keys));
+
 function renderModels(rows) {
-  const top = rows.slice().sort((a, b) => effTokens(b) - effTokens(a)).slice(0, 10);
-  const max = top.length ? effTokens(top[0]) : 0;
+  const m = ovMetric.models;
+  $('ov-models-sub').textContent = METRIC_SUBS[m] + '，取前 10';
+  const top = rows.slice().sort((a, b) => metricVal(b, m) - metricVal(a, m)).slice(0, 10);
+  const max = top.length ? metricVal(top[0], m) : 0;
   $('ov-models').innerHTML = barList(top, max,
     r => r.value || '(空)', r => esc(r.value || '(空)'),
-    effTokens, r => fmtInt(effTokens(r)));
+    r => metricVal(r, m), r => metricText(metricVal(r, m), m));
 }
 function renderKeySpend(rows) {
+  const m = ovMetric.keys;
+  $('ov-keys-sub').textContent = METRIC_SUBS[m] + '，取前 8';
   const labelOf = kid => {
     const k = keysView.cache.find(x => x.kid === kid);
     return k && k.label ? k.label : '';
   };
-  const top = rows.filter(r => r.value).sort((a, b) => b.cost_micro_usd - a.cost_micro_usd).slice(0, 8);
-  const max = top.length ? top[0].cost_micro_usd : 0;
+  const top = rows.filter(r => r.value).sort((a, b) => metricVal(b, m) - metricVal(a, m)).slice(0, 8);
+  const max = top.length ? metricVal(top[0], m) : 0;
   $('ov-keys').innerHTML = barList(top, max,
     r => (labelOf(r.value) || '(无标签)') + ' · ' + r.value,
     r => '<span class="bar-name-main">' + esc(labelOf(r.value) || '(无标签)') + '</span>'
       + '<span class="bar-kid mono">' + esc(r.value) + '</span>',
-    r => r.cost_micro_usd, r => fmtUSD(r.cost_micro_usd), 'trace');
+    r => metricVal(r, m), r => metricText(metricVal(r, m), m), 'trace');
 }
 
 // ---------- 趋势图（内联 SVG 堆叠面积）----------
