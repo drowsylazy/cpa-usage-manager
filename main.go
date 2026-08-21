@@ -1335,6 +1335,8 @@ func handleUsage(body []byte) ([]byte, error) {
 	if err := st.RecordUsage(context.Background(), req); err != nil {
 		return nil, err
 	}
+	// 落库后对账：与执行器结算行是同一请求时合并去重（消除双写竞态）。
+	_, _ = st.ReconcileRequestDuplicates(context.Background(), req.ID)
 	return okEnvelope(map[string]any{})
 }
 

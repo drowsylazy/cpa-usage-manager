@@ -231,6 +231,197 @@ func (s *Store) BackfillRequestUsageByID(ctx context.Context, id string, b Usage
 	})
 }
 
+// ReconcileRequestDuplicates 落库后对账，消除执行器/被动双写竞态。
+//
+// 同一请求会触发两次回调（执行器结算与宿主 usage.handle），两者几乎同时落库，
+// 「先查后插」的判重存在窗口。这里以 anchor 行为起点找另一口径的重复行
+// （key_id 空否相反 + 模型候选匹配 + 延迟±150ms + 时间±15s）：
+// 保留 key_id 非空的执行器行，把被动行的零值字段（token 明细、首字延迟、
+// provider/source/auth/tier 展示信息）合并进去，删除被动行，
+// 并从分钟聚合中扣减被动行的贡献。返回是否发生合并。
+func (s *Store) ReconcileRequestDuplicates(ctx context.Context, anchorID string) (bool, error) {
+	merged := false
+	err := s.Write(ctx, func(tx *sql.Tx) error {
+		anchor, e := loadRequestTx(ctx, tx, anchorID)
+		if e != nil {
+			return e
+		}
+		frag, margs := modelMatchFragment(modelCandidatesOf(anchor.Model))
+		keyCond := `key_id = ''`
+		if anchor.KeyID == "" {
+			keyCond = `key_id <> ''`
+		}
+		args := make([]any, 0, len(margs)+5)
+		args = append(args, anchorID)
+		args = append(args, margs...)
+		args = append(args, anchor.LatencyMS-150, anchor.LatencyMS+150,
+			anchor.TS.Add(-15*time.Second).UnixMilli(), anchor.TS.Add(15*time.Second).UnixMilli(),
+			anchor.TS.UnixMilli())
+		row := tx.QueryRowContext(ctx,
+			`SELECT `+requestColumns+` FROM requests
+			 WHERE id <> ? AND `+keyCond+` AND `+frag+`
+			   AND latency_ms BETWEEN ? AND ?
+			   AND ts BETWEEN ? AND ?
+			 ORDER BY ABS(ts - ?) LIMIT 1`, args...)
+		other, e := scanRequest(row)
+		if errors.Is(e, sql.ErrNoRows) {
+			return nil
+		}
+		if e != nil {
+			return e
+		}
+		keeper, dropee := anchor, other
+		if keeper.KeyID == "" {
+			keeper, dropee = dropee, keeper
+		}
+		// 计算实际并入 keeper 的字段增量（仅补零值），同步回补其分钟聚合。
+		delta := UsageBackfill{
+			InputTokens:         pickZero(keeper.InputTokens, dropee.InputTokens),
+			OutputTokens:        pickZero(keeper.OutputTokens, dropee.OutputTokens),
+			ReasoningTokens:     pickZero(keeper.ReasoningTokens, dropee.ReasoningTokens),
+			CachedTokens:        pickZero(keeper.CachedTokens, dropee.CachedTokens),
+			CacheReadTokens:     pickZero(keeper.CacheReadTokens, dropee.CacheReadTokens),
+			CacheCreationTokens: pickZero(keeper.CacheCreationTokens, dropee.CacheCreationTokens),
+			TotalTokens:         pickZero(keeper.TotalTokens, dropee.TotalTokens),
+		}
+		if keeper.TTFTMS == 0 && dropee.TTFTMS > 0 {
+			delta.TTFTMS = dropee.TTFTMS
+		}
+		if _, e := tx.ExecContext(ctx,
+			`UPDATE requests SET
+			    input_tokens         = CASE WHEN input_tokens = 0         THEN ? ELSE input_tokens END,
+			    output_tokens        = CASE WHEN output_tokens = 0        THEN ? ELSE output_tokens END,
+			    reasoning_tokens     = CASE WHEN reasoning_tokens = 0     THEN ? ELSE reasoning_tokens END,
+			    cached_tokens        = CASE WHEN cached_tokens = 0        THEN ? ELSE cached_tokens END,
+			    cache_read_tokens    = CASE WHEN cache_read_tokens = 0    THEN ? ELSE cache_read_tokens END,
+			    cache_creation_tokens= CASE WHEN cache_creation_tokens = 0 THEN ? ELSE cache_creation_tokens END,
+			    total_tokens         = CASE WHEN total_tokens = 0         THEN ? ELSE total_tokens END,
+			    ttft_ms              = CASE WHEN ttft_ms = 0              THEN ? ELSE ttft_ms END,
+			    provider             = CASE WHEN provider = ''            THEN ? ELSE provider END,
+			    source               = CASE WHEN source = ''              THEN ? ELSE source END,
+			    auth_type            = CASE WHEN auth_type = ''           THEN ? ELSE auth_type END,
+			    tier                 = CASE WHEN tier = ''                THEN ? ELSE tier END
+			 WHERE id = ?`,
+			dropee.InputTokens, dropee.OutputTokens, dropee.ReasoningTokens,
+			dropee.CachedTokens, dropee.CacheReadTokens, dropee.CacheCreationTokens,
+			dropee.TotalTokens, dropee.TTFTMS,
+			dropee.Provider, dropee.Source, dropee.AuthType, dropee.Tier,
+			keeper.ID); e != nil {
+			return fmt.Errorf("合并重复请求失败: %w", e)
+		}
+		if _, e := tx.ExecContext(ctx, `DELETE FROM requests WHERE id = ?`, dropee.ID); e != nil {
+			return fmt.Errorf("删除重复请求 %s 失败: %w", dropee.ID, e)
+		}
+		if e := subtractRollupTx(ctx, tx, dropee); e != nil {
+			return e
+		}
+		if e := addRollupDeltaTx(ctx, tx, keeper, delta); e != nil {
+			return e
+		}
+		merged = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return merged, nil
+}
+
+// pickZero 目标为 0 时取补值，否则保留原值。
+func pickZero(target, fill int64) int64 {
+	if target == 0 {
+		return fill
+	}
+	return 0
+}
+
+// addRollupDeltaTx 把合并进请求行的字段增量回补到该行的分钟聚合。
+func addRollupDeltaTx(ctx context.Context, tx *sql.Tx, r Request, d UsageBackfill) error {
+	if d.InputTokens == 0 && d.OutputTokens == 0 && d.ReasoningTokens == 0 &&
+		d.CachedTokens == 0 && d.CacheReadTokens == 0 && d.CacheCreationTokens == 0 &&
+		d.TotalTokens == 0 && d.TTFTMS == 0 {
+		return nil
+	}
+	ttftCount := 0
+	if d.TTFTMS > 0 {
+		ttftCount = 1
+	}
+	_, err := tx.ExecContext(ctx,
+		`UPDATE usage_rollups SET
+		    input_tokens = input_tokens + ?, output_tokens = output_tokens + ?,
+		    reasoning_tokens = reasoning_tokens + ?, cached_tokens = cached_tokens + ?,
+		    cache_read_tokens = cache_read_tokens + ?, cache_creation_tokens = cache_creation_tokens + ?,
+		    total_tokens = total_tokens + ?,
+		    ttft_sum = ttft_sum + ?, ttft_count = ttft_count + ?
+		 WHERE bucket_minute = ? AND model = ? AND key_id = ? AND caller_id = ? AND provider = ?
+		   AND source = ? AND auth_type = ? AND tier = ? AND result = ?`,
+		d.InputTokens, d.OutputTokens, d.ReasoningTokens, d.CachedTokens,
+		d.CacheReadTokens, d.CacheCreationTokens, d.TotalTokens,
+		d.TTFTMS, ttftCount,
+		BucketMinute(r.TS), r.Model, r.KeyID, r.CallerID, r.Provider, r.Source, r.AuthType, r.Tier, r.Result)
+	if err != nil {
+		return fmt.Errorf("回补分钟聚合失败: %w", err)
+	}
+	return nil
+}
+
+// modelCandidatesOf 由已落库的模型名推导匹配候选：全名与去渠道前缀裸名。
+func modelCandidatesOf(model string) []string {
+	out := []string{model}
+	if i := strings.LastIndex(model, "/"); i >= 0 && i+1 < len(model) {
+		out = append(out, model[i+1:])
+	}
+	return out
+}
+
+func loadRequestTx(ctx context.Context, tx *sql.Tx, id string) (Request, error) {
+	row := tx.QueryRowContext(ctx, `SELECT `+requestColumns+` FROM requests WHERE id = ?`, id)
+	r, err := scanRequest(row)
+	if err != nil {
+		return Request{}, fmt.Errorf("读取请求 %s 失败: %w", id, err)
+	}
+	return r, nil
+}
+
+// subtractRollupTx 从分钟聚合中扣减一条请求的贡献；计数归零则删除该聚合行。
+func subtractRollupTx(ctx context.Context, tx *sql.Tx, r Request) error {
+	if r.Result == "" {
+		r.Result = ResultOK
+	}
+	fail := 0
+	if r.Result != ResultOK {
+		fail = 1
+	}
+	ttftCount := 0
+	if r.TTFTMS > 0 {
+		ttftCount = 1
+	}
+	dim := []any{BucketMinute(r.TS), r.Model, r.KeyID, r.CallerID, r.Provider, r.Source, r.AuthType, r.Tier, r.Result}
+	sets := `req_count = req_count - 1,
+		fail_count = fail_count - ?,
+		input_tokens = input_tokens - ?, output_tokens = output_tokens - ?,
+		reasoning_tokens = reasoning_tokens - ?, cached_tokens = cached_tokens - ?,
+		cache_read_tokens = cache_read_tokens - ?, cache_creation_tokens = cache_creation_tokens - ?,
+		total_tokens = total_tokens - ?,
+		latency_sum = latency_sum - ?, ttft_sum = ttft_sum - ?, ttft_count = ttft_count - ?,
+		generation_sum = generation_sum - ?, tps_milli_sum = tps_milli_sum - ?,
+		cost_micro_usd = cost_micro_usd - ?`
+	vals := []any{fail, r.InputTokens, r.OutputTokens, r.ReasoningTokens, r.CachedTokens,
+		r.CacheReadTokens, r.CacheCreationTokens, r.TotalTokens,
+		r.LatencyMS, r.TTFTMS, ttftCount, r.GenerationMS, r.TPSMilli, int64(r.CostMicroUSD)}
+	where := `bucket_minute = ? AND model = ? AND key_id = ? AND caller_id = ? AND provider = ?
+		AND source = ? AND auth_type = ? AND tier = ? AND result = ?`
+	if _, err := tx.ExecContext(ctx, `UPDATE usage_rollups SET `+sets+` WHERE `+where,
+		append(append([]any{}, vals...), dim...)...); err != nil {
+		return fmt.Errorf("扣减分钟聚合失败: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM usage_rollups WHERE `+where+` AND req_count <= 0`,
+		dim...); err != nil {
+		return fmt.Errorf("清理空聚合行失败: %w", err)
+	}
+	return nil
+}
+
 func backfillRequestTx(ctx context.Context, tx *sql.Tx, id string, b UsageBackfill) error {
 	_, err := tx.ExecContext(ctx,
 		`UPDATE requests SET

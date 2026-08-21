@@ -400,6 +400,11 @@ func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req
 	out, err := s.st.SettleReservation(ctx, id, cost, time.Now(), req)
 	if err == nil {
 		_ = s.st.AppendAudit(ctx, store.AuditEvent{Action: "quota.settle", EntityType: "reservation", EntityID: id, Detail: map[string]any{"cost_micro_usd": cost}})
+		// 落库后对账：宿主 usage.handle 的被动行可能先于本结算落库（双写竞态），
+		// 命中则把其 token/展示信息合并进本行并删除被动行。
+		if req != nil {
+			_, _ = s.st.ReconcileRequestDuplicates(ctx, req.ID)
+		}
 	}
 	return out, err
 }
@@ -426,6 +431,11 @@ func (s *Service) FindDuplicateExecutor(ctx context.Context, models []string, ne
 // BackfillRequestUsageByID 按 ID 回填宿主上报的用量明细。
 func (s *Service) BackfillRequestUsageByID(ctx context.Context, id string, b store.UsageBackfill) error {
 	return s.st.BackfillRequestUsageByID(ctx, id, b)
+}
+
+// ReconcileRequestDuplicates 落库后对账，合并执行器/被动双写产生的重复行。
+func (s *Service) ReconcileRequestDuplicates(ctx context.Context, anchorID string) (bool, error) {
+	return s.st.ReconcileRequestDuplicates(ctx, anchorID)
 }
 
 // UpdateKey、RevokeKey、DeleteKey 是管理面调用的薄封装，并统一写审计。

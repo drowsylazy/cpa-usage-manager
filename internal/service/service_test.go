@@ -152,6 +152,58 @@ func TestFindDuplicateAndBackfillByID(t *testing.T) {
 	}
 }
 
+func TestReconcileRequestDuplicates(t *testing.T) {
+	s, st := testService(t)
+	ctx := context.Background()
+	ts := time.Now().UTC().Add(-2 * time.Second)
+	exec := store.Request{
+		ID: "req-exec", TS: ts, KeyID: "abc123", CallerID: store.DefaultCallerID,
+		Model: "stepfun/step-3.7-flash", Source: "openai", Result: store.ResultOK,
+		LatencyMS: 8844, TTFTMS: 828,
+	}
+	passive := store.Request{
+		ID: "req-passive", TS: ts, CallerID: store.DefaultCallerID,
+		Model: "step-3.7-flash", Provider: "openai-compatible-stepfun",
+		AuthType: "apikey", Tier: "auto", Result: store.ResultOK,
+		InputTokens: 14, OutputTokens: 214, TotalTokens: 228,
+		LatencyMS: 8839, TTFTMS: 826,
+	}
+	if err := st.RecordUsage(ctx, exec); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordUsage(ctx, passive); err != nil {
+		t.Fatal(err)
+	}
+	merged, err := s.ReconcileRequestDuplicates(ctx, passive.ID)
+	if err != nil || !merged {
+		t.Fatalf("对账未合并: merged=%v err=%v", merged, err)
+	}
+	if _, err := st.GetRequest(ctx, passive.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("被动行应被删除: %v", err)
+	}
+	got, err := st.GetRequest(ctx, exec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.InputTokens != 14 || got.OutputTokens != 214 || got.TotalTokens != 228 {
+		t.Fatalf("执行器行应获得回填 token: %+v", got)
+	}
+	if got.TTFTMS != 828 || got.Provider != "openai-compatible-stepfun" || got.Tier != "auto" {
+		t.Fatalf("展示信息合并不符: provider=%q tier=%q ttft=%d", got.Provider, got.Tier, got.TTFTMS)
+	}
+	var reqCount, tokenSum int64
+	if err := st.Read(ctx, func(q store.Querier) error {
+		return q.QueryRowContext(ctx,
+			`SELECT COALESCE(SUM(req_count),0), COALESCE(SUM(total_tokens),0) FROM usage_rollups`).
+			Scan(&reqCount, &tokenSum)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if reqCount != 1 || tokenSum != 228 {
+		t.Fatalf("聚合未正确扣减: req_count=%d total_tokens=%d", reqCount, tokenSum)
+	}
+}
+
 func TestReserveSettleAndQuotaBoundary(t *testing.T) {
 	s, st := testService(t)
 	ctx := context.Background()
