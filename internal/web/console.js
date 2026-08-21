@@ -279,9 +279,13 @@ function openSheet(o) {
   $('sheet-body').innerHTML = o.body || '';
   $('sheet-note').textContent = o.note || '';
   const ok = $('sheet-ok');
+  const cancel = $('sheet-cancel');
   ok.textContent = o.okText || '确定';
   ok.className = 'btn' + (o.danger ? ' danger' : ' primary');
   ok.disabled = false;
+  // 信息展示类弹窗（无 onOk）：主按钮本身就是「关闭」，再摆一个取消
+  // 就是两个按钮做同一件事，只留主按钮。
+  cancel.hidden = !o.onOk;
   sheetOk = o.onOk || null;
   sheet.showModal();
   if (!o.noFocus) {
@@ -309,6 +313,7 @@ function staySheet(okText) {
   const btn = $('sheet-ok');
   btn.textContent = okText || '完成';
   btn.disabled = false;
+  $('sheet-cancel').hidden = true; // 结果态只剩一个关闭按钮
   sheetOk = null; // 下一次点击直接关闭
 }
 function fieldRow(label, inner, cls) {
@@ -966,7 +971,7 @@ $('key-issue-btn').addEventListener('click', () => {
       });
       $('sheet-title').textContent = '密钥已签发 · ' + r.KID;
       $('sheet-body').innerHTML = secretBlock(r.Key)
-        + '<p class="note">指纹 ' + esc(r.Fingerprint) + ' · 已写入审计日志。</p>';
+        + '<p class="note">指纹 ' + esc(r.Fingerprint) + '</p>';
       $('sheet-note').textContent = '';
       wireSecretCopy();
       staySheet('完成');
@@ -1034,7 +1039,7 @@ function editKeySheet(k) {
 function rotateSheet(kid) {
   openSheet({
     title: '轮换 ' + kid, danger: true, okText: '轮换',
-    body: '<p>旧 Key 立即失效，并生成新明文（仅展示一次）。该操作会写入审计日志。</p>',
+    body: '<p>旧 Key 立即失效，并生成新明文（仅展示一次）。</p>',
     onOk: async () => {
       const r = await post('/keys/rotate', { kid, actor: 'console' });
       $('sheet-title').textContent = '已轮换 · ' + r.KID;
@@ -1049,7 +1054,7 @@ function rotateSheet(kid) {
 function revealSheet(kid) {
   openSheet({
     title: '查看明文 ' + kid, okText: '解密',
-    body: '<p>解密该 Key 的明文用于配置客户端。该操作会写入审计日志。</p>',
+    body: '<p>解密该 Key 的明文用于配置客户端。</p>',
     onOk: async () => {
       const r = await post('/keys/reveal', { kid, actor: 'console' });
       $('sheet-title').textContent = '明文 · ' + kid;
@@ -1497,7 +1502,7 @@ $('reset-btn').addEventListener('click', () => {
   openSheet({
     title: '重置统计', danger: true, okText: '确认重置',
     body: '<p>将清空逐请求明细、分钟聚合、已终结预占与密钥周期计数器。'
-      + '<b>密钥、计价规则与审计事件保留</b>。操作本身会写入审计。</p>',
+      + '<b>密钥与计价规则保留</b>。</p>',
     onOk: async () => {
       const r = await post('/reset', { confirm: 'reset', actor: 'console' });
       toast('重置完成：请求 ' + fmtInt(r.requests) + ' · 聚合 ' + fmtInt(r.rollups), 'ok');
