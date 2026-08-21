@@ -235,6 +235,17 @@ type Reservation struct {
 	ReleasedAt  *time.Time `json:"released_at,omitempty"`
 }
 
+// UsageBackfill 是宿主 usage.handle 上报的 token 明细，用于回填零用量记录。
+type UsageBackfill struct {
+	InputTokens         int64
+	OutputTokens        int64
+	ReasoningTokens     int64
+	CachedTokens        int64
+	CacheReadTokens     int64
+	CacheCreationTokens int64
+	TotalTokens         int64
+}
+
 // Request 是一条逐请求记录（tracker 明细与 credit-manager 账本合并）。
 type Request struct {
 	ID       string    `json:"id"`

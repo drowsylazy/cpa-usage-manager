@@ -95,13 +95,14 @@ h1,h2,h3,p{margin:0}
   max-width:1480px;margin:0 auto;padding:12px clamp(14px,2.6vw,32px);
   display:flex;align-items:center;gap:16px;flex-wrap:wrap;
 }
-.brand{display:flex;align-items:center;gap:10px;margin-right:auto}
+.brand{display:flex;align-items:center;gap:10px;margin-right:6px}
 .brand-mark{width:30px;height:30px;flex:none}
 .brand-mark svg{width:100%;height:100%;display:block;border-radius:7px}
 .brand-text{display:grid;line-height:1.25}
 .brand-name{font-size:14.5px;font-weight:700;letter-spacing:-.01em}
 .brand-sub{color:var(--fg3);font-size:11px;letter-spacing:.02em}
-.bar-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+/* 工具组紧跟品牌靠左，避开宿主 management.html 右上角的操作按钮区 */
+.bar-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-right:auto}
 
 .tabs{
   max-width:1480px;margin:0 auto;padding:0 clamp(14px,2.6vw,32px);
@@ -305,6 +306,21 @@ tr.detail>td{background:var(--sunken);padding:14px 16px;white-space:normal;borde
 .bar-line>span{display:block;height:100%;border-radius:3px;background:var(--signal)}
 .bar-line.trace>span{background:var(--trace)}
 
+/* 密钥消耗条目：标签在上、kid 在下 */
+.bar-cell .bar-name{display:flex;flex-direction:column;gap:1px;min-width:0}
+.bar-cell .bar-name-main{font-family:var(--ui);font-weight:600;font-size:12px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar-cell .bar-kid{color:var(--fg4);font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* models.dev 搜索结果 */
+.search-list{display:grid}
+.search-item{display:flex;align-items:center;gap:12px;padding:8px 16px;border-bottom:1px solid var(--line)}
+.search-item:last-child{border-bottom:none}
+.search-item .si-main{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}
+.search-item .si-name{font-size:12.5px;font-weight:600;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.search-item .si-id{color:var(--fg3);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.search-item .si-price{color:var(--fg2);font-size:11.5px;flex:none}
+.search-item .btn{flex:none}
+
 .pager{display:flex;align-items:center;gap:10px;padding:10px 16px;border-top:1px solid var(--line);color:var(--fg3);font-size:12px}
 .pager .mono{color:var(--fg2)}
 .pager .grow{flex:1}
@@ -337,10 +353,8 @@ tr.detail>td{background:var(--sunken);padding:14px 16px;white-space:normal;borde
 .chart svg{display:block;width:100%;height:100%;overflow:visible}
 .chart .gridline{stroke:var(--line);stroke-width:1;shape-rendering:crispEdges}
 .chart .axis-text{fill:var(--fg4);font:10.5px/1 var(--mono)}
-.chart .band{transition:opacity .14s ease}
-.chart .band-hit{fill:transparent}
-.chart .crosshair{stroke:var(--line3);stroke-width:1;stroke-dasharray:3 3}
-.chart .overlay-line{fill:none;stroke:var(--trace);stroke-width:1.6;stroke-dasharray:4 3}
+.chart .bar-hover{fill:transparent}
+.chart .bar-hover.on{fill:var(--fg);opacity:.05}
 .chart-tip{
   position:absolute;z-index:5;min-width:150px;padding:8px 10px;pointer-events:none;
   background:var(--raised);border:1px solid var(--line2);border-radius:9px;box-shadow:var(--shadow-pop);

@@ -292,19 +292,22 @@ type rpcRequestCompletion struct {
 // ---------- usage ----------
 
 type rpcUsageRecord struct {
-	Provider    string
-	Model       string
-	APIKey      string
-	AuthID      string
-	AuthType    string
-	Source      string
-	ServiceTier string
-	RequestedAt time.Time
-	Latency     time.Duration
-	TTFT        time.Duration
-	Failed      bool
-	Failure     rpcUsageFailure
-	Detail      rpcUsageDetail
+	Provider        string
+	Model           string
+	Alias           string
+	APIKey          string
+	AuthID          string
+	AuthIndex       string
+	AuthType        string
+	Source          string
+	ReasoningEffort string
+	ServiceTier     string
+	RequestedAt     time.Time
+	Latency         time.Duration
+	TTFT            time.Duration
+	Failed          bool
+	Failure         rpcUsageFailure
+	Detail          rpcUsageDetail
 }
 type rpcUsageFailure struct {
 	StatusCode int
@@ -753,10 +756,14 @@ func routeModel(body []byte) ([]byte, error) {
 		return okEnvelope(rpcModelRouteResponse{Handled: false, Reason: "native_image_protocol"})
 	}
 	scope := metadataString(req.Metadata, service.CallerScopeMetadataKey)
-	if scope == "" && !bearerPresent(req.Headers) {
-		return okEnvelope(rpcModelRouteResponse{Handled: false})
+	if scope != "" {
+		return okEnvelope(rpcModelRouteResponse{Handled: true, TargetKind: "self", Reason: "cpa_quota_enforced"})
 	}
-	return okEnvelope(rpcModelRouteResponse{Handled: true, TargetKind: "self", Reason: "cpa_quota_enforced"})
+	// 仅接管插件密钥（cum-）；宿主原生 API Key 不接管，与原生转发链路共存。
+	if _, ok := service.ParseKeyID(bearerToken(req.Headers)); ok {
+		return okEnvelope(rpcModelRouteResponse{Handled: true, TargetKind: "self", Reason: "cpa_quota_enforced"})
+	}
+	return okEnvelope(rpcModelRouteResponse{Handled: false})
 }
 
 func isImageProtocol(format string) bool {
@@ -1169,6 +1176,10 @@ func interceptAfter(body []byte) ([]byte, error) {
 	ctx := context.Background()
 	key, err := svc.ResolveIdentity(ctx, req.Headers, req.Metadata)
 	if err != nil {
+		// 非 cum 凭证（原生 API Key）不拦截，交还宿主原生路径。
+		if _, isCum := service.ParseKeyID(bearerToken(req.Headers)); !isCum {
+			return okEnvelope(rpcRequestInterceptResponse{})
+		}
 		return okEnvelope(rejectResponse(http.StatusUnauthorized, "unauthorized: "+err.Error()))
 	}
 	plan, err := svc.BuildReservePlan(ctx, service.FirstNonEmpty(req.RequestedModel, req.Model), req.Body)
@@ -1277,10 +1288,28 @@ func handleUsage(body []byte) ([]byte, error) {
 	if err := json.Unmarshal(body, &u); err != nil {
 		return nil, err
 	}
-	// quota 模式：执行器/拦截器已在结算路径一次性写入请求记录与聚合，
-	// 宿主回调的 usage.handle 不重复入库（单一路径一次入库）。
+	// quota 模式：cum- 密钥流量已由执行器/拦截器在结算路径一次性入库，
+	// 不重复写；原生 API Key / 匿名流量不经过插件执行器，这里被动记录。
 	if cfg.Quota.Enabled {
-		return okEnvelope(map[string]any{})
+		if kid, isCum := service.ParseKeyID(u.APIKey); isCum {
+			// 宿主用量观察（usage.handle）是权威口径：执行器的流式解析可能
+			// 拿不到上游用量（部分 OpenAI 兼容上游不在流里回 usage），
+			// 这里给最近一条零用量记录回填 token 明细，避免统计失真。
+			if u.Detail.InputTokens > 0 || u.Detail.OutputTokens > 0 || u.Detail.TotalTokens > 0 {
+				if _, err := svc.BackfillRequestUsage(context.Background(), kid, u.Model, u.RequestedAt, store.UsageBackfill{
+					InputTokens:         u.Detail.InputTokens,
+					OutputTokens:        u.Detail.OutputTokens,
+					ReasoningTokens:     u.Detail.ReasoningTokens,
+					CachedTokens:        u.Detail.CachedTokens,
+					CacheReadTokens:     u.Detail.CacheReadTokens,
+					CacheCreationTokens: u.Detail.CacheCreationTokens,
+					TotalTokens:         u.Detail.TotalTokens,
+				}); err != nil {
+					return nil, err
+				}
+			}
+			return okEnvelope(map[string]any{})
+		}
 	}
 	req := usageRecordToRequest(st, u)
 	if cost, _, err := svc.Price(req.Model, usageFromRecord(u)); err == nil {
@@ -1337,6 +1366,9 @@ func usageRecordToRequest(st *store.Store, u rpcUsageRecord) store.Request {
 		if k, err := st.GetKey(context.Background(), kid); err == nil {
 			req.CallerID = k.CallerID
 		}
+	}
+	if req.ThinkingIntensity == "" {
+		req.ThinkingIntensity = strings.TrimSpace(u.ReasoningEffort)
 	}
 	if req.CallerID == "" {
 		req.CallerID = store.DefaultCallerID

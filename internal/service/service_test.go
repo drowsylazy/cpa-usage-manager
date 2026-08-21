@@ -72,6 +72,52 @@ func TestIssueAuthenticateRotateReveal(t *testing.T) {
 	}
 }
 
+func TestBackfillRequestUsage(t *testing.T) {
+	s, st := testService(t)
+	ctx := context.Background()
+	issued, err := s.IssueKey(ctx, IssueRequest{CallerID: store.DefaultCallerID, Actor: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := time.Now().UTC().Add(-2 * time.Second)
+	zero := store.Request{
+		ID: "req-zero", TS: ts, KeyID: issued.KID, CallerID: store.DefaultCallerID,
+		Model: "gpt-test", Provider: "openai", Result: store.ResultOK,
+		CostMicroUSD: money.Micro(5), Priced: true,
+	}
+	if err := st.RecordUsage(ctx, zero); err != nil {
+		t.Fatal(err)
+	}
+	b := store.UsageBackfill{
+		InputTokens: 100, OutputTokens: 50, ReasoningTokens: 10,
+		CachedTokens: 0, CacheReadTokens: 20, CacheCreationTokens: 5, TotalTokens: 185,
+	}
+	ok, err := s.BackfillRequestUsage(ctx, issued.KID, "gpt-test", ts, b)
+	if err != nil || !ok {
+		t.Fatalf("回填失败: ok=%v err=%v", ok, err)
+	}
+	got, err := st.GetRequest(ctx, "req-zero")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.InputTokens != 100 || got.OutputTokens != 50 || got.TotalTokens != 185 ||
+		got.CacheReadTokens != 20 || got.CacheCreationTokens != 5 {
+		t.Fatalf("回填数据不符: %+v", got)
+	}
+	if got.CostMicroUSD != money.Micro(5) {
+		t.Fatalf("回填不应改动费用: %s", got.CostMicroUSD)
+	}
+	// 已有用量与窗口外的记录都不应再被回填。
+	again, err := s.BackfillRequestUsage(ctx, issued.KID, "gpt-test", ts, b)
+	if err != nil || again {
+		t.Fatalf("二次回填应无匹配: ok=%v err=%v", again, err)
+	}
+	far, err := s.BackfillRequestUsage(ctx, issued.KID, "gpt-test", ts.Add(time.Hour), b)
+	if err != nil || far {
+		t.Fatalf("窗口外回填应无匹配: ok=%v err=%v", far, err)
+	}
+}
+
 func TestReserveSettleAndQuotaBoundary(t *testing.T) {
 	s, st := testService(t)
 	ctx := context.Background()

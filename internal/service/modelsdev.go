@@ -171,6 +171,125 @@ func (s *Service) LastModelsDevSync(ctx context.Context) (ModelsDevSyncResult, b
 	return out, true, nil
 }
 
+// ModelsDevCandidate 是搜索结果里的一条可添加模型，字段与
+// store.PricingRule 的 JSON 契约对齐，前端可直接作为 POST /pricing 的请求体。
+type ModelsDevCandidate struct {
+	ProviderID         string      `json:"provider_id"`
+	ProviderName       string      `json:"provider_name"`
+	ModelID            string      `json:"model_id"`
+	Name               string      `json:"name"`
+	Pattern            string      `json:"pattern"`
+	Label              string      `json:"label,omitempty"`
+	PriceInput         money.Price `json:"price_input"`
+	PriceOutput        money.Price `json:"price_output"`
+	PriceReasoning     money.Price `json:"price_reasoning"`
+	PriceCached        money.Price `json:"price_cached"`
+	PriceCacheRead     money.Price `json:"price_cache_read"`
+	PriceCacheCreation money.Price `json:"price_cache_creation"`
+	MatchKind          string      `json:"match_kind"`
+	Source             string      `json:"source"`
+	ModelsDevID        string      `json:"models_dev_id"`
+}
+
+const modelsDevCatalogTTL = 10 * time.Minute
+
+// catalog 返回价格簿目录，TTL 内复用缓存，避免每次搜索都整本拉取。
+func (s *Service) catalog(ctx context.Context, syncer *ModelsDevSyncer) (map[string]ModelsDevProvider, error) {
+	s.catalogMu.Lock()
+	defer s.catalogMu.Unlock()
+	if s.catalogRaw != nil && time.Since(s.catalogAt) < modelsDevCatalogTTL {
+		return s.catalogRaw, nil
+	}
+	if syncer == nil {
+		syncer = NewModelsDevSyncer("", nil)
+	}
+	raw, err := syncer.Fetch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.catalogRaw, s.catalogAt = raw, time.Now()
+	return raw, nil
+}
+
+// SearchModelsDev 按关键词在 models.dev 目录中查找模型，返回可直接添加的计价候选。
+// 只读操作，不写库、不受 pricing.models_dev_sync.enabled 开关限制。
+func (s *Service) SearchModelsDev(ctx context.Context, syncer *ModelsDevSyncer, query string, limit int) ([]ModelsDevCandidate, error) {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return []ModelsDevCandidate{}, nil
+	}
+	if limit <= 0 || limit > 50 {
+		limit = 20
+	}
+	raw, err := s.catalog(ctx, syncer)
+	if err != nil {
+		return nil, err
+	}
+	type hit struct {
+		c     ModelsDevCandidate
+		score int
+	}
+	var hits []hit
+	for pid, p := range raw {
+		for mid, m := range p.Models {
+			id := strings.TrimSpace(mid)
+			if id == "" {
+				id = strings.TrimSpace(m.ID)
+			}
+			if id == "" {
+				continue
+			}
+			hay := strings.ToLower(pid + "/" + id + " " + m.Name + " " + p.Name + " " + p.ID)
+			idx := strings.Index(hay, q)
+			if idx < 0 {
+				continue
+			}
+			rule, rErr := ruleForModel(pid, id, m)
+			if rErr != nil {
+				continue
+			}
+			name := strings.TrimSpace(m.Name)
+			if name == "" {
+				name = id
+			}
+			hits = append(hits, hit{
+				c: ModelsDevCandidate{
+					ProviderID:         pid,
+					ProviderName:       p.Name,
+					ModelID:            id,
+					Name:               name,
+					Pattern:            id,
+					Label:              name,
+					PriceInput:         rule.PriceInput,
+					PriceOutput:        rule.PriceOutput,
+					PriceReasoning:     rule.PriceReasoning,
+					PriceCached:        rule.PriceCached,
+					PriceCacheRead:     rule.PriceCacheRead,
+					PriceCacheCreation: rule.PriceCacheCreation,
+					MatchKind:          "exact",
+					Source:             string(store.PricingSourceModelsDev),
+					ModelsDevID:        pid + "/" + id,
+				},
+				score: idx,
+			})
+		}
+	}
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].score != hits[j].score {
+			return hits[i].score < hits[j].score
+		}
+		return hits[i].c.ModelsDevID < hits[j].c.ModelsDevID
+	})
+	if len(hits) > limit {
+		hits = hits[:limit]
+	}
+	out := make([]ModelsDevCandidate, 0, len(hits))
+	for _, h := range hits {
+		out = append(out, h.c)
+	}
+	return out, nil
+}
+
 // transformModelsDev 把价格簿变换为计价规则。
 //
 //   - providerPriority 决定同名模型的取用顺序；未列出的提供方排在其后，按 ID 字典序。

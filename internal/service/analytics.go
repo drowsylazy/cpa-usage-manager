@@ -115,13 +115,16 @@ func (s *Service) ListRequests(ctx context.Context, f UsageFilter, limit, offset
 }
 
 type TrendPoint struct {
-	Bucket       time.Time `json:"bucket"`
-	Requests     int64     `json:"requests"`
-	Failures     int64     `json:"failures"`
-	InputTokens  int64     `json:"input_tokens"`
-	OutputTokens int64     `json:"output_tokens"`
-	TotalTokens  int64     `json:"total_tokens"`
-	CostMicroUSD int64     `json:"cost_micro_usd"`
+	Bucket              time.Time `json:"bucket"`
+	Requests            int64     `json:"requests"`
+	Failures            int64     `json:"failures"`
+	InputTokens         int64     `json:"input_tokens"`
+	OutputTokens        int64     `json:"output_tokens"`
+	CachedTokens        int64     `json:"cached_tokens"`
+	CacheReadTokens     int64     `json:"cache_read_tokens"`
+	CacheCreationTokens int64     `json:"cache_creation_tokens"`
+	TotalTokens         int64     `json:"total_tokens"`
+	CostMicroUSD        int64     `json:"cost_micro_usd"`
 }
 
 func (s *Service) Trends(ctx context.Context, f UsageFilter, grain string) ([]TrendPoint, error) {
@@ -170,7 +173,7 @@ func (s *Service) Trends(ctx context.Context, f UsageFilter, grain string) ([]Tr
 		args = append([]any{seconds, seconds}, args...)
 	}
 	query := `SELECT ` + selectBucket +
-		`, SUM(req_count),SUM(fail_count),SUM(input_tokens),SUM(output_tokens),SUM(total_tokens),SUM(cost_micro_usd)` +
+		`, SUM(req_count),SUM(fail_count),SUM(input_tokens),SUM(output_tokens),SUM(cached_tokens),SUM(cache_read_tokens),SUM(cache_creation_tokens),SUM(total_tokens),SUM(cost_micro_usd)` +
 		` FROM usage_rollups` + clause + ` GROUP BY 1 ORDER BY 1`
 	var out []TrendPoint
 	err := s.st.Read(ctx, func(q store.Querier) error {
@@ -182,7 +185,7 @@ func (s *Service) Trends(ctx context.Context, f UsageFilter, grain string) ([]Tr
 		for rows.Next() {
 			var p TrendPoint
 			var unix int64
-			if e := rows.Scan(&unix, &p.Requests, &p.Failures, &p.InputTokens, &p.OutputTokens, &p.TotalTokens, &p.CostMicroUSD); e != nil {
+			if e := rows.Scan(&unix, &p.Requests, &p.Failures, &p.InputTokens, &p.OutputTokens, &p.CachedTokens, &p.CacheReadTokens, &p.CacheCreationTokens, &p.TotalTokens, &p.CostMicroUSD); e != nil {
 				return e
 			}
 			p.Bucket = time.Unix(unix, 0).UTC()

@@ -39,7 +39,7 @@
       </span>
       <span class="brand-text">
         <span class="brand-name">CPA 用量管理</span>
-        <span class="brand-sub">插件 Key 额度 · 用量计量 · 审计</span>
+        <span class="brand-sub">插件 Key 额度 · 用量计量</span>
       </span>
     </div>
 
@@ -78,7 +78,6 @@
     <button role="tab" class="tab" data-tab="usage">用量</button>
     <button role="tab" class="tab" data-tab="pricing">价格</button>
     <button role="tab" class="tab" data-tab="auth">认证额度</button>
-    <button role="tab" class="tab" data-tab="audit">审计</button>
     <button role="tab" class="tab" data-tab="system">系统<span class="tab-dot alarm" data-badge="system" hidden></span></button>
     <span class="tabs-meta mono" id="stamp"></span>
   </nav>
@@ -214,7 +213,7 @@
           <th class="num">输入</th><th class="num">输出</th><th class="num">缓存读</th>
           <th class="num sort" data-sort="tokens">总 Token</th>
           <th class="num sort" data-sort="cost">费用</th>
-          <th class="num sort" data-sort="latency">延迟</th><th class="num">TPS</th>
+          <th class="num sort" data-sort="latency">首字</th><th class="num">总延迟</th><th class="num">TPS</th>
         </tr></thead>
         <tbody id="req-rows"></tbody>
       </table>
@@ -231,16 +230,15 @@
       <div class="panel-tools">
         <span class="fx mono" id="fx-info"></span>
         <button type="button" class="btn" id="fx-refresh">刷新汇率</button>
-        <button type="button" class="btn" id="pricing-sync">
-          <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 5.5v5h-5"/><path d="M18.4 14.6A7 7 0 1 1 17.6 7L20 10.5"/></svg>
-          <span>同步 models.dev</span>
-        </button>
+        <input class="btn input" id="pricing-search-input" type="search" placeholder="搜索 models.dev 模型" spellcheck="false">
+        <button type="button" class="btn" id="pricing-search-btn">搜索</button>
         <button type="button" class="btn primary" id="pricing-add">
           <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
           <span>新增规则</span>
         </button>
       </div>
     </div>
+    <div class="panel-body pad-0" id="pricing-search-results" hidden></div>
     <div class="table-wrap">
       <table class="data" id="pricing-table">
         <thead><tr>
@@ -261,20 +259,6 @@
       <div><h2 class="panel-title">上游认证额度</h2><p class="panel-sub">OAuth 快照与本地观测增量，不缓存</p></div>
     </div>
     <div class="panel-body" id="auth-body"></div>
-  </article>
-</section>
-
-<!-- ── 审计 ─────────────────────────────────────────────────────── -->
-<section class="view" id="view-audit" role="tabpanel" aria-labelledby="tab-audit" hidden>
-  <article class="panel">
-    <div class="panel-head">
-      <div><h2 class="panel-title">审计事件</h2><p class="panel-sub">签发、改动与维护操作的完整留痕</p></div>
-      <div class="panel-tools">
-        <input class="btn input" id="audit-filter" type="search" placeholder="过滤动作或对象" spellcheck="false">
-      </div>
-    </div>
-    <div class="panel-body" id="audit-body"></div>
-    <div class="pager" id="audit-pager"></div>
   </article>
 </section>
 
@@ -314,7 +298,7 @@
   </div>
 
   <article class="panel danger-zone">
-    <div class="panel-head"><div><h2 class="panel-title">重置统计</h2><p class="panel-sub">清空逐请求明细、分钟聚合、已终结预占与密钥计数器；密钥、计价规则与审计保留</p></div></div>
+      <div class="panel-head"><div><h2 class="panel-title">重置统计</h2><p class="panel-sub">清空逐请求明细、分钟聚合、已终结预占与密钥计数器；密钥与计价规则保留</p></div></div>
     <div class="panel-body">
       <div class="btn-row">
         <input class="btn input" id="reset-confirm" placeholder="输入 reset 以解锁" spellcheck="false" autocomplete="off">

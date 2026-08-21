@@ -323,6 +323,7 @@ func (s *Store) ReadDB() *sql.DB { return s.readDB }
 
 // Write 在写事务中执行 fn。事务使用 immediate 锁，串行执行。
 // fn 返回错误则回滚。未持有写租约时返回 ErrReadOnly。
+// 瞬时磁盘 I/O 错误（杀毒/同步盘短暂占用库文件）自动重试一次。
 func (s *Store) Write(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	s.mu.RLock()
 	closed, writable := s.closed, s.writable
@@ -337,7 +338,20 @@ func (s *Store) Write(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	tx, err := s.writeDB.BeginTx(ctx, nil)
+	var err error
+	for attempt := 0; ; attempt++ {
+		if attempt == 1 {
+			time.Sleep(50 * time.Millisecond)
+		}
+		err = writeOnce(ctx, s.writeDB, fn)
+		if !isTransientIOErr(err) || attempt == 1 {
+			return err
+		}
+	}
+}
+
+func writeOnce(ctx context.Context, db *sql.DB, fn func(tx *sql.Tx) error) error {
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("开启写事务失败: %w", err)
 	}
@@ -351,7 +365,19 @@ func (s *Store) Write(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	return nil
 }
 
-// Read 在只读连接上执行 fn。
+// isTransientIOErr 报告错误是否为可重试的磁盘 I/O 错误。
+// Windows 上杀毒软件或同步盘短暂占用库文件时会得到 SQLITE_IOERR 系列
+// 扩展码（如 522 SHORT_READ），稍候重试通常即可恢复；持续失败说明
+// 文件、磁盘或外部占用确有问题，应由调用方向用户呈现原始错误。
+func isTransientIOErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "disk I/O error") || strings.Contains(msg, "SQLITE_IOERR")
+}
+
+// Read 在只读连接上执行 fn。瞬时磁盘 I/O 错误自动重试一次。
 func (s *Store) Read(ctx context.Context, fn func(q Querier) error) error {
 	s.mu.RLock()
 	closed := s.closed
@@ -359,7 +385,12 @@ func (s *Store) Read(ctx context.Context, fn func(q Querier) error) error {
 	if closed {
 		return ErrClosed
 	}
-	return fn(s.readDB)
+	err := fn(s.readDB)
+	if isTransientIOErr(err) {
+		time.Sleep(50 * time.Millisecond)
+		err = fn(s.readDB)
+	}
+	return err
 }
 
 // Querier 抽象 *sql.DB 与 *sql.Tx 的公共查询接口。

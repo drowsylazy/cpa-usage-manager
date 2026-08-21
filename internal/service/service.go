@@ -139,6 +139,11 @@ type Service struct {
 	mu      sync.RWMutex
 	// fxSvc 懒初始化，只在面板请求汇率时创建。
 	fxSvc *fx.Service
+
+	// models.dev 价格簿搜索缓存：整本目录较大，10 分钟内复用同一份。
+	catalogMu  sync.Mutex
+	catalogRaw map[string]ModelsDevProvider
+	catalogAt  time.Time
 }
 
 // Config 返回当前生效的配置副本，供 httpapi 读取展示项与开关。
@@ -387,6 +392,10 @@ func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req
 		req.TotalTokens = u.EffectiveTotal()
 		req.CostMicroUSD = cost
 		req.Priced = priced
+		// 上游不回 TPS 时按 输出token/生成时长 自算（毫单位整数，避免浮点）。
+		if req.TPSMilli == 0 && req.OutputTokens > 0 && req.GenerationMS > 0 {
+			req.TPSMilli = req.OutputTokens * 1_000_000 / req.GenerationMS
+		}
 	}
 	out, err := s.st.SettleReservation(ctx, id, cost, time.Now(), req)
 	if err == nil {
@@ -400,6 +409,13 @@ func (s *Service) Release(ctx context.Context, id string) (store.Reservation, er
 		_ = s.st.AppendAudit(ctx, store.AuditEvent{Action: "quota.release", EntityType: "reservation", EntityID: id})
 	}
 	return out, err
+}
+
+// BackfillRequestUsage 用宿主 usage.handle 的权威用量回填最近的零用量记录。
+// 执行器流式解析拿不到上游用量时（费用按预占估算入账），token 明细在此补齐；
+// 分钟聚合不回填，属可接受的统计口径差异。
+func (s *Service) BackfillRequestUsage(ctx context.Context, kid, model string, near time.Time, b store.UsageBackfill) (bool, error) {
+	return s.st.BackfillRequestUsage(ctx, kid, model, near, b)
 }
 
 // UpdateKey、RevokeKey、DeleteKey 是管理面调用的薄封装，并统一写审计。

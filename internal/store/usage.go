@@ -137,6 +137,39 @@ func (s *Store) GetRequest(ctx context.Context, id string) (Request, error) {
 	return r, nil
 }
 
+// BackfillRequestUsage 给 key+model 在 near 前后 15 秒内最近一条零用量记录
+// 补写宿主 usage.handle 上报的 token 明细。返回是否找到并更新了记录。
+// 只补逐请求行，分钟聚合不回填（可接受的口径差异）。
+func (s *Store) BackfillRequestUsage(ctx context.Context, kid, model string, near time.Time, b UsageBackfill) (bool, error) {
+	var id string
+	err := s.Write(ctx, func(tx *sql.Tx) error {
+		row := tx.QueryRowContext(ctx,
+			`SELECT id FROM requests
+			 WHERE key_id = ? AND model = ?
+			   AND input_tokens = 0 AND output_tokens = 0 AND total_tokens = 0
+			   AND ts BETWEEN ? AND ?
+			 ORDER BY ts DESC LIMIT 1`,
+			kid, model, near.Add(-15*time.Second).UnixMilli(), near.Add(15*time.Second).UnixMilli())
+		if e := row.Scan(&id); e != nil {
+			return e
+		}
+		_, e := tx.ExecContext(ctx,
+			`UPDATE requests SET input_tokens=?, output_tokens=?, reasoning_tokens=?,
+			    cached_tokens=?, cache_read_tokens=?, cache_creation_tokens=?, total_tokens=?
+			 WHERE id = ? AND total_tokens = 0`,
+			b.InputTokens, b.OutputTokens, b.ReasoningTokens,
+			b.CachedTokens, b.CacheReadTokens, b.CacheCreationTokens, b.TotalTokens, id)
+		return e
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // requestColumns 是 requests 表的完整列清单。
 const requestColumns = `id, ts, key_id, caller_id, model, provider, source,
 	auth_id, auth_label, auth_type, tier, result,
