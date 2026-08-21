@@ -16,6 +16,17 @@ function fmtInt(n) {
   if (a >= 1e4) return (n / 1e4).toFixed(a >= 1e6 ? 0 : 1) + ' 万';
   return n.toLocaleString('zh-CN');
 }
+// fmtTok Token 计数专用：按 K / M / B 自动升级（<1000 原样显示），整数部分满三位后省去小数；
+// 升级阈值取 999.5 的倍数，四舍五入后满千的值（如 999500）直接进位到更大单位（1M 而非 1000K）。
+function fmtTok(n) {
+  n = Math.round(Number(n) || 0);
+  const a = Math.abs(n);
+  const dec = s => s.toFixed(Math.abs(s) >= 100 ? 0 : 1).replace(/\.0$/, '');
+  if (a >= 999.5e6) return dec(n / 1e9) + 'B';
+  if (a >= 999.5e3) return dec(n / 1e6) + 'M';
+  if (a >= 999.5) return dec(n / 1e3) + 'K';
+  return String(n);
+}
 function fmtUSD(micro) {
   if (micro === null || micro === undefined) return '不限';
   const v = (Number(micro) || 0) / 1e6, neg = v < 0, a = Math.abs(v);
@@ -419,13 +430,13 @@ function renderReadouts(total, costs) {
     readout('请求总数', fmtInt(total.requests),
       '失败 <b>' + fmtInt(total.failures) + '</b> · 失败率 ' + failRate,
       total.requests > 0 && total.failures / total.requests > 0.05)
-    + readout('总 Token', fmtInt(effTokens(total)),
-      '输入 <b>' + fmtInt(total.input_tokens) + '</b> · 输出 <b>' + fmtInt(total.output_tokens)
-      + '</b> · 缓存命中 <b>' + fmtInt(cacheHit(total)) + '</b>')
+    + readout('总消耗 Token', effTokens(total).toLocaleString('zh-CN'),
+      '输入 <b>' + fmtTok(total.input_tokens) + '</b> · 输出 <b>' + fmtTok(total.output_tokens)
+      + '</b> · 缓存命中 <b>' + fmtTok(cacheHit(total)) + '</b>')
     + readout('总费用', fmtUSD(total.cost_micro_usd),
       '计价覆盖 <b>' + cover + '%</b>' + esc(cny))
     + readout('缓存命中率', hitPct < 0 ? '—' : hitPct.toFixed(1) + '%',
-      '读 <b>' + fmtInt(total.cache_read_tokens) + '</b> · 写 <b>' + fmtInt(total.cache_creation_tokens)
+      '读 <b>' + fmtTok(total.cache_read_tokens) + '</b> · 写 <b>' + fmtTok(total.cache_creation_tokens)
       + '</b>' + ((total.cached_tokens || 0) > (total.cache_read_tokens || 0) + (total.cache_creation_tokens || 0)
         ? ' · 含上游缓存口径' : ''));
 }
@@ -454,7 +465,7 @@ function metricVal(r, m) {
   return effTokens(r);
 }
 function metricText(v, m) {
-  return m === 'cost' ? fmtUSD(v) : fmtInt(v);
+  return m === 'cost' ? fmtUSD(v) : m === 'tokens' ? fmtTok(v) : fmtInt(v);
 }
 const METRIC_SUBS = { tokens: '按 Token 计量', cost: '按费用计量', requests: '按请求次数计量' };
 function bindMetricSeg(id, key, apply) {
@@ -485,15 +496,11 @@ function renderModels(rows) {
 function renderKeySpend(rows) {
   const m = ovMetric.keys;
   $('ov-keys-sub').textContent = METRIC_SUBS[m] + '，取前 8';
-  const labelOf = kid => {
-    const k = keysView.cache.find(x => x.kid === kid);
-    return k && k.label ? k.label : '';
-  };
   const top = rows.filter(r => r.value).sort((a, b) => metricVal(b, m) - metricVal(a, m)).slice(0, 8);
   const max = top.length ? metricVal(top[0], m) : 0;
   $('ov-keys').innerHTML = barList(top, max,
-    r => (labelOf(r.value) || '(无标签)') + ' · ' + r.value,
-    r => '<span class="bar-name-main">' + esc(labelOf(r.value) || '(无标签)') + '</span>'
+    r => (keyLabelOf(r.value) || '(无标签)') + ' · ' + r.value,
+    r => '<span class="bar-name-main">' + esc(keyLabelOf(r.value) || '(无标签)') + '</span>'
       + '<span class="bar-kid mono">' + esc(r.value) + '</span>',
     r => metricVal(r, m), r => metricText(metricVal(r, m), m), 'trace');
 }
@@ -611,10 +618,10 @@ function trendSeries() {
     { key: 'cost', label: '费用', color: cssVar('--signal'), val: p => p.cost_micro_usd, money: true },
   ];
   return [
-    { key: 'input', label: '输入', color: cssVar('--signal'), val: p => p.input_tokens },
-    { key: 'output', label: '输出', color: cssVar('--trace'), val: p => p.output_tokens },
-    { key: 'cache-read', label: '缓存读', color: cssVar('--live'), val: p => p.cache_read_tokens || 0 },
-    { key: 'cache-creation', label: '缓存写', color: cssVar('--warn'), val: p => p.cache_creation_tokens || 0 },
+    { key: 'input', label: '输入', color: cssVar('--signal'), tok: true, val: p => p.input_tokens },
+    { key: 'output', label: '输出', color: cssVar('--trace'), tok: true, val: p => p.output_tokens },
+    { key: 'cache-read', label: '缓存读', color: cssVar('--live'), tok: true, val: p => p.cache_read_tokens || 0 },
+    { key: 'cache-creation', label: '缓存写', color: cssVar('--warn'), tok: true, val: p => p.cache_creation_tokens || 0 },
   ];
 }
 function renderLegend() {
@@ -662,11 +669,13 @@ function renderTrend() {
 
   let grid = '', labels = '';
   const isMoney = defs.some(d => d.money);
+  const isTokens = defs.some(d => d.tok);
+  const fmtAxis = v => isMoney ? fmtUSD(v) : isTokens ? fmtTok(v) : fmtInt(v);
   for (let g = 0; g <= 4; g++) {
     const gv = ymax * g / 4, gy = y(gv);
     grid += '<line class="gridline" x1="' + padL + '" y1="' + gy.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + gy.toFixed(1) + '"/>';
     labels += '<text class="axis-text" x="' + (padL - 8) + '" y="' + (gy + 3.5).toFixed(1) + '" text-anchor="end">'
-      + (isMoney ? fmtUSD(gv) : fmtInt(gv)) + '</text>';
+      + fmtAxis(gv) + '</text>';
   }
   const tickStep = Math.max(1, Math.ceil(n / Math.floor(iw / 64)));
   let lastTickX = -1e9;
@@ -721,9 +730,8 @@ function renderTrend() {
     const p = pts[idx];
     let rows = defs.filter(d => d.on).map(d =>
       '<div class="tip-row"><span class="swatch" style="background:' + d.color + '"></span><span>' + d.label
-      + '</span><b>' + (d.money ? fmtUSD(d.val(p)) : fmtInt(d.val(p))) + '</b></div>').join('');
-    rows += '<div class="tip-row"><span></span><span>合计</span><b>'
-      + (isMoney ? fmtUSD(stacks[idx]) : fmtInt(stacks[idx])) + '</b></div>';
+      + '</span><b>' + (d.money ? fmtUSD(d.val(p)) : d.tok ? fmtTok(d.val(p)) : fmtInt(d.val(p))) + '</b></div>').join('');
+    rows += '<div class="tip-row"><span></span><span>合计</span><b>' + fmtAxis(stacks[idx]) + '</b></div>';
     tip.innerHTML = '<div class="tip-head">' + esc(bucketLabel(p.bucket, grain)) + '</div>' + rows;
     tip.hidden = false;
     const px = cx(idx) / W * rect.width;
@@ -741,6 +749,11 @@ window.addEventListener('resize', debounce(() => { if (activeTab === 'overview')
 
 // ---------- 密钥 ----------
 const keysView = { cache: [], filtered: [], page: 0, size: 20, search: '', caller: '', status: '' };
+// keyLabelOf 由 kid 查密钥标签；无标签或缓存未热时返回空串，由调用方决定回落值。
+function keyLabelOf(kid) {
+  const k = keysView.cache.find(x => x.kid === kid);
+  return k && k.label ? k.label : '';
+}
 
 loaders.keys = async () => { await refreshKeys(); };
 async function refreshKeys() {
@@ -1095,7 +1108,7 @@ async function loadDim() {
       + '<div class="bar-line"><span style="width:' + (row.requests / maxReq * 100).toFixed(1) + '%"></span></div></div></td>'
       + '<td class="num">' + fmtInt(row.requests) + '</td>'
       + '<td class="num">' + (row.failures ? '<span class="pill alarm mono">' + fmtInt(row.failures) + '</span>' : '0') + '</td>'
-      + '<td class="num">' + fmtInt(effTokens(row)) + '</td>'
+      + '<td class="num">' + fmtTok(effTokens(row)) + '</td>'
       + '<td class="num">' + fmtUSD(row.cost_micro_usd) + '</td>'
       + '<td class="num">' + fmtSec(row.latency_avg_ms) + '</td>'
       + '<td class="num">' + (row.tps_avg_milli ? (row.tps_avg_milli / 1000).toFixed(1) : '-') + '</td></tr>').join('')
@@ -1135,7 +1148,7 @@ async function loadRequests() {
     const uncaught = noUsage && (+x.cost_micro_usd || 0) > 0;
     const tokenCell = uncaught
       ? '<span class="pill warn mono" title="上游未返回用量，费用按预占估算扣费">未捕获</span>'
-      : '<b>' + fmtInt(effTokens(x)) + '</b>';
+      : '<b>' + fmtTok(effTokens(x)) + '</b>';
     return '<tr class="row" data-id="' + esc(x.id) + '">'
     + '<td class="cell-mono">' + fmtDT(x.ts, true) + '</td>'
     + '<td class="cell-mono">' + esc(x.key_id || '-') + '</td>'
@@ -1143,9 +1156,9 @@ async function loadRequests() {
     + '<td class="cell-dim">' + esc(x.provider || '-') + '</td>'
     + '<td><span class="pill ' + (x.result === 'ok' ? 'live' : x.result === 'blocked' ? 'warn' : 'alarm') + '">'
     + esc(x.result) + '</span></td>'
-    + '<td class="num">' + fmtInt(x.input_tokens) + '</td>'
-    + '<td class="num">' + fmtInt(x.output_tokens) + '</td>'
-    + '<td class="num">' + fmtInt(x.cache_read_tokens) + '</td>'
+    + '<td class="num">' + fmtTok(x.input_tokens) + '</td>'
+    + '<td class="num">' + fmtTok(x.output_tokens) + '</td>'
+    + '<td class="num">' + fmtTok(x.cache_read_tokens) + '</td>'
     + '<td class="num">' + tokenCell + '</td>'
     + '<td class="num">' + fmtUSD(x.cost_micro_usd) + '</td>'
     + '<td class="num">' + fmtSec(x.ttft_ms) + '</td>'
@@ -1190,12 +1203,12 @@ $('req-rows').addEventListener('click', e => {
     body: '<div class="detail-facts">'
       + fact('模型', x.model || '-') + fact('提供方', x.provider || '-')
       + fact('来源', x.source || '-') + fact('结果', x.result)
-      + fact('密钥', x.key_id || '-') + fact('caller', x.caller_id || '-')
+      + fact('密钥', x.key_id ? (keyLabelOf(x.key_id) || x.key_id) : '-') + fact('caller', x.caller_id || '-')
       + fact('认证账号', x.auth_label || x.auth_id || '-') + fact('认证类型', x.auth_type || '-')
       + fact('档位', x.tier || '-') + fact('思考强度', x.thinking_intensity || '-')
-      + fact('输入 Token', fmtInt(x.input_tokens)) + fact('输出 Token', fmtInt(x.output_tokens))
-      + fact('推理 Token', fmtInt(x.reasoning_tokens)) + fact('缓存读', fmtInt(x.cache_read_tokens))
-      + fact('缓存写', fmtInt(x.cache_creation_tokens)) + fact('总 Token', fmtInt(effTokens(x)))
+      + fact('输入 Token', fmtTok(x.input_tokens)) + fact('输出 Token', fmtTok(x.output_tokens))
+      + fact('推理 Token', fmtTok(x.reasoning_tokens)) + fact('缓存读', fmtTok(x.cache_read_tokens))
+      + fact('缓存写', fmtTok(x.cache_creation_tokens)) + fact('总 Token', fmtTok(effTokens(x)))
       + (!(+x.input_tokens || 0) && !(+x.output_tokens || 0) && (+x.cost_micro_usd || 0) > 0
         ? fact('用量捕获', '上游未返回用量，费用按预占估算扣费') : '')
       + fact('首字延迟', fmtSec(x.ttft_ms))

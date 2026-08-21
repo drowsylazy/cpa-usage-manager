@@ -299,6 +299,8 @@ tr.detail>td{background:var(--sunken);padding:14px 16px;white-space:normal;borde
 
 /* 维度表内的占比条 */
 .bar-cell{display:grid;gap:4px;min-width:150px}
+/* 概览占比卡内多条目纵向堆叠时的间隔（维度表中每格只有一条，不受影响） */
+.bar-cell + .bar-cell{margin-top:14px}
 .bar-cell .bar-top{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
 .bar-cell .bar-name{font-family:var(--mono);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bar-cell .bar-pct{color:var(--fg3);font-family:var(--mono);font-size:11px;flex:none}

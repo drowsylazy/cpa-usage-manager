@@ -3,11 +3,14 @@
 package main
 
 import (
+	"context"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/drowsylazy/cpa-usage-manager/internal/config"
 	"github.com/drowsylazy/cpa-usage-manager/internal/store"
 )
 
@@ -27,6 +30,35 @@ func TestNormalizeModelKey(t *testing.T) {
 		if got := normalizeModelKey(in); got != want {
 			t.Fatalf("normalizeModelKey(%q) = %q, 期望 %q", in, got, want)
 		}
+	}
+}
+
+// TestUsageRecordPrefersAlias 覆盖被动入库的模型名口径：
+// 宿主上报的 Model 是上游实际路由名（如 OpenRouter 把 openrouter/ox-alpha
+// 回报为 stealth/ox-alpha），直接落库会与执行器路径记录的别名割裂成两个维度值。
+func TestUsageRecordPrefersAlias(t *testing.T) {
+	c := config.Default()
+	c.DataDir = t.TempDir()
+	st, err := store.Open(context.Background(), store.Options{
+		Path: filepath.Join(c.DataDir, "alias.db"), OwnerID: "alias"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	req := usageRecordToRequest(st, rpcUsageRecord{
+		Model: "stealth/ox-alpha", Alias: "openrouter/ox-alpha",
+		Detail: rpcUsageDetail{TotalTokens: 100},
+	})
+	if req.Model != "openrouter/ox-alpha" {
+		t.Fatalf("应优先记录用户配置的别名，得到 %q", req.Model)
+	}
+
+	fallback := usageRecordToRequest(st, rpcUsageRecord{
+		Model: "gpt-5", Detail: rpcUsageDetail{TotalTokens: 1},
+	})
+	if fallback.Model != "gpt-5" {
+		t.Fatalf("别名缺失时应回落宿主上报模型名，得到 %q", fallback.Model)
 	}
 }
 

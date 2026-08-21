@@ -1697,9 +1697,12 @@ func modelCandidates(model, alias string) []string {
 
 func usageRecordToRequest(st *store.Store, u rpcUsageRecord) store.Request {
 	req := store.Request{
-		ID:                  uuid.NewString(),
-		TS:                  u.RequestedAt,
-		Model:               u.Model,
+		ID: uuid.NewString(),
+		TS: u.RequestedAt,
+		// 模型展示口径统一用别名：宿主上报的 Model 是上游实际路由名
+		// （如 OpenRouter 把 openrouter/ox-alpha 回报为 stealth/ox-alpha），
+		// 直接落库会与执行器路径记录的别名割裂成两个维度值。
+		Model:               service.FirstNonEmpty(u.Alias, u.Model),
 		Provider:            u.Provider,
 		Source:              store.RedactSource(u.Source),
 		AuthID:              u.AuthID,
