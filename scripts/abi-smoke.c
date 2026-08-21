@@ -139,7 +139,15 @@ int main(int argc, char **argv) {
         printf("ok: cliproxyPluginShutdown\n");
     }
 
-    lib_close(lib);
+    /*
+     * 故意不卸载动态库。Go 运行时不支持卸载 c-shared 库：shutdown 之后
+     * 运行时线程与定时器仍然存活，FreeLibrary/dlclose 会把它们的代码页抽走，
+     * 于是进程在退出前偶发段错误（实测约 1/50，v0.2.1 及更早同样存在）。
+     * 宿主 CLIProxyAPI 也从不卸载插件——句柄留到进程退出才是生产行为，
+     * 这里保持一致，避免用一个不可能修好的卸载路径把回归测试变成掷硬币。
+     * （早退分支仍会卸载：那时还没走完 init，也没什么可保护的。）
+     */
+
     printf(failures ? "ABI SMOKE FAILED (%d)\n" : "ABI SMOKE PASSED\n", failures);
     return failures ? 1 : 0;
 }

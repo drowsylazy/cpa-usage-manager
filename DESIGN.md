@@ -80,7 +80,32 @@
 
 不注册鉴权/执行器能力；仅 `usage.handle` 接收宿主用量记录入库统计。
 
-### 2.3 读路径
+### 2.3 宿主用量认领（单一写入路径的实现）
+
+`quota.enabled=true` 时，同一个真实请求会被两条链路看到：插件执行器（结算时写行）与宿主
+`usage.handle` 回调（被动统计写行）。宿主回调载荷**不含请求 ID**，早期版本靠
+「时间窗 + 延迟 + 模型」在库里猜关联，既会漏判（重复统计）也会误判（合并掉不同请求）。
+
+现行做法是**进程内认领登记表（rendezvous）**：
+
+```
+executor.execute(_stream) / request_interceptor
+  → registerUsageClaim(kid, 归一化模型名…)     登记一个认领位
+  → host.model.execute(_stream)
+usage.handle(record)
+  → claimHostUsage(record)                     按模型名匹配（同 kid 优先，其次 FIFO）
+      命中 → 交给该请求，**不写行**；若该请求已落库则回填 token/首字延迟
+      未命中 → 走被动写入（跨进程/迟到回调的兜底，仍做落库后对账）
+结算
+  → 落库前合并宿主展示字段（provider/auth_type/tier，属聚合主键，只能落库前写）
+  → 落库后仅回填 token 与首字延迟
+  → claim.release(8s 宽限)                     容忍宿主稍晚回调
+```
+
+写行的路径始终只有一条：认领命中即被动侧不写。数据库层的
+`ReconcileRequestDuplicates` / `DedupeRequests` 退居兜底，处理跨进程或超出宽限期的回调。
+
+### 2.4 读路径
 
 唯一入口 `/console`（管理面板，HTML 壳不含数据）；所有数据经 `/v0/management/plugins/cpa-usage-manager/*`（宿主管理密钥鉴权）。无其他公开读取面。
 
@@ -220,7 +245,7 @@ quota:                               # 额度子系统（默认开启）
     require_estimate: false
   settlement:
     missing_usage: settle_reserved   # settle_reserved | release
-    host_usage_wait: 1500ms          # 等待宿主 usage 回调的时间窗
+    host_usage_wait: 1500ms          # 流式兜底：关流后等宿主 usage 回调的窗口（非流式不等待）
   stream:
     max_buffer_bytes: 4194304        # 流式结算本地缓冲上限
     stale_reservation_timeout: 2h    # 无心跳在途预占自动释放

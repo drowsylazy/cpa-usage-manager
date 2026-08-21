@@ -95,12 +95,27 @@ async function api(path, opts = {}) {
   if (!r.ok) {
     let msg = 'HTTP ' + r.status;
     try { const j = await r.json(); if (j.error) msg = j.error; } catch (_) { /* 非 JSON 错误体 */ }
-    if (/disk I\/O error/i.test(msg))
-      msg += ' —— 数据目录可能被杀毒软件/同步盘占用，或磁盘空间异常；若持续出现请在「系统」页备份后重建数据库';
-    throw new Error(msg);
+    throw new Error(withStorageHint(msg));
   }
   const ct = r.headers.get('Content-Type') || '';
   return ct.includes('json') ? r.json() : r;
+}
+
+// withStorageHint 为存储层错误补上处置建议。
+//
+// 后端在重试耗尽后已经带上中文成因（见 store.transientCause），此时不再追加，
+// 避免同一句话出现两遍；只有透出的是原始英文 SQLite 错误时才由前端补一句。
+function withStorageHint(msg) {
+  if (/malformed|SQLITE_CORRUPT|not a database/i.test(msg))
+    return msg + ' —— 数据库文件已损坏，重试无效：请在「系统」页备份后重建数据库';
+  if (/数据目录|已重试|检查 data_dir/.test(msg)) return msg;
+  if (/database is locked|SQLITE_BUSY|SQLITE_LOCKED/i.test(msg))
+    return msg + ' —— 数据库被其他进程占用；检查是否有第二个宿主实例共用同一 data_dir';
+  if (/unable to open database file/i.test(msg))
+    return msg + ' —— 无法打开数据库或临时文件；检查 data_dir 权限、磁盘剩余空间与 TEMP 目录';
+  if (/disk I\/O error|SQLITE_IOERR/i.test(msg))
+    return msg + ' —— 数据目录可能被杀毒软件/同步盘占用，或磁盘空间异常；建议把 data_dir 加入杀毒排除列表并移出同步盘';
+  return msg;
 }
 const post = (path, body) => api(path, { method: 'POST', body: JSON.stringify(body) });
 
@@ -1395,7 +1410,10 @@ loaders.system = async () => {
     + readout('在途预占', fmtInt(s.held_reservations), '未结算的额度预占', s.held_reservations > 0)
     + readout('密钥', fmtInt(s.keys), '含已撤销 / 过期')
     + readout('Caller', fmtInt(s.callers), '归属记录')
-    + readout('计价规则', fmtInt(s.pricing_rules), 'manual + models.dev');
+    + readout('计价规则', fmtInt(s.pricing_rules), 'manual + models.dev')
+    + readout('存储重试', fmtInt(s.io_retries || 0),
+      s.io_retries > 0 ? '瞬时 I/O 故障已自动重试；持续增长请把 data_dir 移出杀毒/同步盘' : '本次运行未出现瞬时 I/O 故障',
+      s.io_retries > 0);
   $('db-note').textContent = s.writable
     ? '备份为单文件 SQLite 快照；恢复前服务端会做一致性检查。'
     : '当前实例处于只读模式（可能存在跨进程写者），备份可用，恢复不可用。';
@@ -1450,6 +1468,7 @@ function maintainRun(vacuum) {
       const g = k => r[k] !== undefined ? r[k] : r[k.charAt(0).toUpperCase() + k.slice(1)];
       $('maintain-note').textContent = '上次结果：清理请求 ' + fmtInt(g('requests'))
         + ' · 聚合 ' + fmtInt(g('rollups')) + ' · 预占 ' + fmtInt(g('reservations'))
+        + ' · 合并重复 ' + fmtInt(g('deduped'))
         + (vacuum ? ' · 已 VACUUM' : '');
       toast(vacuum ? '清理并 VACUUM 完成' : '清理完成', 'ok');
       loaders.system().catch(() => {});
@@ -1458,6 +1477,19 @@ function maintainRun(vacuum) {
 }
 $('maintain-btn').addEventListener('click', maintainRun(false));
 $('vacuum-btn').addEventListener('click', maintainRun(true));
+$('dedupe-btn').addEventListener('click', async () => {
+  const btn = $('dedupe-btn');
+  btn.disabled = true;
+  try {
+    const r = await post('/dedupe', { actor: 'console' });
+    const n = r.merged || 0;
+    $('maintain-note').textContent = n > 0
+      ? '上次对账：合并了 ' + fmtInt(n) + ' 条重复请求行，费用口径不变（保留执行器行的结算金额）。'
+      : '上次对账：未发现重复请求行。';
+    toast(n > 0 ? '对账完成：合并 ' + fmtInt(n) + ' 条' : '对账完成：无重复', 'ok');
+    loaders.system().catch(() => {});
+  } catch (e) { toast(e.message, 'err'); } finally { btn.disabled = false; }
+});
 $('reset-confirm').addEventListener('input', () => {
   $('reset-btn').disabled = $('reset-confirm').value !== 'reset';
 });

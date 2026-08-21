@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite" // 纯 Go SQLite 驱动，注册驱动名 "sqlite"
@@ -28,11 +29,23 @@ const (
 	driverName = "sqlite"
 
 	// maxReadConns 是读连接池上限。WAL 下读不阻塞写。
+	// 实际打开上限多 1，用于常驻锚定连接（见 Store.anchor）。
 	maxReadConns = 8
+
+	// retryAttempts 是瞬时故障（磁盘 I/O、忙锁、临时文件打不开）的总尝试次数。
+	retryAttempts = 5
 
 	// DefaultCallerID 是空库自动创建的默认归属。
 	DefaultCallerID = "default"
 )
+
+// retryBackoff 是第 2..N 次尝试前的等待时长。
+var retryBackoff = []time.Duration{
+	20 * time.Millisecond,
+	60 * time.Millisecond,
+	150 * time.Millisecond,
+	400 * time.Millisecond,
+}
 
 // 常见错误。
 var (
@@ -48,6 +61,9 @@ var (
 	ErrQuotaExceeded = errors.New("store: 额度不足")
 	// ErrConcurrencyExceeded 表示在途请求数已达上限。
 	ErrConcurrencyExceeded = errors.New("store: 并发额度不足")
+	// ErrTransient 表示重试若干次后仍失败的瞬时故障（外部占用/忙锁/磁盘异常）。
+	// 上层可据此给出可操作提示，而不必解析 SQLite 英文错误串。
+	ErrTransient = errors.New("store: 数据库暂时不可用")
 )
 
 // Options 是打开 Store 的参数。
@@ -112,10 +128,20 @@ type Store struct {
 	writeDB *sql.DB
 	// readDB 允许多连接并发读。
 	readDB *sql.DB
+	// anchor 是一条常驻只读连接，全生命周期不归还连接池。
+	//
+	// SQLite 在「最后一条连接关闭」时会 checkpoint 并删除 -wal/-shm。
+	// Windows 上杀毒/同步盘会短暂持有这两个文件句柄，此时的创建/删除竞态
+	// 表现为 SQLITE_IOERR（面板上就是「disk I/O error」）。保持一条连接常驻
+	// 可让 WAL 与 shm 在插件存活期内始终存在，从根上消除该竞态。
+	anchor *sql.Conn
 
 	// writeMu 串行化写事务。连接池上限为 1 已能保证串行，
 	// 此锁额外保证「读-改-写」复合操作的原子性边界清晰。
 	writeMu sync.Mutex
+
+	// retries 累计瞬时故障重试次数，用于 health/系统页自检。
+	retries atomic.Int64
 
 	mu       sync.RWMutex
 	writable bool
@@ -152,6 +178,12 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	}
 
 	s := &Store{opts: opts, writeDB: writeDB, readDB: readDB}
+
+	// 锚定连接必须在迁移之前建立：迁移期间 writeDB 会独占文件，
+	// 若此时读池尚无连接，任何一次读都会重新打开文件（并可能撞上外部占用）。
+	if anchor, err := readDB.Conn(context.Background()); err == nil {
+		s.anchor = anchor
+	}
 
 	// 迁移必须在获取租约之前完成：租约表本身由迁移创建。
 	if !opts.ReadOnly {
@@ -198,12 +230,14 @@ func openPool(opts Options, write bool) (*sql.DB, error) {
 		db.SetMaxOpenConns(1)
 		db.SetMaxIdleConns(1)
 	} else {
-		db.SetMaxOpenConns(maxReadConns)
-		db.SetMaxIdleConns(maxReadConns)
+		// 多 1 条用于常驻锚定连接，不挤占并发读额度。
+		db.SetMaxOpenConns(maxReadConns + 1)
+		db.SetMaxIdleConns(maxReadConns + 1)
 	}
-	// 连接长期复用，避免反复初始化 pragma。
+	// 连接长期复用：既避免反复初始化 pragma，也避免空闲回收把最后一条连接关掉
+	// 触发 WAL/shm 的删除与重建（Windows 上这是 SQLITE_IOERR 的主要来源）。
 	db.SetConnMaxLifetime(0)
-	db.SetConnMaxIdleTime(5 * time.Minute)
+	db.SetConnMaxIdleTime(0)
 
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
@@ -222,9 +256,14 @@ func buildDSN(opts Options, write bool) string {
 	// NORMAL 在 WAL 下兼顾安全与吞吐；崩溃最多丢失最近若干事务，
 	// 对用量统计可接受，且额度预占本身有过期释放兜底。
 	q.Add("_pragma", "synchronous(NORMAL)")
+	// 排序/分组的溢出中间结果留在内存：趋势与维度聚合会 ORDER BY/GROUP BY，
+	// 一旦进程 TEMP 目录不可写（权限、磁盘满、被同步盘接管）就会报 I/O 错误。
+	q.Add("_pragma", "temp_store(MEMORY)")
 	if write {
 		// 写事务直接取写锁，避免读→写升级导致的 SQLITE_BUSY 死锁。
 		q.Set("_txlock", "immediate")
+		// 8MiB 页缓存，减少写放大与临时溢出。
+		q.Add("_pragma", "cache_size(-8000)")
 	} else {
 		q.Add("_pragma", "query_only(1)")
 	}
@@ -282,6 +321,12 @@ func (s *Store) Close() error {
 
 func (s *Store) closePools() error {
 	var errs []error
+	if s.anchor != nil {
+		if err := s.anchor.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("关闭锚定连接: %w", err))
+		}
+		s.anchor = nil
+	}
 	if s.readDB != nil {
 		if err := s.readDB.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("关闭读连接池: %w", err))
@@ -323,7 +368,7 @@ func (s *Store) ReadDB() *sql.DB { return s.readDB }
 
 // Write 在写事务中执行 fn。事务使用 immediate 锁，串行执行。
 // fn 返回错误则回滚。未持有写租约时返回 ErrReadOnly。
-// 瞬时磁盘 I/O 错误（杀毒/同步盘短暂占用库文件）自动重试一次。
+// 瞬时故障（杀毒/同步盘短暂占用库文件、忙锁）按退避重试，见 retryTransient。
 func (s *Store) Write(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	s.mu.RLock()
 	closed, writable := s.closed, s.writable
@@ -338,16 +383,7 @@ func (s *Store) Write(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	var err error
-	for attempt := 0; ; attempt++ {
-		if attempt == 1 {
-			time.Sleep(50 * time.Millisecond)
-		}
-		err = writeOnce(ctx, s.writeDB, fn)
-		if !isTransientIOErr(err) || attempt == 1 {
-			return err
-		}
-	}
+	return s.retryTransient(ctx, func() error { return writeOnce(ctx, s.writeDB, fn) })
 }
 
 func writeOnce(ctx context.Context, db *sql.DB, fn func(tx *sql.Tx) error) error {
@@ -365,19 +401,7 @@ func writeOnce(ctx context.Context, db *sql.DB, fn func(tx *sql.Tx) error) error
 	return nil
 }
 
-// isTransientIOErr 报告错误是否为可重试的磁盘 I/O 错误。
-// Windows 上杀毒软件或同步盘短暂占用库文件时会得到 SQLITE_IOERR 系列
-// 扩展码（如 522 SHORT_READ），稍候重试通常即可恢复；持续失败说明
-// 文件、磁盘或外部占用确有问题，应由调用方向用户呈现原始错误。
-func isTransientIOErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "disk I/O error") || strings.Contains(msg, "SQLITE_IOERR")
-}
-
-// Read 在只读连接上执行 fn。瞬时磁盘 I/O 错误自动重试一次。
+// Read 在只读连接上执行 fn。瞬时故障按退避重试，见 retryTransient。
 func (s *Store) Read(ctx context.Context, fn func(q Querier) error) error {
 	s.mu.RLock()
 	closed := s.closed
@@ -385,12 +409,94 @@ func (s *Store) Read(ctx context.Context, fn func(q Querier) error) error {
 	if closed {
 		return ErrClosed
 	}
-	err := fn(s.readDB)
-	if isTransientIOErr(err) {
-		time.Sleep(50 * time.Millisecond)
-		err = fn(s.readDB)
+	return s.retryTransient(ctx, func() error { return fn(s.readDB) })
+}
+
+// retryTransient 在瞬时故障下按退避重试 fn，重试耗尽后把原始错误包进
+// ErrTransient 并附上可操作的成因说明。
+//
+// 单次重试不足以覆盖真实场景：杀毒软件实时扫描一个刚写入的 -wal 文件
+// 通常持有数十到数百毫秒，同步盘的上传窗口更长。
+func (s *Store) retryTransient(ctx context.Context, fn func() error) error {
+	var err error
+	for attempt := 0; attempt < retryAttempts; attempt++ {
+		if attempt > 0 {
+			s.retries.Add(1)
+			wait := retryBackoff[minInt(attempt-1, len(retryBackoff)-1)]
+			select {
+			case <-ctx.Done():
+				return err
+			case <-time.After(wait):
+			}
+		}
+		err = fn()
+		if !isTransientErr(err) {
+			return err
+		}
 	}
-	return err
+	return fmt.Errorf("%w（%s；已重试 %d 次）: %w",
+		ErrTransient, transientCause(err), retryAttempts-1, err)
+}
+
+// Retries 返回累计的瞬时故障重试次数（进程内计数，重开库后归零）。
+func (s *Store) Retries() int64 { return s.retries.Load() }
+
+// isTransientErr 报告错误是否值得重试。
+//
+// Windows 上杀毒软件或同步盘短暂占用库文件时会得到 SQLITE_IOERR 系列
+// 扩展码（如 522 SHORT_READ）；跨进程写者交接、宿主热重载会短暂出现忙锁；
+// 临时目录不可用会报 "unable to open database file"。这些稍候重试通常即可恢复。
+// 「database disk image is malformed」不在其列：重试不会让损坏的库变好。
+func isTransientErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, needle := range []string{
+		"disk I/O error",
+		"SQLITE_IOERR",
+		"database is locked",
+		"database table is locked",
+		"SQLITE_BUSY",
+		"SQLITE_LOCKED",
+		"unable to open database file",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// transientCause 把 SQLite 的英文错误映射为面向用户的成因说明。
+func transientCause(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "locked") || strings.Contains(msg, "SQLITE_BUSY"):
+		return "数据库被其他进程长时间占用；检查是否有第二个宿主实例共用同一 data_dir"
+	case strings.Contains(msg, "unable to open database file"):
+		return "无法打开数据库或临时文件；检查 data_dir 权限、磁盘剩余空间与 TEMP 目录"
+	default:
+		return "数据目录可能被杀毒软件/同步盘占用，或磁盘空间异常；建议把 data_dir 加入杀毒软件排除列表，并移出同步盘"
+	}
+}
+
+// IsCorrupted 报告错误是否指向数据库文件损坏（重试无用，需备份后重建）。
+func IsCorrupted(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "database disk image is malformed") ||
+		strings.Contains(msg, "SQLITE_CORRUPT") ||
+		strings.Contains(msg, "file is not a database")
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // Querier 抽象 *sql.DB 与 *sql.Tx 的公共查询接口。
@@ -454,21 +560,28 @@ func (s *Store) SetPreference(ctx context.Context, key, value string) error {
 
 // ListPreferences 返回全部面板偏好。
 func (s *Store) ListPreferences(ctx context.Context) (map[string]string, error) {
-	rows, err := s.readDB.QueryContext(ctx, `SELECT k, v FROM preferences ORDER BY k`)
-	if err != nil {
-		return nil, fmt.Errorf("读取偏好失败: %w", err)
-	}
-	defer rows.Close()
 	out := make(map[string]string)
-	for rows.Next() {
-		var k, v string
-		if err := rows.Scan(&k, &v); err != nil {
-			return nil, fmt.Errorf("扫描偏好失败: %w", err)
+	err := s.Read(ctx, func(q Querier) error {
+		rows, err := q.QueryContext(ctx, `SELECT k, v FROM preferences ORDER BY k`)
+		if err != nil {
+			return fmt.Errorf("读取偏好失败: %w", err)
 		}
-		out[k] = v
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历偏好失败: %w", err)
+		defer rows.Close()
+		clear(out)
+		for rows.Next() {
+			var k, v string
+			if err := rows.Scan(&k, &v); err != nil {
+				return fmt.Errorf("扫描偏好失败: %w", err)
+			}
+			out[k] = v
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("遍历偏好失败: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -498,8 +611,9 @@ func (s *Store) SetPreferences(ctx context.Context, kv map[string]string) error 
 // getKV 从指定 KV 表读取。table 只能是包内常量，不接受外部输入。
 func (s *Store) getKV(ctx context.Context, table, key string) (string, bool, error) {
 	var v string
-	err := s.readDB.QueryRowContext(ctx,
-		`SELECT v FROM `+table+` WHERE k = ?`, key).Scan(&v)
+	err := s.Read(ctx, func(q Querier) error {
+		return q.QueryRowContext(ctx, `SELECT v FROM `+table+` WHERE k = ?`, key).Scan(&v)
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
@@ -524,10 +638,12 @@ func (s *Store) setKV(ctx context.Context, table, key, value string) error {
 // 维护操作 ---------------------------------------------------------------
 
 // RetentionResult 汇报一次保留清理删除的行数。
+// Deduped 是同一次维护里被合并掉的历史重复请求行数（见 DedupeRequests）。
 type RetentionResult struct {
-	Requests     int64
-	Rollups      int64
-	Reservations int64
+	Requests     int64 `json:"requests"`
+	Rollups      int64 `json:"rollups"`
+	Reservations int64 `json:"reservations"`
+	Deduped      int   `json:"deduped"`
 }
 
 // ApplyRetention 按保留天数清理 requests 与 usage_rollups，
@@ -607,11 +723,14 @@ type Stats struct {
 	HeldReserves  int64 `json:"held_reservations"`
 	FileBytes     int64 `json:"file_bytes"`
 	Writable      bool  `json:"writable"`
+	// IORetries 是本进程累计的瞬时故障重试次数。持续增长说明数据目录
+	// 正被外部程序（杀毒/同步盘）干扰，即使请求最终成功也值得处理。
+	IORetries int64 `json:"io_retries"`
 }
 
 // Stats 读取库规模统计。
 func (s *Store) Stats(ctx context.Context) (Stats, error) {
-	out := Stats{Writable: s.Writable()}
+	out := Stats{Writable: s.Writable(), IORetries: s.Retries()}
 	v, err := s.CurrentSchemaVersion(ctx)
 	if err != nil {
 		return Stats{}, err
@@ -630,14 +749,21 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 		{`SELECT COUNT(*) FROM audit_events`, &out.AuditEvents},
 		{`SELECT COUNT(*) FROM reservations WHERE status = 'held'`, &out.HeldReserves},
 	}
-	for _, c := range counts {
-		if err := s.readDB.QueryRowContext(ctx, c.query).Scan(c.dst); err != nil {
-			return Stats{}, fmt.Errorf("统计失败 (%s): %w", c.query, err)
+	if err := s.Read(ctx, func(q Querier) error {
+		for _, c := range counts {
+			if err := q.QueryRowContext(ctx, c.query).Scan(c.dst); err != nil {
+				return fmt.Errorf("统计失败 (%s): %w", c.query, err)
+			}
 		}
+		return nil
+	}); err != nil {
+		return Stats{}, err
 	}
 	if fi, err := os.Stat(s.opts.Path); err == nil {
 		out.FileBytes = fi.Size()
 	}
+	// 重试计数取最新值：上面的统计本身也可能触发重试。
+	out.IORetries = s.Retries()
 	return out, nil
 }
 

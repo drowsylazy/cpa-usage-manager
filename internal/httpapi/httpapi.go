@@ -21,6 +21,7 @@ type API struct {
 	st            *store.Store
 	managementKey string
 	mux           *http.ServeMux
+	paths         []string // base 之下已注册的管理路径后缀，供 Paths 比对宿主声明表
 }
 
 func New(svc *service.Service, st *store.Store, managementKey string) *API {
@@ -31,48 +32,60 @@ func New(svc *service.Service, st *store.Store, managementKey string) *API {
 
 const base = "/v0/management/plugins/cpa-usage-manager"
 
+// route 注册一条管理路径（相对 base）并登记到 paths。
+// 宿主只会转发它在插件注册时声明过的路径，漏声明的路径在面板上表现为 404
+// （v0.1.2 的 /pricing/search 就是这样丢掉的）；Paths 让 main.go 的声明表可被测试比对。
+func (a *API) route(suffix string, h http.HandlerFunc) {
+	a.paths = append(a.paths, suffix)
+	a.mux.HandleFunc(base+suffix, a.auth(h))
+}
+
+// Paths 返回本包在 base 之下注册的全部管理路径后缀。
+func (a *API) Paths() []string { return append([]string(nil), a.paths...) }
+
 func (a *API) register() {
 	a.mux.HandleFunc("/console", a.console)
 	a.mux.HandleFunc("/v0/resource/plugins/cpa-usage-manager/console", a.console)
-	a.mux.HandleFunc(base+"/health", a.auth(a.health))
-	a.mux.HandleFunc(base+"/overview", a.auth(a.overview))
+	a.route("/health", a.health)
+	a.route("/overview", a.overview)
 
-	a.mux.HandleFunc(base+"/callers", a.auth(a.callers))
-	a.mux.HandleFunc(base+"/callers/enabled", a.auth(a.callerEnabled))
+	a.route("/callers", a.callers)
+	a.route("/callers/enabled", a.callerEnabled)
 
-	a.mux.HandleFunc(base+"/keys", a.auth(a.keys))
-	a.mux.HandleFunc(base+"/keys/issue", a.auth(a.issue))
-	a.mux.HandleFunc(base+"/keys/update", a.auth(a.updateKey))
-	a.mux.HandleFunc(base+"/keys/rotate", a.auth(a.rotate))
-	a.mux.HandleFunc(base+"/keys/reveal", a.auth(a.reveal))
-	a.mux.HandleFunc(base+"/keys/revoke", a.auth(a.revoke))
-	a.mux.HandleFunc(base+"/keys/delete", a.auth(a.deleteKey))
+	a.route("/keys", a.keys)
+	a.route("/keys/issue", a.issue)
+	a.route("/keys/update", a.updateKey)
+	a.route("/keys/rotate", a.rotate)
+	a.route("/keys/reveal", a.reveal)
+	a.route("/keys/revoke", a.revoke)
+	a.route("/keys/delete", a.deleteKey)
 
-	a.mux.HandleFunc(base+"/pricing", a.auth(a.pricing))
-	a.mux.HandleFunc(base+"/pricing/delete", a.auth(a.pricingDelete))
-	a.mux.HandleFunc(base+"/pricing/search", a.auth(a.pricingSearch))
-	a.mux.HandleFunc(base+"/pricing/reset", a.auth(a.pricingReset))
-	a.mux.HandleFunc(base+"/pricing/sync", a.auth(a.pricingSync))
+	a.route("/pricing", a.pricing)
+	a.route("/pricing/delete", a.pricingDelete)
+	a.route("/pricing/search", a.pricingSearch)
+	a.route("/pricing/reset", a.pricingReset)
+	a.route("/pricing/sync", a.pricingSync)
 
-	a.mux.HandleFunc(base+"/usage", a.auth(a.usage))
-	a.mux.HandleFunc(base+"/usage/summary", a.auth(a.usageSummary))
-	a.mux.HandleFunc(base+"/usage/dimension", a.auth(a.usageDimension))
-	a.mux.HandleFunc(base+"/requests", a.auth(a.usage))
-	a.mux.HandleFunc(base+"/trends", a.auth(a.trends))
-	a.mux.HandleFunc(base+"/costs", a.auth(a.costs))
-	a.mux.HandleFunc(base+"/balance", a.auth(a.balance))
+	a.route("/usage", a.usage)
+	a.route("/usage/summary", a.usageSummary)
+	a.route("/usage/dimension", a.usageDimension)
+	a.route("/requests", a.usage)
+	a.route("/trends", a.trends)
+	a.route("/costs", a.costs)
+	a.route("/balance", a.balance)
 
-	a.mux.HandleFunc(base+"/audit", a.auth(a.audit))
-	a.mux.HandleFunc(base+"/auth-quotas", a.auth(a.authQuotas))
-	a.mux.HandleFunc(base+"/preferences", a.auth(a.preferences))
-	a.mux.HandleFunc(base+"/exchange-rate", a.auth(a.exchangeRate))
+	a.route("/audit", a.audit)
+	a.route("/auth-quotas", a.authQuotas)
+	a.route("/preferences", a.preferences)
+	a.route("/exchange-rate", a.exchangeRate)
 
-	a.mux.HandleFunc(base+"/export/csv", a.auth(a.exportCSV))
-	a.mux.HandleFunc(base+"/export/png", a.auth(a.exportPNG))
-	a.mux.HandleFunc(base+"/backup", a.auth(a.backup))
-	a.mux.HandleFunc(base+"/restore", a.auth(a.restore))
-	a.mux.HandleFunc(base+"/reset", a.auth(a.reset))
-	a.mux.HandleFunc(base+"/maintain", a.auth(a.maintain))
+	a.route("/export/csv", a.exportCSV)
+	a.route("/export/png", a.exportPNG)
+	a.route("/backup", a.backup)
+	a.route("/restore", a.restore)
+	a.route("/reset", a.reset)
+	a.route("/maintain", a.maintain)
+	a.route("/dedupe", a.dedupe)
 }
 func (a *API) Handler() http.Handler { return a.gzip(a.mux) }
 func (a *API) console(w http.ResponseWriter, r *http.Request) {
@@ -702,6 +715,25 @@ func (a *API) maintain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOut(w, res, 200)
+}
+
+// dedupe 手动触发历史重复请求行对账。days<=0 时按保留期回溯。
+func (a *API) dedupe(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Days  int    `json:"days"`
+		Actor string `json:"actor"`
+	}
+	_ = decode(r, &in)
+	var since time.Time
+	if in.Days > 0 {
+		since = time.Now().UTC().AddDate(0, 0, -in.Days)
+	}
+	n, e := a.svc.Dedupe(r.Context(), since, in.Actor)
+	if e != nil {
+		jsonOut(w, map[string]any{"error": e.Error(), "merged": n}, 400)
+		return
+	}
+	jsonOut(w, map[string]any{"merged": n}, 200)
 }
 
 func atoi(s string) int { v, _ := strconv.Atoi(s); return v }

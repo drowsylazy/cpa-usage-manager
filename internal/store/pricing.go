@@ -151,9 +151,13 @@ func (s *Store) UpsertPricingRule(ctx context.Context, r PricingRule) (PricingRu
 
 // GetPricingRule 按 ID 读取规则。
 func (s *Store) GetPricingRule(ctx context.Context, id int64) (PricingRule, error) {
-	row := s.readDB.QueryRowContext(ctx,
-		`SELECT `+pricingColumns+` FROM pricing_rules WHERE id = ?`, id)
-	r, err := scanPricingRule(row)
+	var r PricingRule
+	err := s.Read(ctx, func(q Querier) error {
+		var e error
+		r, e = scanPricingRule(q.QueryRowContext(ctx,
+			`SELECT `+pricingColumns+` FROM pricing_rules WHERE id = ?`, id))
+		return e
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return PricingRule{}, fmt.Errorf("%w: 计价规则 #%d", ErrNotFound, id)
 	}
@@ -165,10 +169,14 @@ func (s *Store) GetPricingRule(ctx context.Context, id int64) (PricingRule, erro
 
 // GetPricingRuleByPattern 按 (match_kind, pattern) 读取规则。
 func (s *Store) GetPricingRuleByPattern(ctx context.Context, matchKind, pattern string) (PricingRule, error) {
-	row := s.readDB.QueryRowContext(ctx,
-		`SELECT `+pricingColumns+` FROM pricing_rules WHERE match_kind = ? AND pattern = ?`,
-		matchKind, pattern)
-	r, err := scanPricingRule(row)
+	var r PricingRule
+	err := s.Read(ctx, func(q Querier) error {
+		var e error
+		r, e = scanPricingRule(q.QueryRowContext(ctx,
+			`SELECT `+pricingColumns+` FROM pricing_rules WHERE match_kind = ? AND pattern = ?`,
+			matchKind, pattern))
+		return e
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return PricingRule{}, fmt.Errorf("%w: 计价规则 %s:%s", ErrNotFound, matchKind, pattern)
 	}
@@ -180,27 +188,34 @@ func (s *Store) GetPricingRuleByPattern(ctx context.Context, matchKind, pattern 
 
 // ListPricingRules 列出全部计价规则，按匹配优先级排序（高优先级在前）。
 func (s *Store) ListPricingRules(ctx context.Context, onlyEnabled bool) ([]PricingRule, error) {
-	q := `SELECT ` + pricingColumns + ` FROM pricing_rules`
+	sqlText := `SELECT ` + pricingColumns + ` FROM pricing_rules`
 	if onlyEnabled {
-		q += ` WHERE enabled = 1`
+		sqlText += ` WHERE enabled = 1`
 	}
 	// 排序即匹配顺序：priority 降序，同优先级下 id 升序（先建先胜），结果稳定。
-	q += ` ORDER BY priority DESC, id ASC`
-	rows, err := s.readDB.QueryContext(ctx, q)
-	if err != nil {
-		return nil, fmt.Errorf("列出计价规则失败: %w", err)
-	}
-	defer rows.Close()
+	sqlText += ` ORDER BY priority DESC, id ASC`
 	var out []PricingRule
-	for rows.Next() {
-		r, err := scanPricingRule(rows)
+	err := s.Read(ctx, func(q Querier) error {
+		rows, err := q.QueryContext(ctx, sqlText)
 		if err != nil {
-			return nil, fmt.Errorf("扫描计价规则失败: %w", err)
+			return fmt.Errorf("列出计价规则失败: %w", err)
 		}
-		out = append(out, r)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历计价规则失败: %w", err)
+		defer rows.Close()
+		out = out[:0]
+		for rows.Next() {
+			r, err := scanPricingRule(rows)
+			if err != nil {
+				return fmt.Errorf("扫描计价规则失败: %w", err)
+			}
+			out = append(out, r)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("遍历计价规则失败: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }

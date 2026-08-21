@@ -317,4 +317,11 @@ func TestBackupRestoreResetMaintain(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("maintain=%d", w.Code)
 	}
+	w = do(t, a, "POST", base+"/dedupe", `{"actor":"t"}`)
+	if w.Code != 200 {
+		t.Fatalf("dedupe=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"merged"`) {
+		t.Fatalf("dedupe 响应缺少 merged: %s", w.Body.String())
+	}
 }

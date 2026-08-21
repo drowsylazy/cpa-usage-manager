@@ -339,7 +339,9 @@ func applyMigration(ctx context.Context, db *sql.DB, m migration) error {
 // CurrentSchemaVersion 返回库中已应用的最高迁移版本。
 func (s *Store) CurrentSchemaVersion(ctx context.Context) (int, error) {
 	var v sql.NullInt64
-	err := s.readDB.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&v)
+	err := s.Read(ctx, func(q Querier) error {
+		return q.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&v)
+	})
 	if err != nil {
 		return 0, fmt.Errorf("读取 schema 版本失败: %w", err)
 	}

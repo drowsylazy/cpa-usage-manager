@@ -186,13 +186,21 @@ func (s *Service) Reset(ctx context.Context, opts store.ResetOptions, actor stri
 	return res, nil
 }
 
-// Maintain 执行保留清理并可选 VACUUM，供系统页与宿主定时任务调用。
+// Maintain 执行保留清理、历史重复行对账，并可选 VACUUM，供系统页与宿主定时任务调用。
+//
+// 对账（DedupeRequests）与保留清理放在同一次维护里：v0.2.2 之前的版本会把同一请求
+// 记两次（执行器行 + 宿主被动行），这些历史行只能靠事后扫描合并。
 func (s *Service) Maintain(ctx context.Context, vacuum bool, actor string) (store.RetentionResult, error) {
 	cfg := s.Config()
-	res, err := s.st.ApplyRetention(ctx, cfg.RetentionDays, time.Now().UTC())
+	now := time.Now().UTC()
+	res, err := s.st.ApplyRetention(ctx, cfg.RetentionDays, now)
 	if err != nil {
 		return store.RetentionResult{}, err
 	}
+	// 对账窗口跟随保留期：更早的行已被上一步删掉，扫描它们没有意义。
+	since := now.AddDate(0, 0, -maxInt(1, cfg.RetentionDays))
+	deduped, derr := s.st.DedupeRequests(ctx, since)
+	res.Deduped = deduped
 	if vacuum {
 		if err := s.st.Vacuum(ctx); err != nil {
 			return res, err
@@ -203,9 +211,37 @@ func (s *Service) Maintain(ctx context.Context, vacuum bool, actor string) (stor
 		Detail: map[string]any{
 			"retention_days": cfg.RetentionDays, "vacuum": vacuum,
 			"requests": res.Requests, "rollups": res.Rollups, "reservations": res.Reservations,
+			"deduped": deduped,
 		},
 	})
+	if derr != nil {
+		return res, fmt.Errorf("重复请求对账失败（保留清理已完成）: %w", derr)
+	}
 	return res, nil
+}
+
+// Dedupe 单独执行历史重复行对账，供系统页「对账去重」按钮调用。
+// since 为零值时按保留期回溯。
+func (s *Service) Dedupe(ctx context.Context, since time.Time, actor string) (int, error) {
+	if since.IsZero() {
+		since = time.Now().UTC().AddDate(0, 0, -maxInt(1, s.Config().RetentionDays))
+	}
+	n, err := s.st.DedupeRequests(ctx, since)
+	_ = s.st.AppendAudit(ctx, store.AuditEvent{
+		Actor: actor, Action: "system.dedupe", EntityType: "system", EntityID: "requests",
+		Detail: map[string]any{"since": since.UTC().Format(time.RFC3339), "merged": n},
+	})
+	if err != nil {
+		return n, fmt.Errorf("重复请求对账失败: %w", err)
+	}
+	return n, nil
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // ---------- CSV 导出 ----------

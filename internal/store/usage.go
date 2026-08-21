@@ -127,8 +127,12 @@ func upsertRollupTx(ctx context.Context, tx *sql.Tx, r Request) error {
 
 // GetRequest 按 ID 读取逐请求记录。
 func (s *Store) GetRequest(ctx context.Context, id string) (Request, error) {
-	row := s.readDB.QueryRowContext(ctx, `SELECT `+requestColumns+` FROM requests WHERE id = ?`, id)
-	r, err := scanRequest(row)
+	var r Request
+	err := s.Read(ctx, func(q Querier) error {
+		var e error
+		r, e = scanRequest(q.QueryRowContext(ctx, `SELECT `+requestColumns+` FROM requests WHERE id = ?`, id))
+		return e
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return Request{}, fmt.Errorf("%w: 请求 %q", ErrNotFound, id)
 	}
@@ -138,24 +142,50 @@ func (s *Store) GetRequest(ctx context.Context, id string) (Request, error) {
 	return r, nil
 }
 
-// BackfillRequestUsage 给 key+model 候选在 near 前后 15 秒内最近一条零用量记录
-// 补写宿主 usage.handle 上报的 token 明细（执行器落库的模型可能是别名，
-// 因此按候选列表匹配：原始模型 / 别名 / 「渠道/模型」后缀）。返回是否更新。
-// 只补逐请求行，分钟聚合不回填（可接受的口径差异）。
-// modelMatchFragment 生成「model IN (…) OR model LIKE '渠道/模型'」的匹配片段。
+// 双写判重容差。宿主 usage.handle 与执行器结算描述同一次上游调用：
+// 两者观测到的时刻相差不超过一次回调往返，延迟读数相差仅几毫秒。
+const (
+	dupTSWindow      = 15 * time.Second
+	dupLatencyWindow = int64(150) // 毫秒
+)
+
+// modelMatchFragment 生成「model IN (…) OR model LIKE '%/模型'」的匹配片段。
 // 执行器落库常用「渠道/模型」别名，宿主上报原始模型，需按候选集 + 后缀双匹配。
 func modelMatchFragment(models []string) (string, []any) {
-	in := placeholders(len(models))
-	like := strings.TrimSuffix(strings.Repeat("OR model LIKE ? ESCAPE '\\' ,", len(models)), ",")
-	frag := "(model IN (" + in + ") " + like + ")"
+	models = normalizeModels(models)
+	parts := make([]string, 0, len(models)+1)
 	args := make([]any, 0, len(models)*2)
+	parts = append(parts, "model IN ("+placeholders(len(models))+")")
 	for _, m := range models {
 		args = append(args, m)
 	}
 	for _, m := range models {
+		parts = append(parts, `model LIKE ? ESCAPE '\'`)
 		args = append(args, "%/"+escapeLike(m))
 	}
-	return frag, args
+	return "(" + strings.Join(parts, " OR ") + ")", args
+}
+
+// normalizeModels 去空白、去空值、去重，保持原顺序。
+func normalizeModels(models []string) []string {
+	out := make([]string, 0, len(models))
+	for _, m := range models {
+		m = strings.TrimSpace(m)
+		if m == "" {
+			continue
+		}
+		dup := false
+		for _, v := range out {
+			if v == m {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // escapeLike 转义 LIKE 通配符。
@@ -165,15 +195,19 @@ func escapeLike(s string) string {
 	return strings.ReplaceAll(s, `_`, `\_`)
 }
 
+// BackfillRequestUsage 给 key+model 候选在 near 前后 dupTSWindow 内最近一条零用量记录
+// 补写宿主 usage.handle 上报的 token 明细（执行器落库的模型可能是别名，
+// 因此按候选列表匹配：原始模型 / 别名 / 「渠道/模型」后缀）。返回是否更新。
+// 只补逐请求行，分钟聚合不回填（可接受的口径差异）。
 func (s *Store) BackfillRequestUsage(ctx context.Context, kid string, models []string, near time.Time, b UsageBackfill) (bool, error) {
-	if len(models) == 0 {
+	if len(normalizeModels(models)) == 0 {
 		return false, nil
 	}
 	frag, margs := modelMatchFragment(models)
 	args := make([]any, 0, len(margs)+3)
 	args = append(args, kid)
 	args = append(args, margs...)
-	args = append(args, near.Add(-15*time.Second).UnixMilli(), near.Add(15*time.Second).UnixMilli())
+	args = append(args, near.Add(-dupTSWindow).UnixMilli(), near.Add(dupTSWindow).UnixMilli())
 	var id string
 	err := s.Write(ctx, func(tx *sql.Tx) error {
 		row := tx.QueryRowContext(ctx,
@@ -196,26 +230,30 @@ func (s *Store) BackfillRequestUsage(ctx context.Context, kid string, models []s
 	return true, nil
 }
 
-// FindDuplicateExecutor 按 时间±15s + 延迟±150ms + 模型候选 关联执行器已入库的记录。
+// FindDuplicateExecutor 按 时间±dupTSWindow + 延迟±dupLatencyWindow + 模型候选
+// 关联执行器已入库的记录。
 // 宿主 usage.handle 的 APIKey 字段在部分兼容渠道里是上游凭据而非插件 Key，
 // 无法用 kid 判重；同一请求的两次回调延迟仅差几毫秒，该组合足以唯一对应。
 func (s *Store) FindDuplicateExecutor(ctx context.Context, models []string, near time.Time, latencyMS int64) (string, bool, error) {
-	if len(models) == 0 {
+	if len(normalizeModels(models)) == 0 {
 		return "", false, nil
 	}
 	frag, margs := modelMatchFragment(models)
-	args := make([]any, 0, len(margs)+4)
+	args := make([]any, 0, len(margs)+5)
 	args = append(args, margs...)
-	args = append(args, latencyMS-150, latencyMS+150,
-		near.Add(-15*time.Second).UnixMilli(), near.Add(15*time.Second).UnixMilli())
+	args = append(args, latencyMS-dupLatencyWindow, latencyMS+dupLatencyWindow,
+		near.Add(-dupTSWindow).UnixMilli(), near.Add(dupTSWindow).UnixMilli(),
+		near.UnixMilli())
 	var id string
-	row := s.readDB.QueryRowContext(ctx,
-		`SELECT id FROM requests
-		 WHERE key_id <> '' AND `+frag+`
-		   AND latency_ms BETWEEN ? AND ?
-		   AND ts BETWEEN ? AND ?
-		 ORDER BY ts DESC LIMIT 1`, args...)
-	if err := row.Scan(&id); err != nil {
+	err := s.Read(ctx, func(q Querier) error {
+		return q.QueryRowContext(ctx,
+			`SELECT id FROM requests
+			 WHERE key_id <> '' AND `+frag+`
+			   AND latency_ms BETWEEN ? AND ?
+			   AND ts BETWEEN ? AND ?
+			 ORDER BY ABS(ts - ?) LIMIT 1`, args...).Scan(&id)
+	})
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", false, nil
 		}
@@ -233,9 +271,9 @@ func (s *Store) BackfillRequestUsageByID(ctx context.Context, id string, b Usage
 
 // ReconcileRequestDuplicates 落库后对账，消除执行器/被动双写竞态。
 //
-// 同一请求会触发两次回调（执行器结算与宿主 usage.handle），两者几乎同时落库，
+// 同一请求可能触发两次落库（执行器结算与宿主 usage.handle），两者几乎同时发生，
 // 「先查后插」的判重存在窗口。这里以 anchor 行为起点找另一口径的重复行
-// （key_id 空否相反 + 模型候选匹配 + 延迟±150ms + 时间±15s）：
+// （key_id 空否相反 + 模型候选匹配 + 延迟±dupLatencyWindow + 时间±dupTSWindow）：
 // 保留 key_id 非空的执行器行，把被动行的零值字段（token 明细、首字延迟、
 // provider/source/auth/tier 展示信息）合并进去，删除被动行，
 // 并从分钟聚合中扣减被动行的贡献。返回是否发生合并。
@@ -254,8 +292,8 @@ func (s *Store) ReconcileRequestDuplicates(ctx context.Context, anchorID string)
 		args := make([]any, 0, len(margs)+5)
 		args = append(args, anchorID)
 		args = append(args, margs...)
-		args = append(args, anchor.LatencyMS-150, anchor.LatencyMS+150,
-			anchor.TS.Add(-15*time.Second).UnixMilli(), anchor.TS.Add(15*time.Second).UnixMilli(),
+		args = append(args, anchor.LatencyMS-dupLatencyWindow, anchor.LatencyMS+dupLatencyWindow,
+			anchor.TS.Add(-dupTSWindow).UnixMilli(), anchor.TS.Add(dupTSWindow).UnixMilli(),
 			anchor.TS.UnixMilli())
 		row := tx.QueryRowContext(ctx,
 			`SELECT `+requestColumns+` FROM requests
@@ -274,48 +312,7 @@ func (s *Store) ReconcileRequestDuplicates(ctx context.Context, anchorID string)
 		if keeper.KeyID == "" {
 			keeper, dropee = dropee, keeper
 		}
-		// 计算实际并入 keeper 的字段增量（仅补零值），同步回补其分钟聚合。
-		delta := UsageBackfill{
-			InputTokens:         pickZero(keeper.InputTokens, dropee.InputTokens),
-			OutputTokens:        pickZero(keeper.OutputTokens, dropee.OutputTokens),
-			ReasoningTokens:     pickZero(keeper.ReasoningTokens, dropee.ReasoningTokens),
-			CachedTokens:        pickZero(keeper.CachedTokens, dropee.CachedTokens),
-			CacheReadTokens:     pickZero(keeper.CacheReadTokens, dropee.CacheReadTokens),
-			CacheCreationTokens: pickZero(keeper.CacheCreationTokens, dropee.CacheCreationTokens),
-			TotalTokens:         pickZero(keeper.TotalTokens, dropee.TotalTokens),
-		}
-		if keeper.TTFTMS == 0 && dropee.TTFTMS > 0 {
-			delta.TTFTMS = dropee.TTFTMS
-		}
-		if _, e := tx.ExecContext(ctx,
-			`UPDATE requests SET
-			    input_tokens         = CASE WHEN input_tokens = 0         THEN ? ELSE input_tokens END,
-			    output_tokens        = CASE WHEN output_tokens = 0        THEN ? ELSE output_tokens END,
-			    reasoning_tokens     = CASE WHEN reasoning_tokens = 0     THEN ? ELSE reasoning_tokens END,
-			    cached_tokens        = CASE WHEN cached_tokens = 0        THEN ? ELSE cached_tokens END,
-			    cache_read_tokens    = CASE WHEN cache_read_tokens = 0    THEN ? ELSE cache_read_tokens END,
-			    cache_creation_tokens= CASE WHEN cache_creation_tokens = 0 THEN ? ELSE cache_creation_tokens END,
-			    total_tokens         = CASE WHEN total_tokens = 0         THEN ? ELSE total_tokens END,
-			    ttft_ms              = CASE WHEN ttft_ms = 0              THEN ? ELSE ttft_ms END,
-			    provider             = CASE WHEN provider = ''            THEN ? ELSE provider END,
-			    source               = CASE WHEN source = ''              THEN ? ELSE source END,
-			    auth_type            = CASE WHEN auth_type = ''           THEN ? ELSE auth_type END,
-			    tier                 = CASE WHEN tier = ''                THEN ? ELSE tier END
-			 WHERE id = ?`,
-			dropee.InputTokens, dropee.OutputTokens, dropee.ReasoningTokens,
-			dropee.CachedTokens, dropee.CacheReadTokens, dropee.CacheCreationTokens,
-			dropee.TotalTokens, dropee.TTFTMS,
-			dropee.Provider, dropee.Source, dropee.AuthType, dropee.Tier,
-			keeper.ID); e != nil {
-			return fmt.Errorf("合并重复请求失败: %w", e)
-		}
-		if _, e := tx.ExecContext(ctx, `DELETE FROM requests WHERE id = ?`, dropee.ID); e != nil {
-			return fmt.Errorf("删除重复请求 %s 失败: %w", dropee.ID, e)
-		}
-		if e := subtractRollupTx(ctx, tx, dropee); e != nil {
-			return e
-		}
-		if e := addRollupDeltaTx(ctx, tx, keeper, delta); e != nil {
+		if e := mergeRequestPairTx(ctx, tx, keeper, dropee); e != nil {
 			return e
 		}
 		merged = true
@@ -325,6 +322,141 @@ func (s *Store) ReconcileRequestDuplicates(ctx context.Context, anchorID string)
 		return false, err
 	}
 	return merged, nil
+}
+
+// mergeRequestPairTx 把 dropee 行并入 keeper 行：仅补 keeper 的零值/空值字段，
+// 删除 dropee，并同步分钟聚合（扣减 dropee 的整行贡献 + 回补并入 keeper 的增量）。
+//
+// 费用不参与合并：执行器行的 cost_micro_usd 已按结算金额记入 Key 账本，
+// 改写会造成明细与账本口径不一致。
+func mergeRequestPairTx(ctx context.Context, tx *sql.Tx, keeper, dropee Request) error {
+	delta := UsageBackfill{
+		InputTokens:         pickZero(keeper.InputTokens, dropee.InputTokens),
+		OutputTokens:        pickZero(keeper.OutputTokens, dropee.OutputTokens),
+		ReasoningTokens:     pickZero(keeper.ReasoningTokens, dropee.ReasoningTokens),
+		CachedTokens:        pickZero(keeper.CachedTokens, dropee.CachedTokens),
+		CacheReadTokens:     pickZero(keeper.CacheReadTokens, dropee.CacheReadTokens),
+		CacheCreationTokens: pickZero(keeper.CacheCreationTokens, dropee.CacheCreationTokens),
+		TotalTokens:         pickZero(keeper.TotalTokens, dropee.TotalTokens),
+	}
+	if keeper.TTFTMS == 0 && dropee.TTFTMS > 0 {
+		delta.TTFTMS = dropee.TTFTMS
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE requests SET
+		    input_tokens         = CASE WHEN input_tokens = 0         THEN ? ELSE input_tokens END,
+		    output_tokens        = CASE WHEN output_tokens = 0        THEN ? ELSE output_tokens END,
+		    reasoning_tokens     = CASE WHEN reasoning_tokens = 0     THEN ? ELSE reasoning_tokens END,
+		    cached_tokens        = CASE WHEN cached_tokens = 0        THEN ? ELSE cached_tokens END,
+		    cache_read_tokens    = CASE WHEN cache_read_tokens = 0    THEN ? ELSE cache_read_tokens END,
+		    cache_creation_tokens= CASE WHEN cache_creation_tokens = 0 THEN ? ELSE cache_creation_tokens END,
+		    total_tokens         = CASE WHEN total_tokens = 0         THEN ? ELSE total_tokens END,
+		    ttft_ms              = CASE WHEN ttft_ms = 0              THEN ? ELSE ttft_ms END,
+		    provider             = CASE WHEN provider = ''            THEN ? ELSE provider END,
+		    source               = CASE WHEN source = ''              THEN ? ELSE source END,
+		    auth_type            = CASE WHEN auth_type = ''           THEN ? ELSE auth_type END,
+		    tier                 = CASE WHEN tier = ''                THEN ? ELSE tier END
+		 WHERE id = ?`,
+		dropee.InputTokens, dropee.OutputTokens, dropee.ReasoningTokens,
+		dropee.CachedTokens, dropee.CacheReadTokens, dropee.CacheCreationTokens,
+		dropee.TotalTokens, dropee.TTFTMS,
+		dropee.Provider, dropee.Source, dropee.AuthType, dropee.Tier,
+		keeper.ID); err != nil {
+		return fmt.Errorf("合并重复请求失败: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM requests WHERE id = ?`, dropee.ID); err != nil {
+		return fmt.Errorf("删除重复请求 %s 失败: %w", dropee.ID, err)
+	}
+	if err := subtractRollupTx(ctx, tx, dropee); err != nil {
+		return err
+	}
+	return addRollupDeltaTx(ctx, tx, keeper, delta)
+}
+
+// dedupePairSQL 自连接找出「执行器行 a + 被动行 b」的历史重复对。
+// 模型名按精确相等或「渠道/模型」后缀判定（避免 LIKE 元字符误匹配）。
+const dedupePairSQL = `
+	SELECT a.id, b.id FROM requests a JOIN requests b
+	  ON b.id <> a.id
+	 AND b.ts BETWEEN a.ts - ? AND a.ts + ?
+	 AND b.latency_ms BETWEEN a.latency_ms - ? AND a.latency_ms + ?
+	 AND (a.model = b.model
+	   OR substr(a.model, length(a.model) - length(b.model)) = '/' || b.model
+	   OR substr(b.model, length(b.model) - length(a.model)) = '/' || a.model)
+	 WHERE a.key_id <> '' AND b.key_id = '' AND a.ts >= ?
+	 ORDER BY a.ts, ABS(b.ts - a.ts), b.id
+	 LIMIT ?`
+
+// DedupeRequests 清理历史遗留的双写重复行（v0.2.2 之前的版本会因判重 SQL 失效
+// 把同一请求记两次）。按时间贪心两两配对：每行最多参与一次合并，
+// 同模型并发请求即使配错对，聚合口径依然守恒。
+// 返回合并掉的行数。
+func (s *Store) DedupeRequests(ctx context.Context, since time.Time) (int, error) {
+	const (
+		batch     = 400
+		maxMerges = 200_000
+	)
+	sinceMS := since.UTC().UnixMilli()
+	total := 0
+	for total < maxMerges {
+		n, err := s.dedupeBatch(ctx, sinceMS, batch)
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n < batch {
+			break
+		}
+	}
+	return total, nil
+}
+
+func (s *Store) dedupeBatch(ctx context.Context, sinceMS int64, limit int) (int, error) {
+	merged := 0
+	err := s.Write(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, dedupePairSQL,
+			dupTSWindow.Milliseconds(), dupTSWindow.Milliseconds(),
+			dupLatencyWindow, dupLatencyWindow, sinceMS, limit)
+		if err != nil {
+			return fmt.Errorf("扫描重复请求失败: %w", err)
+		}
+		type pair struct{ keep, drop string }
+		pairs := make([]pair, 0, limit)
+		used := make(map[string]bool)
+		for rows.Next() {
+			var p pair
+			if err := rows.Scan(&p.keep, &p.drop); err != nil {
+				rows.Close()
+				return fmt.Errorf("扫描重复请求失败: %w", err)
+			}
+			if used[p.keep] || used[p.drop] {
+				continue
+			}
+			used[p.keep], used[p.drop] = true, true
+			pairs = append(pairs, p)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("遍历重复请求失败: %w", err)
+		}
+		rows.Close()
+		for _, p := range pairs {
+			keeper, err := loadRequestTx(ctx, tx, p.keep)
+			if err != nil {
+				return err
+			}
+			dropee, err := loadRequestTx(ctx, tx, p.drop)
+			if err != nil {
+				return err
+			}
+			if err := mergeRequestPairTx(ctx, tx, keeper, dropee); err != nil {
+				return err
+			}
+			merged++
+		}
+		return nil
+	})
+	return merged, err
 }
 
 // pickZero 目标为 0 时取补值，否则保留原值。

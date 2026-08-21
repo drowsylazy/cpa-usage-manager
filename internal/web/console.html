@@ -294,13 +294,14 @@
     </article>
 
     <article class="panel">
-      <div class="panel-head"><div><h2 class="panel-title">保留清理</h2><p class="panel-sub">按配置的保留期删除过期明细与聚合</p></div></div>
+      <div class="panel-head"><div><h2 class="panel-title">保留清理与对账</h2><p class="panel-sub">按配置的保留期删除过期明细与聚合，并合并历史重复统计行</p></div></div>
       <div class="panel-body stack">
         <div class="btn-row">
           <button type="button" class="btn" id="maintain-btn">执行清理</button>
           <button type="button" class="btn" id="vacuum-btn">清理并 VACUUM</button>
+          <button type="button" class="btn" id="dedupe-btn">对账去重</button>
         </div>
-        <p class="note" id="maintain-note">清理只影响过期数据，密钥与计价规则不受影响。</p>
+        <p class="note" id="maintain-note">清理只影响过期数据，密钥与计价规则不受影响；对账去重合并 v0.2.2 之前被记两次的请求行。</p>
       </div>
     </article>
   </div>

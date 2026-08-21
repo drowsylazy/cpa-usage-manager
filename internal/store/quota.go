@@ -148,8 +148,12 @@ func scanReservation(sc interface{ Scan(...any) error }) (Reservation, error) {
 }
 
 func (s *Store) GetReservation(ctx context.Context, id string) (Reservation, error) {
-	row := s.readDB.QueryRowContext(ctx, `SELECT id,key_id,caller_id,model,idempotency_key,status,held_micro_usd,settled_micro_usd,reserved_tokens,created_at,expires_at,heartbeat_at,settled_at,released_at FROM reservations WHERE id = ?`, id)
-	r, err := scanReservation(row)
+	var r Reservation
+	err := s.Read(ctx, func(q Querier) error {
+		var e error
+		r, e = scanReservation(q.QueryRowContext(ctx, `SELECT id,key_id,caller_id,model,idempotency_key,status,held_micro_usd,settled_micro_usd,reserved_tokens,created_at,expires_at,heartbeat_at,settled_at,released_at FROM reservations WHERE id = ?`, id))
+		return e
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return Reservation{}, fmt.Errorf("%w: reservation %q", ErrNotFound, id)
 	}
@@ -302,24 +306,31 @@ func (s *Store) ListAudit(ctx context.Context, limit, offset int) ([]AuditEvent,
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.readDB.QueryContext(ctx, `SELECT id,ts,actor,action,entity_type,entity_id,detail_json FROM audit_events ORDER BY ts DESC,id DESC LIMIT ? OFFSET ?`, limit, maxInt(0, offset))
+	var out []AuditEvent
+	err := s.Read(ctx, func(q Querier) error {
+		rows, err := q.QueryContext(ctx, `SELECT id,ts,actor,action,entity_type,entity_id,detail_json FROM audit_events ORDER BY ts DESC,id DESC LIMIT ? OFFSET ?`, limit, maxInt(0, offset))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		out = out[:0]
+		for rows.Next() {
+			var e AuditEvent
+			var ts int64
+			var raw string
+			if err := rows.Scan(&e.ID, &ts, &e.Actor, &e.Action, &e.EntityType, &e.EntityID, &raw); err != nil {
+				return err
+			}
+			e.TS = time.UnixMilli(ts).UTC()
+			if raw != "" {
+				_ = json.Unmarshal([]byte(raw), &e.Detail)
+			}
+			out = append(out, e)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []AuditEvent
-	for rows.Next() {
-		var e AuditEvent
-		var ts int64
-		var raw string
-		if err := rows.Scan(&e.ID, &ts, &e.Actor, &e.Action, &e.EntityType, &e.EntityID, &raw); err != nil {
-			return nil, err
-		}
-		e.TS = time.UnixMilli(ts).UTC()
-		if raw != "" {
-			_ = json.Unmarshal([]byte(raw), &e.Detail)
-		}
-		out = append(out, e)
-	}
-	return out, rows.Err()
+	return out, nil
 }

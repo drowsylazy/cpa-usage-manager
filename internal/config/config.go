@@ -126,6 +126,11 @@ type LimitsConfig struct {
 }
 
 // SettlementConfig 是结算策略配置。
+//
+// HostUsageWait 只作用于**流式**结算的兜底分支：上游 SSE 未带 usage 时，
+// 插件已经先关闭对客户端的流，再等宿主 usage.handle 认领窗口把权威 token 数送来，
+// 因此这段等待不占用客户端时延。置 0 关闭等待（直接按预占估算结算）。
+// 非流式路径不等待——宿主是在插件执行器返回**之后**才记账的，等待必然超时。
 type SettlementConfig struct {
 	MissingUsage  string   `yaml:"missing_usage"`
 	HostUsageWait Duration `yaml:"host_usage_wait"`

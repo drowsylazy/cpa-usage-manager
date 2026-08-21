@@ -182,9 +182,12 @@ func (s *Store) InsertKey(ctx context.Context, p InsertKeyParams) (PluginKey, er
 
 // GetKey 按 kid 读取 Key（含安全材料，仅限服务端内部使用）。
 func (s *Store) GetKey(ctx context.Context, kid string) (PluginKey, error) {
-	row := s.readDB.QueryRowContext(ctx,
-		`SELECT `+keyColumns+` FROM plugin_keys WHERE kid = ?`, kid)
-	k, err := scanKey(row)
+	var k PluginKey
+	err := s.Read(ctx, func(q Querier) error {
+		var e error
+		k, e = scanKey(q.QueryRowContext(ctx, `SELECT `+keyColumns+` FROM plugin_keys WHERE kid = ?`, kid))
+		return e
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return PluginKey{}, fmt.Errorf("%w: Key %q", ErrNotFound, kid)
 	}
@@ -200,9 +203,13 @@ func (s *Store) FindKeyByCallerScope(ctx context.Context, scope string) (PluginK
 	if scope == "" {
 		return PluginKey{}, fmt.Errorf("%w: 缺少 caller_scope", ErrNotFound)
 	}
-	row := s.readDB.QueryRowContext(ctx,
-		`SELECT `+keyColumns+` FROM plugin_keys WHERE caller_scope = ? ORDER BY created_at DESC, kid LIMIT 1`, scope)
-	k, err := scanKey(row)
+	var k PluginKey
+	err := s.Read(ctx, func(q Querier) error {
+		var e error
+		k, e = scanKey(q.QueryRowContext(ctx,
+			`SELECT `+keyColumns+` FROM plugin_keys WHERE caller_scope = ? ORDER BY created_at DESC, kid LIMIT 1`, scope))
+		return e
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return PluginKey{}, fmt.Errorf("%w: caller_scope %q", ErrNotFound, scope)
 	}
@@ -245,30 +252,36 @@ func (s *Store) ListKeys(ctx context.Context, f KeyFilter) ([]PluginKey, int64, 
 	}
 
 	var total int64
-	if err := s.readDB.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM plugin_keys`+clause, args...).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("统计 Key 数量失败: %w", err)
-	}
-
-	q := `SELECT ` + keyColumns + ` FROM plugin_keys` + clause + ` ORDER BY created_at DESC, kid`
-	if f.Limit > 0 {
-		q += fmt.Sprintf(" LIMIT %d OFFSET %d", f.Limit, maxInt(0, f.Offset))
-	}
-	rows, err := s.readDB.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, 0, fmt.Errorf("列出 Key 失败: %w", err)
-	}
-	defer rows.Close()
 	var out []PluginKey
-	for rows.Next() {
-		k, err := scanKey(rows)
-		if err != nil {
-			return nil, 0, fmt.Errorf("扫描 Key 失败: %w", err)
+	err := s.Read(ctx, func(qr Querier) error {
+		if err := qr.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM plugin_keys`+clause, args...).Scan(&total); err != nil {
+			return fmt.Errorf("统计 Key 数量失败: %w", err)
 		}
-		out = append(out, k)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, 0, fmt.Errorf("遍历 Key 失败: %w", err)
+		q := `SELECT ` + keyColumns + ` FROM plugin_keys` + clause + ` ORDER BY created_at DESC, kid`
+		if f.Limit > 0 {
+			q += fmt.Sprintf(" LIMIT %d OFFSET %d", f.Limit, maxInt(0, f.Offset))
+		}
+		rows, err := qr.QueryContext(ctx, q, args...)
+		if err != nil {
+			return fmt.Errorf("列出 Key 失败: %w", err)
+		}
+		defer rows.Close()
+		out = out[:0]
+		for rows.Next() {
+			k, err := scanKey(rows)
+			if err != nil {
+				return fmt.Errorf("扫描 Key 失败: %w", err)
+			}
+			out = append(out, k)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("遍历 Key 失败: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, 0, err
 	}
 	return out, total, nil
 }
@@ -465,23 +478,30 @@ func (s *Store) TouchKeyLastUsed(ctx context.Context, kid string, at time.Time) 
 
 // CountKeysByPepper 统计各 pepper 代际下的 Key 数量，用于轮换进度展示。
 func (s *Store) CountKeysByPepper(ctx context.Context) (map[string]int64, error) {
-	rows, err := s.readDB.QueryContext(ctx,
-		`SELECT pepper_id, COUNT(*) FROM plugin_keys GROUP BY pepper_id ORDER BY pepper_id`)
-	if err != nil {
-		return nil, fmt.Errorf("统计 pepper 分布失败: %w", err)
-	}
-	defer rows.Close()
 	out := make(map[string]int64)
-	for rows.Next() {
-		var id string
-		var n int64
-		if err := rows.Scan(&id, &n); err != nil {
-			return nil, fmt.Errorf("扫描 pepper 分布失败: %w", err)
+	err := s.Read(ctx, func(q Querier) error {
+		rows, err := q.QueryContext(ctx,
+			`SELECT pepper_id, COUNT(*) FROM plugin_keys GROUP BY pepper_id ORDER BY pepper_id`)
+		if err != nil {
+			return fmt.Errorf("统计 pepper 分布失败: %w", err)
 		}
-		out[id] = n
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历 pepper 分布失败: %w", err)
+		defer rows.Close()
+		clear(out)
+		for rows.Next() {
+			var id string
+			var n int64
+			if err := rows.Scan(&id, &n); err != nil {
+				return fmt.Errorf("扫描 pepper 分布失败: %w", err)
+			}
+			out[id] = n
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("遍历 pepper 分布失败: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }

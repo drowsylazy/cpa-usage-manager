@@ -81,9 +81,12 @@ func (s *Store) CreateCaller(ctx context.Context, id, displayName string) (Calle
 
 // GetCaller 读取单个归属。
 func (s *Store) GetCaller(ctx context.Context, id string) (Caller, error) {
-	row := s.readDB.QueryRowContext(ctx,
-		`SELECT `+callerColumns+` FROM callers WHERE id = ?`, id)
-	c, err := scanCaller(row)
+	var c Caller
+	err := s.Read(ctx, func(q Querier) error {
+		var e error
+		c, e = scanCaller(q.QueryRowContext(ctx, `SELECT `+callerColumns+` FROM callers WHERE id = ?`, id))
+		return e
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return Caller{}, fmt.Errorf("%w: caller %q", ErrNotFound, id)
 	}
@@ -95,22 +98,28 @@ func (s *Store) GetCaller(ctx context.Context, id string) (Caller, error) {
 
 // ListCallers 列出全部归属，按 ID 排序。
 func (s *Store) ListCallers(ctx context.Context) ([]Caller, error) {
-	rows, err := s.readDB.QueryContext(ctx,
-		`SELECT `+callerColumns+` FROM callers ORDER BY id`)
-	if err != nil {
-		return nil, fmt.Errorf("列出 callers 失败: %w", err)
-	}
-	defer rows.Close()
 	var out []Caller
-	for rows.Next() {
-		c, err := scanCaller(rows)
+	err := s.Read(ctx, func(q Querier) error {
+		rows, err := q.QueryContext(ctx, `SELECT `+callerColumns+` FROM callers ORDER BY id`)
 		if err != nil {
-			return nil, fmt.Errorf("扫描 caller 失败: %w", err)
+			return fmt.Errorf("列出 callers 失败: %w", err)
 		}
-		out = append(out, c)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历 callers 失败: %w", err)
+		defer rows.Close()
+		out = out[:0]
+		for rows.Next() {
+			c, err := scanCaller(rows)
+			if err != nil {
+				return fmt.Errorf("扫描 caller 失败: %w", err)
+			}
+			out = append(out, c)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("遍历 callers 失败: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }

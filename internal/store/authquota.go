@@ -77,30 +77,37 @@ func (s *Store) UpsertAuthQuotaSnapshot(ctx context.Context, snap AuthQuotaSnaps
 
 // ListAuthQuotaSnapshots 列出全部认证额度快照，按 provider/auth_id 排序。
 func (s *Store) ListAuthQuotaSnapshots(ctx context.Context) ([]AuthQuotaSnapshot, error) {
-	rows, err := s.readDB.QueryContext(ctx,
-		`SELECT provider, auth_id, snapshot_json, fetched_at, status
-		 FROM auth_quota_snapshots ORDER BY provider, auth_id`)
-	if err != nil {
-		return nil, fmt.Errorf("列出认证额度快照失败: %w", err)
-	}
-	defer rows.Close()
 	var out []AuthQuotaSnapshot
-	for rows.Next() {
-		var snap AuthQuotaSnapshot
-		var payload string
-		var fetched int64
-		if err := rows.Scan(&snap.Provider, &snap.AuthID, &payload, &fetched, &snap.Status); err != nil {
-			return nil, fmt.Errorf("扫描认证额度快照失败: %w", err)
+	err := s.Read(ctx, func(q Querier) error {
+		rows, err := q.QueryContext(ctx,
+			`SELECT provider, auth_id, snapshot_json, fetched_at, status
+			 FROM auth_quota_snapshots ORDER BY provider, auth_id`)
+		if err != nil {
+			return fmt.Errorf("列出认证额度快照失败: %w", err)
 		}
-		snap.FetchedAt = time.UnixMilli(fetched).UTC()
-		if strings.TrimSpace(payload) != "" && payload != "{}" {
-			// 快照内容由宿主提供，解析失败不应让整个接口失败。
-			_ = json.Unmarshal([]byte(payload), &snap.Snapshot)
+		defer rows.Close()
+		out = out[:0]
+		for rows.Next() {
+			var snap AuthQuotaSnapshot
+			var payload string
+			var fetched int64
+			if err := rows.Scan(&snap.Provider, &snap.AuthID, &payload, &fetched, &snap.Status); err != nil {
+				return fmt.Errorf("扫描认证额度快照失败: %w", err)
+			}
+			snap.FetchedAt = time.UnixMilli(fetched).UTC()
+			if strings.TrimSpace(payload) != "" && payload != "{}" {
+				// 快照内容由宿主提供，解析失败不应让整个接口失败。
+				_ = json.Unmarshal([]byte(payload), &snap.Snapshot)
+			}
+			out = append(out, snap)
 		}
-		out = append(out, snap)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历认证额度快照失败: %w", err)
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("遍历认证额度快照失败: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -160,12 +167,14 @@ func (s *Store) ObserveAuthQuotaWindow(ctx context.Context, b AuthQuotaBaseline)
 func (s *Store) GetAuthQuotaWindow(ctx context.Context, provider, authID, windowID, cycleKey string) (AuthQuotaBaseline, error) {
 	var out AuthQuotaBaseline
 	var updated int64
-	err := s.readDB.QueryRowContext(ctx,
-		`SELECT provider, auth_id, window_id, cycle_key, observed, baseline, updated_at
-		 FROM auth_quota_window_baselines
-		 WHERE provider = ? AND auth_id = ? AND window_id = ? AND cycle_key = ?`,
-		provider, authID, windowID, cycleKey).
-		Scan(&out.Provider, &out.AuthID, &out.WindowID, &out.CycleKey, &out.Observed, &out.Baseline, &updated)
+	err := s.Read(ctx, func(q Querier) error {
+		return q.QueryRowContext(ctx,
+			`SELECT provider, auth_id, window_id, cycle_key, observed, baseline, updated_at
+			 FROM auth_quota_window_baselines
+			 WHERE provider = ? AND auth_id = ? AND window_id = ? AND cycle_key = ?`,
+			provider, authID, windowID, cycleKey).
+			Scan(&out.Provider, &out.AuthID, &out.WindowID, &out.CycleKey, &out.Observed, &out.Baseline, &updated)
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return AuthQuotaBaseline{}, fmt.Errorf("%w: 认证额度窗口 %s/%s/%s", ErrNotFound, provider, authID, windowID)
 	}
@@ -192,27 +201,34 @@ func (s *Store) ListAuthQuotaWindows(ctx context.Context, provider, authID strin
 	if len(where) > 0 {
 		clause = " WHERE " + strings.Join(where, " AND ")
 	}
-	rows, err := s.readDB.QueryContext(ctx,
-		`SELECT provider, auth_id, window_id, cycle_key, observed, baseline, updated_at
-		 FROM auth_quota_window_baselines`+clause+
-			` ORDER BY provider, auth_id, window_id, cycle_key`, args...)
-	if err != nil {
-		return nil, fmt.Errorf("列出认证额度窗口失败: %w", err)
-	}
-	defer rows.Close()
 	var out []AuthQuotaBaseline
-	for rows.Next() {
-		var b AuthQuotaBaseline
-		var updated int64
-		if err := rows.Scan(&b.Provider, &b.AuthID, &b.WindowID, &b.CycleKey,
-			&b.Observed, &b.Baseline, &updated); err != nil {
-			return nil, fmt.Errorf("扫描认证额度窗口失败: %w", err)
+	err := s.Read(ctx, func(q Querier) error {
+		rows, err := q.QueryContext(ctx,
+			`SELECT provider, auth_id, window_id, cycle_key, observed, baseline, updated_at
+			 FROM auth_quota_window_baselines`+clause+
+				` ORDER BY provider, auth_id, window_id, cycle_key`, args...)
+		if err != nil {
+			return fmt.Errorf("列出认证额度窗口失败: %w", err)
 		}
-		b.UpdatedAt = time.UnixMilli(updated).UTC()
-		out = append(out, b)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历认证额度窗口失败: %w", err)
+		defer rows.Close()
+		out = out[:0]
+		for rows.Next() {
+			var b AuthQuotaBaseline
+			var updated int64
+			if err := rows.Scan(&b.Provider, &b.AuthID, &b.WindowID, &b.CycleKey,
+				&b.Observed, &b.Baseline, &updated); err != nil {
+				return fmt.Errorf("扫描认证额度窗口失败: %w", err)
+			}
+			b.UpdatedAt = time.UnixMilli(updated).UTC()
+			out = append(out, b)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("遍历认证额度窗口失败: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }

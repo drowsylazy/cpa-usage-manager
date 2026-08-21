@@ -67,6 +67,7 @@ type imageHold struct {
 	reservation store.Reservation
 	plan        service.ReservePlan
 	stopHeart   func()
+	claim       *usageClaim
 }
 
 var (
@@ -387,6 +388,7 @@ func cliproxyPluginShutdown() {
 	}
 	imageHolds = map[string]imageHold{}
 	imageHoldsMu.Unlock()
+	resetUsageClaims()
 }
 
 func writeResponse(out *C.cpa_buffer, raw []byte) {
@@ -624,7 +626,7 @@ func pluginRegistration(schema uint32) rpcRegistration {
 				{Name: "quota.limits.default_output_reserve", Type: "integer", Description: "请求体未给 max_tokens 时的输出预占。"},
 				{Name: "quota.limits.require_estimate", Type: "boolean", Description: "true 时缺少用量估算的请求拒绝预占。"},
 				{Name: "quota.settlement.missing_usage", Type: "enum", EnumValues: []string{"settle_reserved", "release"}, Description: "上游未返回 usage 时的结算策略。"},
-				{Name: "quota.settlement.host_usage_wait", Type: "string", Description: "结算前等待宿主 usage.handle 的时长（0 关闭）。"},
+				{Name: "quota.settlement.host_usage_wait", Type: "string", Description: "流式结算在上游未给 usage 时，关闭客户端流后等待宿主 usage.handle 的时长（0 关闭；非流式不等待）。"},
 				{Name: "quota.stream.max_buffer_bytes", Type: "integer", Description: "流式结算本地缓冲上限。"},
 				{Name: "quota.stream.stale_reservation_timeout", Type: "string", Description: "无心跳在途预占自动释放时长。"},
 				{Name: "pricing.unknown_policy", Type: "enum", EnumValues: []string{"deny", "allow", "default"}, Description: "无计价规则命中时的策略。"},
@@ -677,6 +679,7 @@ func managementRegistration() rpcManagementRegistration {
 		{Method: "POST", Path: base + "/restore", Description: "数据库恢复"},
 		{Method: "POST", Path: base + "/reset", Description: "重置统计"},
 		{Method: "POST", Path: base + "/maintain", Description: "保留清理/VACUUM"},
+		{Method: "POST", Path: base + "/dedupe", Description: "重复请求对账去重"},
 	}
 	return rpcManagementRegistration{
 		Routes: routes,
@@ -842,15 +845,22 @@ func execute(body []byte) ([]byte, error) {
 	stopHeartbeat := startReservationHeartbeat(svc, reservation.ID)
 	defer stopHeartbeat()
 
+	// 登记认领：宿主随后的 usage.handle 由本次请求消费，不再被动入库。
+	claim := registerUsageClaim(key.KID, plan.Model, req.Model)
 	startedAt := time.Now()
 	hostBody, headers, status, errHost := hostModelExecute(req.HostCallbackID, req, request, false)
 	if errHost != nil {
+		// 未落库任何请求行：放弃认领，宿主若上报失败用量仍走被动统计。
+		claim.release(0)
 		_, _ = svc.Release(ctx, reservation.ID)
 		return errorEnvelope("upstream_error", errHost.Error()), nil
 	}
 	completedAt := time.Now()
 	parsed, _ := usageparse.Parse(hostBody)
-	settleReservation(svc, reservation, req, request, startedAt, time.Time{}, completedAt, status, parsed)
+	// 非流式响应体几乎总带 usage，这里只做非阻塞探测：宿主记账发生在
+	// 本次调用返回之后，同步等待只会白等一个超时。缺失的明细由认领在
+	// 宽限期内按请求 ID 回填。
+	settleReservation(svc, reservation, req, request, startedAt, time.Time{}, completedAt, status, parsed, claim)
 	return okEnvelope(rpcExecutorResponse{Payload: hostBody, Headers: headers})
 }
 
@@ -868,23 +878,27 @@ func executeStream(body []byte) ([]byte, error) {
 		return errorEnvelope("executor_error", "缺少 stream_id"), nil
 	}
 	go func() {
+		var once sync.Once
+		closeStream := func(errMsg string) {
+			once.Do(func() { closePluginStream(pluginStreamID, errMsg) })
+		}
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				closePluginStream(pluginStreamID, fmt.Sprintf("panic: %v", recovered))
+				closeStream(fmt.Sprintf("panic: %v", recovered))
 			}
 		}()
-		if err := runStream(req, pluginStreamID); err != nil {
-			closePluginStream(pluginStreamID, err.Error())
+		if err := runStream(req, pluginStreamID, closeStream); err != nil {
+			closeStream(err.Error())
 			return
 		}
-		closePluginStream(pluginStreamID, "")
+		closeStream("")
 	}()
 	return okEnvelope(map[string]any{
 		"headers": http.Header{"Content-Type": []string{"text/event-stream"}},
 	})
 }
 
-func runStream(req rpcExecutorRequest, pluginStreamID string) error {
+func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(string)) error {
 	_, svc, _, _ := current()
 	if svc == nil {
 		return errors.New("插件尚未注册")
@@ -906,6 +920,8 @@ func runStream(req rpcExecutorRequest, pluginStreamID string) error {
 	stopHeartbeat := startReservationHeartbeat(svc, reservation.ID)
 	defer stopHeartbeat()
 
+	// 登记认领：宿主随后的 usage.handle 由本次请求消费，不再被动入库。
+	claim := registerUsageClaim(key.KID, plan.Model, req.Model)
 	startedAt := time.Now()
 	request = requestBodyWithStreamUsage(request, req.SourceFormat, req.Format)
 	raw, err := callHost("host.model.execute_stream", rpcHostModelExecutionRequest{
@@ -920,20 +936,23 @@ func runStream(req rpcExecutorRequest, pluginStreamID string) error {
 		HostCallbackID: req.HostCallbackID,
 	})
 	if err != nil {
+		claim.release(0)
 		_, _ = svc.Release(ctx, reservation.ID)
 		return err
 	}
 	var stream rpcHostModelStreamResponse
 	if err := json.Unmarshal(raw, &stream); err != nil {
+		claim.release(0)
 		_, _ = svc.Release(ctx, reservation.ID)
 		return err
 	}
 	if stream.StatusCode >= 400 {
 		_ = closeHostModelStream(stream.StreamID)
-		settleReservation(svc, reservation, req, request, startedAt, time.Time{}, time.Now(), stream.StatusCode, usageparse.Usage{})
+		settleReservation(svc, reservation, req, request, startedAt, time.Time{}, time.Now(), stream.StatusCode, usageparse.Usage{}, claim)
 		return fmt.Errorf("host model status %d", stream.StatusCode)
 	}
 	if strings.TrimSpace(stream.StreamID) == "" {
+		claim.release(0)
 		_, _ = svc.Release(ctx, reservation.ID)
 		return errors.New("empty host stream id")
 	}
@@ -948,20 +967,20 @@ func runStream(req rpcExecutorRequest, pluginStreamID string) error {
 		if errRead != nil {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 502, parsed)
+			settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 502, parsed, claim)
 			return errRead
 		}
 		var chunk rpcHostModelStreamReadResponse
 		if err := json.Unmarshal(chunkRaw, &chunk); err != nil {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 502, parsed)
+			settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 502, parsed, claim)
 			return err
 		}
 		if chunk.Error != "" {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 502, parsed)
+			settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 502, parsed, claim)
 			return fmt.Errorf("%s", chunk.Error)
 		}
 		if len(chunk.Payload) > 0 {
@@ -976,7 +995,7 @@ func runStream(req rpcExecutorRequest, pluginStreamID string) error {
 			if err := emitPluginStreamChunk(pluginStreamID, chunk.Payload); err != nil {
 				completedAt = time.Now()
 				parsed, _ := acc.Result()
-				settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 499, parsed)
+				settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 499, parsed, claim)
 				return err
 			}
 		}
@@ -986,15 +1005,71 @@ func runStream(req rpcExecutorRequest, pluginStreamID string) error {
 	}
 	completedAt = time.Now()
 	parsed, _ := acc.Result()
-	_, err = svc.Settle(ctx, reservation.ID, parsed, buildRequest(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 200))
-	return err
+	// 先结束对客户端的流，再等宿主用量：等待不占用客户端时延。
+	// 部分 OpenAI 兼容上游不在流里回 usage，此时预占估算会成为入账金额；
+	// 宿主 usage.handle 是权威口径，等到它才能按真实 token 计费。
+	closeStream("")
+	if parsed.IsZero() {
+		if rec, ok := claim.wait(svc.Config().Quota.Settlement.HostUsageWait.Std()); ok {
+			parsed = usageFromRecord(rec)
+			r := buildRequest(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 200)
+			applyHostUsageToRequest(r, rec)
+			return finishSettle(svc, reservation, r, parsed, claim)
+		}
+	}
+	return finishSettle(svc, reservation, buildRequest(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 200), parsed, claim)
 }
 
 // settleReservation 解析 usage 结算预占并写请求记录；结算失败时释放预占兜底。
-func settleReservation(svc *service.Service, reservation store.Reservation, req rpcExecutorRequest, body []byte, startedAt, firstChunkAt, completedAt time.Time, status int, usage usageparse.Usage) {
-	_, err := svc.Settle(context.Background(), reservation.ID, usage, buildRequest(svc, reservation, req, body, startedAt, firstChunkAt, completedAt, status))
+func settleReservation(svc *service.Service, reservation store.Reservation, req rpcExecutorRequest, body []byte, startedAt, firstChunkAt, completedAt time.Time, status int, usage usageparse.Usage, claim *usageClaim) {
+	r := buildRequest(svc, reservation, req, body, startedAt, firstChunkAt, completedAt, status)
+	// 认领已在结算前收到宿主口径（少见但可能）：结算前补齐展示字段，
+	// 使请求行与它的分钟聚合维度一致。
+	if rec, ok := claim.wait(0); ok {
+		applyHostUsageToRequest(r, rec)
+		if usage.IsZero() {
+			usage = usageFromRecord(rec)
+		}
+	}
+	_ = finishSettle(svc, reservation, r, usage, claim)
+}
+
+// finishSettle 落库结算结果，并把请求行 ID 交给认领：
+// 宽限期内晚到的宿主用量据此回填，无需再靠库内启发式判重。
+func finishSettle(svc *service.Service, reservation store.Reservation, r *store.Request, usage usageparse.Usage, claim *usageClaim) error {
+	ctx := context.Background()
+	_, err := svc.Settle(ctx, reservation.ID, usage, r)
 	if err != nil {
-		_, _ = svc.Release(context.Background(), reservation.ID)
+		// 未落库请求行：放弃认领，宿主回调回落到被动统计，避免用量凭空丢失。
+		claim.release(0)
+		_, _ = svc.Release(ctx, reservation.ID)
+		return err
+	}
+	if rec := claim.settled(r.ID); rec != nil {
+		// 结算与交付并发时由这里补回填（attach 侧当时还看不到请求 ID）。
+		backfillFromHostUsage(svc, r.ID, *rec)
+	}
+	claim.release(usageClaimGrace)
+	return nil
+}
+
+// backfillFromHostUsage 用宿主口径回填已落库请求行的 token 明细与首字延迟。
+func backfillFromHostUsage(svc *service.Service, requestID string, rec rpcUsageRecord) {
+	if rec.Detail.InputTokens <= 0 && rec.Detail.OutputTokens <= 0 && rec.Detail.TotalTokens <= 0 {
+		return
+	}
+	err := svc.BackfillRequestUsageByID(context.Background(), requestID, store.UsageBackfill{
+		InputTokens:         rec.Detail.InputTokens,
+		OutputTokens:        rec.Detail.OutputTokens,
+		ReasoningTokens:     rec.Detail.ReasoningTokens,
+		CachedTokens:        rec.Detail.CachedTokens,
+		CacheReadTokens:     rec.Detail.CacheReadTokens,
+		CacheCreationTokens: rec.Detail.CacheCreationTokens,
+		TotalTokens:         rec.Detail.TotalTokens,
+		TTFTMS:              rec.TTFT.Milliseconds(),
+	})
+	if err != nil {
+		warnf("回填请求 %s 的宿主用量失败: %v", requestID, err)
 	}
 }
 
@@ -1199,7 +1274,12 @@ func interceptAfter(body []byte) ([]byte, error) {
 		return okEnvelope(rejectResponse(http.StatusTooManyRequests, err.Error()))
 	}
 	imageHoldsMu.Lock()
-	imageHolds[requestID] = imageHold{reservation: reservation, plan: plan, stopHeart: startReservationHeartbeat(svc, reservation.ID)}
+	imageHolds[requestID] = imageHold{
+		reservation: reservation,
+		plan:        plan,
+		stopHeart:   startReservationHeartbeat(svc, reservation.ID),
+		claim:       registerUsageClaim(key.KID, plan.Model, req.Model, req.RequestedModel),
+	}
 	imageHoldsMu.Unlock()
 	return okEnvelope(rpcRequestInterceptResponse{})
 }
@@ -1228,13 +1308,15 @@ func completeIntercepted(body []byte) ([]byte, error) {
 	}
 	ctx := context.Background()
 	if req.Outcome != "succeeded" {
+		hold.claim.release(0)
 		_, _ = svc.Release(ctx, hold.reservation.ID)
 		return okEnvelope(map[string]any{})
 	}
-	_, err := svc.Settle(ctx, hold.reservation.ID, usageparse.Usage{ImageCount: hold.plan.ImageCount}, buildRequest(svc, hold.reservation, rpcExecutorRequest{}, nil, req.StartedAt, time.Time{}, req.CompletedAt, req.StatusCode))
-	if err != nil {
-		_, _ = svc.Release(ctx, hold.reservation.ID)
+	r := buildRequest(svc, hold.reservation, rpcExecutorRequest{}, nil, req.StartedAt, time.Time{}, req.CompletedAt, req.StatusCode)
+	if rec, ok := hold.claim.wait(0); ok {
+		applyHostUsageToRequest(r, rec)
 	}
+	_ = finishSettle(svc, hold.reservation, r, usageparse.Usage{ImageCount: hold.plan.ImageCount}, hold.claim)
 	return okEnvelope(map[string]any{})
 }
 
@@ -1279,6 +1361,224 @@ func handleManagement(body []byte) ([]byte, error) {
 	return okEnvelope(rpcManagementResponse{StatusCode: rw.Code, Headers: rw.Header(), Body: rw.Body.Bytes()})
 }
 
+// ---------- 宿主用量认领 ----------
+//
+// 宿主的 usage.handle 回调不携带请求 ID：历史版本只能在库里按
+// 「时间±15s + 延迟±150ms + 模型候选」猜哪条记录是同一请求，既会漏判
+// （于是同一请求被记两次，统计翻倍）也可能误判。
+//
+// 认领把这件事拉回进程内：执行器在调用宿主上游之前登记一条认领，
+// usage.handle 命中后把宿主口径交给该请求消费，自己不再入库。
+// 认领是唯一权威的配对依据，库内启发式判重降级为跨进程/晚到回调的兜底。
+
+const (
+	// usageClaimGrace 是结算完成后继续持有认领的宽限期。
+	// 宿主通常在插件执行器返回之后才记账，晚到的回调必须仍被本次请求吸收。
+	usageClaimGrace = 8 * time.Second
+	// usageClaimMaxAge 是认领的绝对存活上限，用于兜底清理异常路径的残留。
+	usageClaimMaxAge = 10 * time.Minute
+)
+
+type usageClaim struct {
+	models     map[string]bool
+	keyID      string
+	created    time.Time
+	registered bool
+
+	mu    sync.Mutex
+	rec   *rpcUsageRecord
+	reqID string
+	ready chan struct{}
+}
+
+var (
+	usageClaimsMu sync.Mutex
+	usageClaims   []*usageClaim
+)
+
+// normalizeModelKey 归一化模型名：小写、去空白、去「渠道/」前缀。
+// 执行器登记的是「渠道/模型」别名，宿主上报的是裸模型名，裸名才是共同锚点。
+func normalizeModelKey(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if i := strings.LastIndex(s, "/"); i >= 0 && i+1 < len(s) {
+		s = s[i+1:]
+	}
+	return s
+}
+
+// registerUsageClaim 登记一次认领；models 是该请求可能被宿主上报的模型名。
+func registerUsageClaim(keyID string, models ...string) *usageClaim {
+	c := &usageClaim{
+		models:  make(map[string]bool, len(models)),
+		keyID:   strings.TrimSpace(keyID),
+		created: time.Now(),
+		ready:   make(chan struct{}),
+	}
+	for _, m := range models {
+		if k := normalizeModelKey(m); k != "" {
+			c.models[k] = true
+		}
+	}
+	if len(c.models) == 0 {
+		// 没有可匹配的模型名，认领不可能命中：不入册，等价于关闭认领。
+		return c
+	}
+	c.registered = true
+	cutoff := time.Now().Add(-usageClaimMaxAge)
+	usageClaimsMu.Lock()
+	kept := usageClaims[:0]
+	for _, v := range usageClaims {
+		if v.created.After(cutoff) {
+			kept = append(kept, v)
+		}
+	}
+	usageClaims = append(kept, c)
+	usageClaimsMu.Unlock()
+	return c
+}
+
+// release 注销认领。delay > 0 时延后注销，宽限期内继续吸收晚到的回调。
+// delay 为 0 表示立即放弃认领：此后该请求的宿主回调回落到被动统计路径。
+func (c *usageClaim) release(delay time.Duration) {
+	if c == nil || !c.registered {
+		return
+	}
+	if delay > 0 {
+		time.AfterFunc(delay, func() { c.release(0) })
+		return
+	}
+	usageClaimsMu.Lock()
+	for i, v := range usageClaims {
+		if v == c {
+			usageClaims = append(usageClaims[:i], usageClaims[i+1:]...)
+			break
+		}
+	}
+	usageClaimsMu.Unlock()
+}
+
+// settled 登记本次认领已落库的请求行 ID，并返回此前已交付的宿主用量（若有）。
+// 与 attach 互斥：两者中恰好一方能看到对方的数据，回填只会发生一次。
+func (c *usageClaim) settled(requestID string) *rpcUsageRecord {
+	if c == nil || !c.registered {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reqID = requestID
+	return c.rec
+}
+
+// attach 交付一条宿主用量记录，返回已落库的请求行 ID（尚未结算时为空）。
+// 调用方持有 usageClaimsMu，因此同一认领不会被并发交付两次。
+func (c *usageClaim) attach(u rpcUsageRecord) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rec != nil {
+		return "", false
+	}
+	rec := u
+	c.rec = &rec
+	close(c.ready)
+	return c.reqID, true
+}
+
+// available 报告认领是否仍可吸收回调，且模型名匹配。
+func (c *usageClaim) available(keys []string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rec != nil {
+		return false
+	}
+	for _, k := range keys {
+		if k != "" && c.models[k] {
+			return true
+		}
+	}
+	return false
+}
+
+// wait 等待宿主交付用量，最长 d；d <= 0 时只做一次非阻塞探测。
+func (c *usageClaim) wait(d time.Duration) (rpcUsageRecord, bool) {
+	if c == nil || !c.registered {
+		return rpcUsageRecord{}, false
+	}
+	if d > 0 {
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-c.ready:
+		case <-timer.C:
+		}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rec == nil {
+		return rpcUsageRecord{}, false
+	}
+	return *c.rec, true
+}
+
+// claimHostUsage 为一条宿主用量记录寻找匹配的认领。
+// 命中返回（已落库的请求行 ID，true）；未命中返回 ("", false)，由调用方被动入库。
+func claimHostUsage(u rpcUsageRecord) (string, bool) {
+	keys := []string{normalizeModelKey(u.Model), normalizeModelKey(u.Alias)}
+	if keys[0] == "" && keys[1] == "" {
+		return "", false
+	}
+	kid, _ := service.ParseKeyID(u.APIKey)
+	usageClaimsMu.Lock()
+	defer usageClaimsMu.Unlock()
+	var best *usageClaim
+	for _, c := range usageClaims {
+		if !c.available(keys) {
+			continue
+		}
+		// 同模型并发时优先 kid 精确匹配，否则取最早登记的（FIFO）。
+		if best == nil || (kid != "" && c.keyID == kid && best.keyID != kid) {
+			best = c
+		}
+	}
+	if best == nil {
+		return "", false
+	}
+	return best.attach(u)
+}
+
+func resetUsageClaims() {
+	usageClaimsMu.Lock()
+	usageClaims = nil
+	usageClaimsMu.Unlock()
+}
+
+// applyHostUsageToRequest 用宿主口径补齐请求行的缺失字段（结算前调用）。
+// 只补空值：执行器自己观测到的数据更贴近插件视角，不被覆盖。
+// 结算后不可用此函数——provider/auth_type/tier 是分钟聚合的维度键，
+// 改写会让请求行与它的聚合行错位。
+func applyHostUsageToRequest(r *store.Request, rec rpcUsageRecord) {
+	if r == nil {
+		return
+	}
+	if r.Provider == "" {
+		r.Provider = strings.TrimSpace(rec.Provider)
+	}
+	if r.AuthID == "" {
+		r.AuthID = strings.TrimSpace(rec.AuthID)
+	}
+	if r.AuthType == "" {
+		r.AuthType = strings.TrimSpace(rec.AuthType)
+	}
+	if r.Tier == "" {
+		r.Tier = strings.TrimSpace(rec.ServiceTier)
+	}
+	if r.ThinkingIntensity == "" {
+		r.ThinkingIntensity = strings.TrimSpace(rec.ReasoningEffort)
+	}
+	if r.TTFTMS == 0 && rec.TTFT > 0 {
+		r.TTFTMS = rec.TTFT.Milliseconds()
+	}
+}
+
 // ---------- usage.handle ----------
 
 func handleUsage(body []byte) ([]byte, error) {
@@ -1290,28 +1590,38 @@ func handleUsage(body []byte) ([]byte, error) {
 	if err := json.Unmarshal(body, &u); err != nil {
 		return nil, err
 	}
-	// quota 模式：cum- 密钥流量已由执行器/拦截器在结算路径一次性入库，
-	// 不重复写；原生 API Key / 匿名流量不经过插件执行器，这里被动记录。
-	if cfg.Quota.Enabled {
-		bf := store.UsageBackfill{
-			InputTokens:         u.Detail.InputTokens,
-			OutputTokens:        u.Detail.OutputTokens,
-			ReasoningTokens:     u.Detail.ReasoningTokens,
-			CachedTokens:        u.Detail.CachedTokens,
-			CacheReadTokens:     u.Detail.CacheReadTokens,
-			CacheCreationTokens: u.Detail.CacheCreationTokens,
-			TotalTokens:         u.Detail.TotalTokens,
-			TTFTMS:              u.TTFT.Milliseconds(),
+	ctx := context.Background()
+	bf := store.UsageBackfill{
+		InputTokens:         u.Detail.InputTokens,
+		OutputTokens:        u.Detail.OutputTokens,
+		ReasoningTokens:     u.Detail.ReasoningTokens,
+		CachedTokens:        u.Detail.CachedTokens,
+		CacheReadTokens:     u.Detail.CacheReadTokens,
+		CacheCreationTokens: u.Detail.CacheCreationTokens,
+		TotalTokens:         u.Detail.TotalTokens,
+		TTFTMS:              u.TTFT.Milliseconds(),
+	}
+	hasDetail := bf.InputTokens > 0 || bf.OutputTokens > 0 || bf.TotalTokens > 0
+
+	// 认领优先：本次回调若属于插件执行器正在处理/刚结算的请求，
+	// 由该请求消费宿主口径，绝不再被动入库——这是重复统计的根因所在。
+	if id, claimed := claimHostUsage(u); claimed {
+		if id != "" && hasDetail {
+			if err := svc.BackfillRequestUsageByID(ctx, id, bf); err != nil {
+				warnf("回填请求 %s 的宿主用量失败: %v", id, err)
+			}
 		}
-		hasDetail := bf.InputTokens > 0 || bf.OutputTokens > 0 || bf.TotalTokens > 0
+		return okEnvelope(map[string]any{})
+	}
+
+	// 认领未命中（宽限期已过、跨进程回调、或纯统计模式）：回落到库内启发式判重。
+	if cfg.Quota.Enabled {
 		models := modelCandidates(u.Model, u.Alias)
 		if kid, isCum := service.ParseKeyID(u.APIKey); isCum {
-			// 宿主用量观察（usage.handle）是权威口径：执行器的流式解析可能
-			// 拿不到上游用量（部分 OpenAI 兼容上游不在流里回 usage），
-			// 这里给最近一条零用量记录回填 token 明细，避免统计失真。
+			// cum- 密钥的流量必然经过执行器，已一次性入库；这里只补 token 明细。
 			if hasDetail {
-				if _, err := svc.BackfillRequestUsage(context.Background(), kid, models, u.RequestedAt, bf); err != nil {
-					return nil, err
+				if _, err := svc.BackfillRequestUsage(ctx, kid, models, u.RequestedAt, bf); err != nil {
+					warnf("回填 Key %s 的宿主用量失败: %v", kid, err)
 				}
 			}
 			return okEnvelope(map[string]any{})
@@ -1319,10 +1629,10 @@ func handleUsage(body []byte) ([]byte, error) {
 		// APIKey 不是插件 Key 的回调（部分兼容渠道把上游凭据放进该字段）：
 		// 若能按 时间+延迟+模型 关联到执行器已入库的记录，视为同一请求，
 		// 不再被动入库（否则统计翻倍），仅回填缺失用量。
-		if id, dup, err := svc.FindDuplicateExecutor(context.Background(), models, u.RequestedAt, u.Latency.Milliseconds()); err == nil && dup {
+		if id, dup, err := svc.FindDuplicateExecutor(ctx, models, u.RequestedAt, u.Latency.Milliseconds()); err == nil && dup {
 			if hasDetail {
-				if err := svc.BackfillRequestUsageByID(context.Background(), id, bf); err != nil {
-					return nil, err
+				if err := svc.BackfillRequestUsageByID(ctx, id, bf); err != nil {
+					warnf("回填请求 %s 的宿主用量失败: %v", id, err)
 				}
 			}
 			return okEnvelope(map[string]any{})
@@ -1332,12 +1642,21 @@ func handleUsage(body []byte) ([]byte, error) {
 	if cost, _, err := svc.Price(req.Model, usageFromRecord(u)); err == nil {
 		req.CostMicroUSD = cost
 	}
-	if err := st.RecordUsage(context.Background(), req); err != nil {
-		return nil, err
+	if err := st.RecordUsage(ctx, req); err != nil {
+		// 用量记录失败不应让宿主把整次请求判为插件错误。
+		warnf("被动记录用量失败: %v", err)
+		return okEnvelope(map[string]any{})
 	}
 	// 落库后对账：与执行器结算行是同一请求时合并去重（消除双写竞态）。
-	_, _ = st.ReconcileRequestDuplicates(context.Background(), req.ID)
+	if _, err := st.ReconcileRequestDuplicates(ctx, req.ID); err != nil {
+		warnf("请求 %s 落库对账失败: %v", req.ID, err)
+	}
 	return okEnvelope(map[string]any{})
+}
+
+// warnf 把插件内部的非致命异常写到 stderr，由宿主日志收集。
+func warnf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "[cpa-usage-manager] "+format+"\n", args...)
 }
 
 func usageFromRecord(u rpcUsageRecord) usageparse.Usage {
