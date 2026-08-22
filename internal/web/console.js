@@ -752,10 +752,18 @@ function renderReadouts(total, costs) {
         ? ' · 含上游缓存口径' : ''));
 }
 
-function barList(rows, max, nameText, nameHtml, valFn, valText, color) {
+function barList(rows, max, nameText, nameHtml, valFn, valText, color, denom) {
   if (!rows.length) return '<div class="empty"><p class="empty-title">暂无数据</p><p class="empty-hint">所选时间范围内没有请求记录</p></div>';
-  // 分母取全量之和，让「占比」是真实份额；条长仍按最大值归一，保证最长条填满。
-  const sum = rows.reduce((a, r) => a + Math.max(0, Number(valFn(r)) || 0), 0);
+  // 占比分母必须是**全量**合计，不能用 rows 之和：rows 已被 slice 成前 N 项，
+  // 用它做分母会把尾部的量摊到头部，份额被系统性夸大（且头部之和恒为 100%）。
+  // 调用方传入截断前的 denom；缺省时退回行内之和。
+  //
+  // 注：概览两卡的数据源分别带 limit=200（模型）/100（密钥），维度多于该上限时
+  // denom 是「前 200/100 项之和」而非绝对全量，占比会有极小偏高 —— 这两个上限
+  // 远高于实际维度基数，且副标题会显示「共 N 项」，可据此判断是否触顶。
+  const sum = denom !== undefined && denom > 0
+    ? denom
+    : rows.reduce((a, r) => a + Math.max(0, Number(valFn(r)) || 0), 0);
   return rows.map(r => {
     const v = Math.max(0, Number(valFn(r)) || 0);
     const pct = max > 0 ? (v / max * 100) : 0;
@@ -801,23 +809,29 @@ bindMetricSeg('ov-keys-metric', 'keys', () => renderKeySpend(ovCache.keys));
 
 function renderModels(rows) {
   const m = ovMetric.models;
-  $('ov-models-sub').textContent = METRIC_SUBS[m] + '，取前 10';
   const top = rows.slice().sort((a, b) => metricVal(b, m) - metricVal(a, m)).slice(0, 10);
   const max = top.length ? metricVal(top[0], m) : 0;
+  // 分母取全量（未截断）合计，占比才是真实份额
+  const denom = rows.reduce((a, r) => a + Math.max(0, metricVal(r, m)), 0);
+  $('ov-models-sub').textContent = METRIC_SUBS[m]
+    + (rows.length > top.length ? '，取前 10（共 ' + rows.length + ' 项）' : '，共 ' + rows.length + ' 项');
   $('ov-models').innerHTML = barList(top, max,
     r => r.value || '(空)', r => esc(r.value || '(空)'),
-    r => metricVal(r, m), r => metricText(metricVal(r, m), m));
+    r => metricVal(r, m), r => metricText(metricVal(r, m), m), null, denom);
 }
 function renderKeySpend(rows) {
   const m = ovMetric.keys;
-  $('ov-keys-sub').textContent = METRIC_SUBS[m] + '，取前 8';
-  const top = rows.filter(r => r.value).sort((a, b) => metricVal(b, m) - metricVal(a, m)).slice(0, 8);
+  const withKey = rows.filter(r => r.value);
+  const top = withKey.slice().sort((a, b) => metricVal(b, m) - metricVal(a, m)).slice(0, 8);
   const max = top.length ? metricVal(top[0], m) : 0;
+  const denom = withKey.reduce((a, r) => a + Math.max(0, metricVal(r, m)), 0);
+  $('ov-keys-sub').textContent = METRIC_SUBS[m]
+    + (withKey.length > top.length ? '，取前 8（共 ' + withKey.length + ' 枚）' : '，共 ' + withKey.length + ' 枚');
   $('ov-keys').innerHTML = barList(top, max,
     r => (keyLabelOf(r.value) || '(无标签)') + ' · ' + r.value,
     r => '<span class="bar-name-main">' + esc(keyLabelOf(r.value) || '(无标签)') + '</span>'
       + '<span class="bar-kid mono">' + esc(r.value) + '</span>',
-    r => metricVal(r, m), r => metricText(metricVal(r, m), m), 'trace');
+    r => metricVal(r, m), r => metricText(metricVal(r, m), m), 'trace', denom);
 }
 
 // ---------- 趋势图（内联 SVG 堆叠面积）----------
@@ -1620,23 +1634,53 @@ async function loadDim() {
       + '<p class="empty-hint">所选时间范围内没有请求记录</p></div>';
     return;
   }
-  // 占比分母取全量最大值：行序按费用排，首行请求数未必最大，用它会算出 >100%。
-  const maxReq = Math.max(1, ...rows.map(row => row.requests || 0));
+  // 占比 = 本行请求数 / 所有分组请求数之和，各行之和为 100%（四舍五入误差除外）。
+  //
+  // 曾用「最大行请求数」作分母（v0.3.0 为修 >100% 而引入），那算的是「相对最大值的
+  // 比例」而不是占比：最大行恒显示 100%，且各行相加远超 100%（result 维度下
+  // ok 100% + error 8% = 108%，provider 维度累计 263%），与列名和常识都不符。
+  //
+  // 分母用行内之和而非 r.total.requests —— 服务端的 total 是**只对返回行**累加的
+  // （accumulate 在扫描循环里调用），带 limit 时它等于返回行之和、不是全量总数，
+  // 因此两者在这里等价；本函数不传 limit，拿到的就是全部分组。
+  // 条长仍按最大值归一，保证最长条填满、短条之间仍可比。
+  const denom = rows.reduce((a, row) => a + (Number(row.requests) || 0), 0);
+  const maxReq = Math.max(1, ...rows.map(row => Number(row.requests) || 0));
+  const shareOf = row => denom > 0 ? (Number(row.requests) || 0) / denom * 100 : 0;
+  // 密钥维度的分组值是 kid，显示标签更可读（与请求表/概览/详情弹窗同口径），
+  // kid 保留在 title 里。其余维度分组值本身就是可读文本。
+  const nameOf = row => {
+    const v = row.value || '';
+    if (dim === 'key_id' && v) return keyLabelOf(v) || v;
+    return v || '(空)';
+  };
+  const titleOf = row => {
+    const v = row.value || '';
+    if (dim === 'key_id' && v) {
+      const label = keyLabelOf(v);
+      return label ? label + ' · ' + v : v;
+    }
+    return v || '(空)';
+  };
   $('dim-body').innerHTML = '<div class="table-wrap"><table class="data"><thead><tr>'
     + '<th class="w-grow">' + esc((DIMS.find(d => d.value === dim) || {}).label || dim) + '</th>'
     + '<th class="num">请求</th><th class="num">失败</th><th class="num">Token</th><th class="num">费用</th>'
     + '<th class="num">平均延迟</th><th class="num">TPS</th></tr></thead><tbody>'
-    + rows.map(row => '<tr>'
-      + '<td><div class="bar-cell" title="' + esc(row.value || '(空)') + '"><div class="bar-top"><span class="bar-name">'
-      + esc(row.value || '(空)') + '</span><span class="bar-pct">'
-      + (row.requests / maxReq * 100).toFixed(0) + '%</span></div>'
-      + '<div class="bar-line"><span style="width:' + (row.requests / maxReq * 100).toFixed(1) + '%"></span></div></div></td>'
+    + rows.map(row => {
+      const share = shareOf(row);
+      return '<tr>'
+      + '<td><div class="bar-cell" title="' + esc(titleOf(row)) + '"><div class="bar-top"><span class="bar-name">'
+      + esc(nameOf(row)) + '</span><span class="bar-pct">'
+      + (share < 10 ? share.toFixed(1) : share.toFixed(0)) + '%</span></div>'
+      + '<div class="bar-line"><span style="width:'
+      + ((Number(row.requests) || 0) / maxReq * 100).toFixed(1) + '%"></span></div></div></td>'
       + '<td class="num">' + fmtInt(row.requests) + '</td>'
       + '<td class="num">' + (row.failures ? '<span class="pill alarm mono">' + fmtInt(row.failures) + '</span>' : '0') + '</td>'
       + '<td class="num">' + fmtTok(effTokens(row)) + '</td>'
       + '<td class="num">' + fmtUSD(row.cost_micro_usd) + '</td>'
       + '<td class="num">' + fmtSec(row.latency_avg_ms) + '</td>'
-      + '<td class="num">' + fmtTPS(row.tps_avg_milli) + '</td></tr>').join('')
+      + '<td class="num">' + fmtTPS(row.tps_avg_milli) + '</td></tr>';
+    }).join('')
     + '</tbody></table></div>';
 }
 // fmtTPS 展示 TPS：超过 3000 token/s 视为宿主缓冲整转产生的坏测量
