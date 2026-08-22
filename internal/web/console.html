@@ -135,17 +135,17 @@
   <article class="panel">
     <div class="panel-head">
       <div><h2 class="panel-title">插件密钥</h2><p class="panel-sub" id="key-count">—</p></div>
-      <div class="panel-tools">
-        <input class="btn input" id="key-search" type="search" placeholder="搜索 kid 或标签" spellcheck="false">
-        <div class="sel" id="key-caller" data-label="按 caller 过滤"></div>
-        <div class="sel" id="key-status" data-label="按状态过滤"></div>
-        <button type="button" class="btn primary" id="key-issue-btn">
-          <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-          <span>签发密钥</span>
-        </button>
-      </div>
+      <button type="button" class="btn primary" id="key-issue-btn">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        <span>签发密钥</span>
+      </button>
     </div>
-    <div class="key-list" id="key-rows" role="list" aria-label="密钥列表"></div>
+    <div class="keys-toolbar">
+      <input class="btn input" id="key-search" type="search" placeholder="搜索 kid 或标签" spellcheck="false" aria-label="搜索密钥">
+      <div class="sel" id="key-caller" data-label="按 caller 过滤"></div>
+      <div class="sel" id="key-status" data-label="按状态过滤"></div>
+    </div>
+    <div class="key-grid" id="key-rows" role="list" aria-label="密钥列表"></div>
     <div class="pager" id="key-pager"></div>
   </article>
 </section>

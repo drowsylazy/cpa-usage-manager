@@ -1372,27 +1372,20 @@ function renderKeys() {
   $('key-rows').innerHTML = rows.map(k => {
     const meta = STATUS_META[keyStatus(k)];
     const conc = k.max_concurrent_requests > 0 ? '≤ ' + k.max_concurrent_requests : '不限';
-    return '<div class="key-card" data-kid="' + esc(k.kid) + '" aria-expanded="false" tabindex="0">'
-      + '<div class="kc-head">'
-      + '<span class="pill ' + meta.pill + '">' + meta.label + '</span>'
+    return '<button type="button" class="key-card" data-kid="' + esc(k.kid) + '" title="查看详情">'
+      + '<span class="kc-top"><span class="pill ' + meta.pill + '">' + meta.label + '</span>'
+      + '<span class="kc-last">' + esc(rel(k.last_used_at)) + '</span></span>'
       + '<span class="kc-label" title="' + esc(k.label || '') + '">' + (k.label ? esc(k.label) : '<i>无标签</i>') + '</span>'
-      + '<span class="kc-last" title="最后使用">' + esc(rel(k.last_used_at)) + '</span>'
-      + '<svg class="chev" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg>'
-      + '</div>'
-      + '<div class="kc-meta">'
       + '<span class="kc-kid mono">' + esc(k.kid) + '</span>'
-      + '<span class="kc-sep">·</span><span>' + esc(k.caller_id) + '</span>'
-      + '<span class="kc-sep">·</span><span>已用 <b class="mono">' + fmtUSD(k.spent_micro_usd) + '</b></span>'
-      + '<span class="kc-sep">·</span><span>今日 <b class="mono">' + fmtUSD(todaySpent(k)) + '</b></span>'
-      + '<span class="kc-sep">·</span><span>并发 <b class="mono">' + conc + '</b></span>'
-      + '</div>'
-      + '<div class="kc-meters">'
-      + '<div class="kc-meter"><span class="kc-meter-label">金额额度</span>' + meterHTML(k.spent_micro_usd, k.quota_micro_usd) + '</div>'
-      + '<div class="kc-meter"><span class="kc-meter-label">Token 额度</span>' + tokMeterHTML(k) + '</div>'
-      + '</div>'
-      + '</div>';
+      + '<span class="kc-meter-block"><span class="kc-meter-label">金额额度</span>' + meterHTML(k.spent_micro_usd, k.quota_micro_usd) + '</span>'
+      + '<span class="kc-meter-block"><span class="kc-meter-label">Token 额度</span>' + tokMeterHTML(k) + '</span>'
+      + '<span class="kc-meta"><span class="mono">' + esc(k.caller_id) + '</span>'
+      + '<span>已用 <b>' + fmtUSD(k.spent_micro_usd) + '</b></span>'
+      + '<span>今日 <b>' + fmtUSD(todaySpent(k)) + '</b></span>'
+      + '<span>并发 <b>' + conc + '</b></span></span>'
+      + '</button>';
   }).join('')
-    || '<div class="empty"><p class="empty-title">没有匹配的密钥</p>'
+    || '<div class="empty" style="grid-column:1/-1"><p class="empty-title">没有匹配的密钥</p>'
     + '<p class="empty-hint">调整筛选条件，或点击右上角「签发密钥」</p></div>';
 
   const pages = Math.max(1, Math.ceil(list.length / keysView.size));
@@ -1406,72 +1399,62 @@ function renderKeys() {
   if (next) next.onclick = () => { keysView.page++; renderKeys(); };
 }
 
-$('key-rows').addEventListener('keydown', e => {
-  if (e.key !== 'Enter' && e.key !== ' ') return;
-  const card = e.target.closest('.key-card');
-  if (!card || e.target !== card) return;
-  e.preventDefault();
-  card.click();
-});
-
-$('key-rows').addEventListener('click', async e => {
-  const card = e.target.closest('.key-card');
-  if (!card) return;
-  const open = card.getAttribute('aria-expanded') === 'true';
-  const detail = card.nextElementSibling;
-  if (detail && detail.classList.contains('key-detail')) {
-    card.setAttribute('aria-expanded', 'false');
-    detail.remove();
-    if (open) return;
-  }
-  card.setAttribute('aria-expanded', 'true');
-  const kid = card.dataset.kid;
-  const k = keysView.cache.find(x => x.kid === kid);
-  if (!k) return;
+// keyDetailSheet 点卡片弹出详情 dialog：密钥信息、余额仪表与全部操作集中一处。
+function keyDetailSheet(k) {
+  const kid = k.kid;
   const st = keyStatus(k);
-  const box = document.createElement('div');
-  box.className = 'key-detail';
-  box.innerHTML = '<div class="detail-grid"><div class="detail-facts">'
-    + fact('指纹', k.fingerprint || '-')
-    + fact('principal', k.principal || '-')
-    + fact('额度口径', k.caller_scope === 'key' ? '独立计额' : '归属 caller')
-    + fact('过期时间', k.expires_at ? fmtDT(k.expires_at) : '永不')
-    + fact('创建于', fmtDT(k.created_at))
-    + fact('更新于', fmtDT(k.updated_at))
-    + fact('可用模型', (k.allowed_models && k.allowed_models.length) ? k.allowed_models.join(', ') : '不限制')
-    + fact('周期计数', (k.daily_cycle_key || '-') + ' / ' + (k.weekly_cycle_key || '-') + ' / ' + (k.monthly_cycle_key || '-'))
-    + '</div><div class="meter-grid" id="kd-meters"><p class="note">余额核算中…</p></div>'
-    + '<div class="btn-row">'
-    + '<button type="button" class="btn small" data-act="edit">编辑</button>'
-    + '<button type="button" class="btn small" data-act="rotate">轮换</button>'
-    + '<button type="button" class="btn small" data-act="reveal">查看明文</button>'
-    + (st !== 'revoked' ? '<button type="button" class="btn small danger" data-act="revoke">撤销</button>' : '')
-    + '<button type="button" class="btn small danger" data-act="delete">删除</button>'
-    + '</div></div>';
-  card.after(box);
-  box.querySelector('[data-act="edit"]').onclick = () => editKeySheet(k);
-  box.querySelector('[data-act="rotate"]').onclick = () => rotateSheet(kid);
-  box.querySelector('[data-act="reveal"]').onclick = () => revealSheet(kid);
-  const rv = box.querySelector('[data-act="revoke"]');
-  if (rv) rv.onclick = () => confirmSheet('撤销密钥 ' + kid,
+  openSheet({
+    title: k.label || ('密钥 ' + kid),
+    okText: '关闭', noFocus: true,
+    body: (() => {
+      const meta = STATUS_META[st];
+      const conc = k.max_concurrent_requests > 0 ? '≤ ' + k.max_concurrent_requests : '不限';
+      return '<div class="detail-head"><span class="pill ' + meta.pill + '">' + meta.label + '</span>'
+        + '<span class="mono kid-line">' + esc(kid) + '</span>'
+        + '<span class="grow"></span><span class="note">最后使用 ' + esc(rel(k.last_used_at))
+        + ' · 并发 ' + conc + '</span></div>'
+        + '<div class="detail-facts">'
+        + fact('caller', k.caller_id || '-')
+        + fact('principal', k.principal || '-')
+        + fact('额度口径', k.caller_scope === 'key' ? '独立计额' : '归属 caller')
+        + fact('过期时间', k.expires_at ? fmtDT(k.expires_at) : '永不')
+        + fact('创建于', fmtDT(k.created_at))
+        + fact('周期计数', (k.daily_cycle_key || '-') + ' / ' + (k.weekly_cycle_key || '-') + ' / ' + (k.monthly_cycle_key || '-'))
+        + fact('指纹', k.fingerprint || '-')
+        + fact('可用模型', (k.allowed_models && k.allowed_models.length) ? k.allowed_models.join(', ') : '不限制')
+        + '</div>'
+        + '<div class="meter-grid" id="kd-meters"><p class="note">余额核算中…</p></div>'
+        + '<div class="btn-row">'
+        + '<button type="button" class="btn small" data-act="edit">编辑</button>'
+        + '<button type="button" class="btn small" data-act="rotate">轮换</button>'
+        + '<button type="button" class="btn small" data-act="reveal">查看明文</button>'
+        + (st !== 'revoked' ? '<button type="button" class="btn small danger" data-act="revoke">撤销</button>' : '')
+        + '<button type="button" class="btn small danger" data-act="delete">删除</button>'
+        + '</div>';
+    })(),
+  });
+  // 操作按钮在弹窗内容就位后接线；撤销按钮按状态显隐。
+  const wire = act => $('sheet-body').querySelector('[data-act="' + act + '"]');
+  const editBtn = wire('edit'), rotateBtn = wire('rotate'), revealBtn = wire('reveal');
+  const revokeBtn = wire('revoke'), deleteBtn = wire('delete');
+  if (editBtn) editBtn.onclick = () => editKeySheet(k);
+  if (rotateBtn) rotateBtn.onclick = () => rotateSheet(kid);
+  if (revealBtn) revealBtn.onclick = () => revealSheet(kid);
+  if (revokeBtn) revokeBtn.onclick = () => confirmSheet('撤销密钥 ' + kid,
     '撤销不可逆，该 Key 将立即无法通过鉴权。历史用量保留。',
     () => post('/keys/revoke', { kid, actor: 'console' }).then(refreshKeys));
-  box.querySelector('[data-act="delete"]').onclick = () => confirmSheet('删除密钥 ' + kid,
+  if (deleteBtn) deleteBtn.onclick = () => confirmSheet('删除密钥 ' + kid,
     '永久删除该 Key（历史用量保留）。操作不可逆。',
     () => post('/keys/delete', { kid, actor: 'console' }).then(refreshKeys));
 
-  try {
-    const b = await api('/balance?key_id=' + encodeURIComponent(kid));
+  api('/balance?key_id=' + encodeURIComponent(kid)).then(b => {
     const meters = $('kd-meters');
-    if (!meters) return;
+    if (!meters) return; // 用户已关闭弹窗
     // 只有配了 token 限额的 Key 才显示 token 那组仪表，避免未用该功能的 Key
     // 详情里多出四个「不限」的空表盘。
     const hasTok = [k.token_limit, k.daily_token_limit, k.weekly_token_limit, k.monthly_token_limit]
       .some(v => v !== null && v !== undefined);
     // 字段名必须与 service.Balance 的 JSON tag 一致。
-    // 既有缺陷：此处原读 b.total / b.daily / b.held，而接口返回的是
-    // total_remaining_micro_usd 等，全部 undefined → 金额表盘长期显示
-    // 「余 $0 / 100% alarm」（与同一行表格里的真实占用比矛盾）。
     meters.innerHTML =
       '<div class="meter-group"><div class="meter-group-head">金额额度（USD）</div>'
       + remainMeter('总额度', k.quota_micro_usd, b.total_remaining_micro_usd)
@@ -1489,10 +1472,15 @@ $('key-rows').addEventListener('click', async e => {
         : '')
       + '<p class="note">在途预占 ' + fmtUSD(b.held_micro_usd || 0)
       + (hasTok ? ' / ' + fmtTok(b.held_tokens) + ' token' : '')
-      + ' · 并发 ' + b.concurrent
-      + (k.max_concurrent_requests > 0 ? ' / ' + k.max_concurrent_requests : '')
       + ' · 当前周期 ' + cycleKeysNow().daily + '</p>';
-  } catch (e) { /* 余额核算失败不打断详情 */ }
+  }).catch(() => { /* 余额核算失败不打断详情 */ });
+}
+
+$('key-rows').addEventListener('click', e => {
+  const card = e.target.closest('.key-card');
+  if (!card) return;
+  const k = keysView.cache.find(x => x.kid === card.dataset.kid);
+  if (k) keyDetailSheet(k);
 });
 
 $('key-search').addEventListener('input', debounce(() => {
