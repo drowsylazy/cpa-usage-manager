@@ -1228,8 +1228,7 @@ window.addEventListener('resize', debounce(() => { if (activeTab === 'overview')
 // ---------- 密钥 ----------
 const keysView = {
   cache: [], filtered: [], page: 0, size: 20, search: '', caller: '', status: '',
-  selectedKid: '',  // 右栏详情当前展示的密钥
-  balanceSeq: 0,    // 余额异步响应的竞态守卫：快速切换选中时丢弃晚到的旧响应
+  balanceSeq: 0,    // 余额异步响应的竞态守卫：快速切换抽屉对象时丢弃晚到的旧响应
 };
 // keyLabelOf 由 kid 查密钥标签；无标签或缓存未热时返回空串，由调用方决定回落值。
 function keyLabelOf(kid) {
@@ -1245,6 +1244,12 @@ async function refreshKeys() {
   const r = await api('/keys?' + q);
   keysView.cache = r.items || [];
   applyKeyFilter();
+  // 抽屉开着时同步刷新其内容；对象已被删除则收起抽屉。
+  const d = $('key-drawer');
+  if (!d.hidden && d.dataset.kid) {
+    const nk = keysView.cache.find(x => x.kid === d.dataset.kid);
+    if (nk) renderKeyDrawer(nk); else closeKeyDrawer();
+  }
   stamp();
 }
 function keyStatus(k) {
@@ -1313,26 +1318,7 @@ function renderKeys() {
     + (list.length !== totalAll ? ' · 筛选后 ' + list.length + ' 枚' : '');
   const start = keysView.page * keysView.size;
   const rows = list.slice(start, start + keysView.size);
-  // 选中项不在当前可见集合（翻页/筛选/删除后）时，自动选中第一条，
-  // 保证右栏详情始终有内容。
-  if (!rows.some(k => k.kid === keysView.selectedKid)) {
-    keysView.selectedKid = rows.length ? rows[0].kid : '';
-  }
-  $('key-rows').innerHTML = rows.map(k => {
-    const meta = STATUS_META[keyStatus(k)];
-    const sel = k.kid === keysView.selectedKid;
-    // 左栏迷你读数：设了金额上限显示「已用/上限」，否则只报已用。
-    const spentLine = k.quota_micro_usd && k.quota_micro_usd > 0
-      ? fmtUSD(k.spent_micro_usd) + ' / ' + fmtUSD(k.quota_micro_usd)
-      : '已用 ' + fmtUSD(k.spent_micro_usd);
-    return '<div class="km-item" data-kid="' + esc(k.kid) + '" role="option"'
-      + ' aria-selected="' + sel + '" tabindex="0">'
-      + '<span class="km-dot" data-state="' + keyStatus(k) + '" title="' + meta.label + '"></span>'
-      + '<span class="km-main">'
-      + '<span class="km-label">' + (k.label ? esc(k.label) : '<i>无标签</i>') + '</span>'
-      + '<span class="km-sub">' + spentLine + '</span>'
-      + '</span></div>';
-  }).join('')
+  $('key-rows').innerHTML = rows.map(keyCardHTML).join('')
     || '<div class="empty"><p class="empty-title">没有匹配的密钥</p>'
     + '<p class="empty-hint">调整筛选条件，或点击右上角「签发密钥」</p></div>';
 
@@ -1345,29 +1331,80 @@ function renderKeys() {
   const prev = $('key-prev'), next = $('key-next');
   if (prev) prev.onclick = () => { keysView.page--; renderKeys(); };
   if (next) next.onclick = () => { keysView.page++; renderKeys(); };
-
-  const selected = rows.find(k => k.kid === keysView.selectedKid);
-  if (selected) renderKeyDetail(selected);
-  else $('key-detail').innerHTML =
-    '<div class="empty"><p class="empty-title">未选择密钥</p>'
-    + '<p class="empty-hint">在左侧列表中选择一枚密钥查看余额与操作</p></div>';
 }
 
-// renderKeyDetail 右栏常驻详情：头部、facts、余额配额清单、操作按钮。
-// balanceSeq 守卫：快速切换选中时，晚返回的旧余额不得覆盖新选中项的面板。
-function renderKeyDetail(k) {
+// usdPick / tokPick 选出卡片余量块展示的那一档：优先总额，其次当前周期
+// 尚未滚动的日/周/月（cycle key 不匹配即已跨期归零，读数按 0 计）。
+function usdPick(k) {
+  const c = cycleKeysNow();
+  if (k.quota_micro_usd) return { lim: k.quota_micro_usd, used: k.spent_micro_usd };
+  if (k.daily_micro_usd) return { lim: k.daily_micro_usd, used: k.daily_cycle_key === c.daily ? k.daily_spent_micro_usd : 0 };
+  if (k.weekly_micro_usd) return { lim: k.weekly_micro_usd, used: k.weekly_cycle_key === c.weekly ? k.weekly_spent_micro_usd : 0 };
+  if (k.monthly_micro_usd) return { lim: k.monthly_micro_usd, used: k.monthly_cycle_key === c.monthly ? k.monthly_spent_micro_usd : 0 };
+  return null;
+}
+function tokPick(k) {
+  const c = cycleKeysNow();
+  if (k.token_limit) return { lim: k.token_limit, used: k.tokens_used };
+  if (k.daily_token_limit) return { lim: k.daily_token_limit, used: k.daily_cycle_key === c.daily ? k.daily_tokens_used : 0 };
+  if (k.weekly_token_limit) return { lim: k.weekly_token_limit, used: k.weekly_cycle_key === c.weekly ? k.weekly_tokens_used : 0 };
+  if (k.monthly_token_limit) return { lim: k.monthly_token_limit, used: k.monthly_cycle_key === c.monthly ? k.monthly_tokens_used : 0 };
+  return null;
+}
+// keyQuota 卡片余量块：大数字余量 + 细进度条 + 「已用 / 上限」说明。
+function keyQuota(q, kind, fmt) {
+  const remain = Math.max(0, q.lim - q.used);
+  const pct = Math.min(100, q.used / q.lim * 100);
+  return '<div class="ky-quota" data-kind="' + kind + '"'
+    + ' data-state="' + (pct >= 95 ? 'alarm' : pct >= 80 ? 'warn' : '') + '">'
+    + '<div class="ky-quota-row"><span class="ky-quota-num mono">' + fmt(remain) + '</span>'
+    + '<span class="ky-quota-cap mono">已用 ' + fmt(q.used) + ' / ' + fmt(q.lim) + '</span></div>'
+    + '<div class="ky-bar"><span style="width:' + pct.toFixed(1) + '%"></span></div>'
+    + '</div>';
+}
+const COPY_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
+function kidShort(kid) {
+  return kid.length > 18 ? kid.slice(0, 8) + '…' + kid.slice(-6) : kid;
+}
+function keyCardHTML(k) {
+  const meta = STATUS_META[keyStatus(k)];
+  const u = usdPick(k), t = tokPick(k);
+  return '<article class="ky-card" data-kid="' + esc(k.kid) + '" role="listitem" tabindex="0">'
+    + '<div class="ky-card-top">'
+    + '<span class="pill ' + meta.pill + '">' + meta.label + '</span>'
+    + '<span class="ky-when">' + esc(rel(k.last_used_at)) + '</span></div>'
+    + '<h3 class="ky-name">' + (k.label ? esc(k.label) : '<i>无标签</i>') + '</h3>'
+    + '<button type="button" class="ky-kid mono" data-copy="' + esc(k.kid) + '" title="点击复制完整 kid">'
+    + '<span>' + esc(kidShort(k.kid)) + '</span>' + COPY_SVG + '</button>'
+    + (u ? keyQuota(u, 'usd', fmtUSD) : '')
+    + (t ? keyQuota(t, 'tok', fmtTok) : '')
+    + '<footer class="ky-meta">'
+    + '<span class="mono">' + esc(k.caller_id || '-') + '</span>'
+    + '<span>并发 ' + (k.max_concurrent_requests > 0 ? '≤ ' + k.max_concurrent_requests : '不限') + '</span>'
+    + '<span>' + (k.caller_scope === 'key' ? '独立计额' : '归属 caller') + '</span>'
+    + '</footer></article>';
+}
+
+// ---------- 详情抽屉 ----------
+// balanceSeq 守卫：快速连续打开抽屉时，晚返回的旧余额不得覆盖当前内容。
+function renderKeyDrawer(k) {
   const kid = k.kid;
   const st = keyStatus(k);
   const meta = STATUS_META[st];
-  const conc = k.max_concurrent_requests > 0 ? '≤ ' + k.max_concurrent_requests : '不限';
-  $('key-detail').innerHTML =
-    '<div class="detail-head">'
-    + '<span class="kd-title">' + (k.label ? esc(k.label) : '<i>无标签</i>') + '</span>'
+  const d = $('key-drawer');
+  d.dataset.kid = kid;
+  d.innerHTML =
+    '<header class="ky-drawer-head">'
+    + '<div class="ky-drawer-id">'
+    + '<h3>' + (k.label ? esc(k.label) : '<i>无标签</i>') + '</h3>'
     + '<span class="pill ' + meta.pill + '">' + meta.label + '</span>'
-    + '<span class="grow"></span>'
-    + '<span class="note">最近使用: ' + esc(rel(k.last_used_at)) + '</span></div>'
-    + '<div class="kd-kidline mono">' + esc(kid) + ' · caller ' + esc(k.caller_id || '-')
-    + ' · 并发 ' + conc + '</div>'
+    + '</div>'
+    + '<button type="button" class="ky-drawer-close" aria-label="关闭详情">'
+    + '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>'
+    + '</button></header>'
+    + '<div class="ky-drawer-body">'
+    + '<button type="button" class="ky-kid wide mono" data-copy="' + esc(kid) + '" title="点击复制完整 kid">'
+    + '<span>' + esc(kid) + '</span>' + COPY_SVG + '</button>'
     + '<div class="detail-facts">'
     + fact('principal', k.principal || '-')
     + fact('额度口径', k.caller_scope === 'key' ? '独立计额' : '归属 caller')
@@ -1376,6 +1413,7 @@ function renderKeyDetail(k) {
     + fact('周期计数', (k.daily_cycle_key || '-') + ' / ' + (k.weekly_cycle_key || '-') + ' / ' + (k.monthly_cycle_key || '-'))
     + fact('指纹', k.fingerprint || '-')
     + fact('可用模型', (k.allowed_models && k.allowed_models.length) ? k.allowed_models.join(', ') : '不限制')
+    + fact('最近使用', rel(k.last_used_at))
     + '</div>'
     + '<div class="bal-wrap" id="kd-meters"><p class="note">余额核算中…</p></div>'
     + '<div class="btn-row">'
@@ -1384,9 +1422,9 @@ function renderKeyDetail(k) {
     + '<button type="button" class="btn small" data-act="reveal">查看明文</button>'
     + (st !== 'revoked' ? '<button type="button" class="btn small danger" data-act="revoke">撤销</button>' : '')
     + '<button type="button" class="btn small danger" data-act="delete">删除</button>'
-    + '</div>';
+    + '</div></div>';
 
-  const wire = act => $('key-detail').querySelector('[data-act="' + act + '"]');
+  const wire = act => d.querySelector('[data-act="' + act + '"]');
   wire('edit').onclick = () => editKeySheet(k);
   wire('rotate').onclick = () => rotateSheet(kid);
   wire('reveal').onclick = () => revealSheet(kid);
@@ -1397,10 +1435,11 @@ function renderKeyDetail(k) {
   wire('delete').onclick = () => confirmSheet('删除密钥 ' + kid,
     '永久删除该 Key（历史用量保留）。操作不可逆。',
     () => post('/keys/delete', { kid, actor: 'console' }).then(refreshKeys));
+  d.querySelector('.ky-drawer-close').onclick = closeKeyDrawer;
 
   const seq = ++keysView.balanceSeq;
   api('/balance?key_id=' + encodeURIComponent(kid)).then(b => {
-    if (seq !== keysView.balanceSeq || keysView.selectedKid !== kid) return;
+    if (seq !== keysView.balanceSeq || d.hidden || d.dataset.kid !== kid) return;
     const wrap = $('kd-meters');
     if (!wrap) return;
     // 只有配了 token 限额的 Key 才显示 token 那组配额，避免未用该功能的 Key
@@ -1429,25 +1468,56 @@ function renderKeyDetail(k) {
   }).catch(() => { /* 余额核算失败不打断详情 */ });
 }
 
+let kdOpener = null;   // 关闭抽屉后焦点回到打开它的卡片
+function openKeyDrawer(kid, opener) {
+  const k = keysView.cache.find(x => x.kid === kid);
+  if (!k) return;
+  if (opener) kdOpener = opener;
+  renderKeyDrawer(k);
+  $('kd-backdrop').hidden = false;
+  const d = $('key-drawer');
+  d.hidden = false;
+  requestAnimationFrame(() => {
+    $('kd-backdrop').classList.add('open');
+    d.classList.add('open');
+  });
+  const closeBtn = d.querySelector('.ky-drawer-close');
+  if (closeBtn) closeBtn.focus();
+}
+function closeKeyDrawer() {
+  const d = $('key-drawer');
+  if (d.hidden) return;
+  d.classList.remove('open');
+  $('kd-backdrop').classList.remove('open');
+  setTimeout(() => { d.hidden = true; $('kd-backdrop').hidden = true; }, 230);
+  if (kdOpener && document.contains(kdOpener)) kdOpener.focus();
+  kdOpener = null;
+}
+
 $('key-rows').addEventListener('click', e => {
-  const item = e.target.closest('.km-item');
-  if (!item) return;
-  keysView.selectedKid = item.dataset.kid;
-  syncSelection();
-  const k = keysView.cache.find(x => x.kid === keysView.selectedKid);
-  if (k) renderKeyDetail(k);
+  const copy = e.target.closest('[data-copy]');
+  if (copy) {
+    copyText(copy.dataset.copy).then(() => toast('kid 已复制')).catch(() => toast('复制失败', 'err'));
+    return;
+  }
+  const card = e.target.closest('.ky-card');
+  if (card) openKeyDrawer(card.dataset.kid, card);
 });
 $('key-rows').addEventListener('keydown', e => {
   if (e.key !== 'Enter' && e.key !== ' ') return;
-  const item = e.target.closest('.km-item');
-  if (!item || e.target !== item) return;
+  const card = e.target.closest('.ky-card');
+  if (!card || e.target !== card) return;
   e.preventDefault();
-  item.click();
+  openKeyDrawer(card.dataset.kid, card);
 });
-function syncSelection() {
-  [...document.querySelectorAll('#key-rows .km-item')].forEach(el =>
-    el.setAttribute('aria-selected', String(el.dataset.kid === keysView.selectedKid)));
-}
+$('kd-backdrop').addEventListener('click', closeKeyDrawer);
+// Esc 逐层关闭：下拉/范围弹层/对话框优先（各自的处理器负责），轮到抽屉才关。
+window.addEventListener('keydown', e => {
+  if (e.key !== 'Escape' || $('key-drawer').hidden) return;
+  if (openSel || !$('range-pop').hidden || document.querySelector('dialog[open]')) return;
+  e.preventDefault();
+  closeKeyDrawer();
+});
 
 $('key-search').addEventListener('input', debounce(() => {
   keysView.search = $('key-search').value.trim();
@@ -1455,17 +1525,24 @@ $('key-search').addEventListener('input', debounce(() => {
   refreshKeys().catch(e => toast(e.message, 'err'));
 }, 350));
 $('key-search').addEventListener('keydown', e => { if (e.key === 'Enter') e.preventDefault(); });
-const keyStatusSel = new Select('key-status', [
-  { value: '', label: '全部状态' },
-  { value: 'active', label: '启用中' },
-  { value: 'disabled', label: '已禁用' },
-  { value: 'revoked', label: '已撤销' },
-  { value: 'expired', label: '已过期' },
-], v => {
-  keysView.status = v;
+// 状态筛选 chips：与 STATUS_META 的文案保持一致
+const KEY_STATUS_CHIPS = [
+  ['', '全部'], ['active', '启用中'], ['disabled', '已禁用'], ['revoked', '已撤销'], ['expired', '已过期'],
+];
+function renderStatusChips() {
+  $('key-status-chips').innerHTML = KEY_STATUS_CHIPS.map(([v, label]) =>
+    '<button type="button" class="ky-chip' + (keysView.status === v ? ' on' : '') + '"'
+    + ' data-v="' + v + '" aria-pressed="' + (keysView.status === v) + '">' + label + '</button>').join('');
+}
+$('key-status-chips').addEventListener('click', e => {
+  const b = e.target.closest('button[data-v]');
+  if (!b || b.dataset.v === keysView.status) return;
+  keysView.status = b.dataset.v;
   keysView.page = 0;
+  renderStatusChips();
   applyKeyFilter();
-}, { value: '', head: '按状态过滤' });
+});
+renderStatusChips();
 const keyCallerSel = new Select('key-caller', [{ value: '', label: '全部 caller' }], v => {
   keysView.caller = v;
   keysView.page = 0;

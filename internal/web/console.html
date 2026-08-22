@@ -132,28 +132,33 @@
 
 <!-- ── 密钥 ─────────────────────────────────────────────────────── -->
 <section class="view" id="view-keys" role="tabpanel" aria-labelledby="tab-keys" hidden>
-  <article class="panel">
-    <div class="panel-head">
-      <div><h2 class="panel-title">插件密钥</h2><p class="panel-sub" id="key-count">—</p></div>
+  <article class="panel ky-panel">
+    <header class="ky-head">
+      <div class="ky-heading">
+        <h2 class="ky-title">密钥</h2>
+        <p class="panel-sub" id="key-count">—</p>
+      </div>
       <button type="button" class="btn primary" id="key-issue-btn">
         <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
         <span>签发密钥</span>
       </button>
-    </div>
+    </header>
     <div class="keys-toolbar">
-      <input class="btn input" id="key-search" type="search" placeholder="搜索 kid 或标签" spellcheck="false" aria-label="搜索密钥">
-      <div class="sel" id="key-caller" data-label="按 caller 过滤"></div>
-      <div class="sel" id="key-status" data-label="按状态过滤"></div>
-    </div>
-    <div class="km-split">
-      <div class="km-side">
-        <div class="km-list" id="key-rows" role="listbox" aria-label="密钥列表"></div>
-        <div class="pager" id="key-pager"></div>
+      <div class="ky-search">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="key-search" type="search" placeholder="搜索标签或 kid…" spellcheck="false" aria-label="搜索密钥">
       </div>
-      <div class="km-detail" id="key-detail" aria-live="polite"></div>
+      <div class="sel" id="key-caller" data-label="按 caller 过滤"></div>
+      <div class="ky-chips" id="key-status-chips" role="group" aria-label="按状态过滤"></div>
     </div>
+    <div class="ky-grid" id="key-rows" role="list" aria-label="密钥列表"></div>
+    <nav class="pager" id="key-pager"></nav>
   </article>
 </section>
+
+<!-- 密钥详情抽屉（右侧滑出） -->
+<div class="ky-backdrop" id="kd-backdrop" hidden></div>
+<aside class="ky-drawer" id="key-drawer" role="dialog" aria-modal="true" aria-label="密钥详情" hidden></aside>
 
 <!-- ── 用量 ─────────────────────────────────────────────────────── -->
 <section class="view" id="view-usage" role="tabpanel" aria-labelledby="tab-usage" hidden>
