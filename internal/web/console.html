@@ -145,8 +145,13 @@
       <div class="sel" id="key-caller" data-label="按 caller 过滤"></div>
       <div class="sel" id="key-status" data-label="按状态过滤"></div>
     </div>
-    <div class="key-grid" id="key-rows" role="list" aria-label="密钥列表"></div>
-    <div class="pager" id="key-pager"></div>
+    <div class="km-split">
+      <div class="km-side">
+        <div class="km-list" id="key-rows" role="listbox" aria-label="密钥列表"></div>
+        <div class="pager" id="key-pager"></div>
+      </div>
+      <div class="km-detail" id="key-detail" aria-live="polite"></div>
+    </div>
   </article>
 </section>
 

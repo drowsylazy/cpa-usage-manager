@@ -1226,7 +1226,11 @@ $('trend-view').addEventListener('click', e => {
 window.addEventListener('resize', debounce(() => { if (activeTab === 'overview') renderTrend(); }, 200));
 
 // ---------- 密钥 ----------
-const keysView = { cache: [], filtered: [], page: 0, size: 20, search: '', caller: '', status: '' };
+const keysView = {
+  cache: [], filtered: [], page: 0, size: 20, search: '', caller: '', status: '',
+  selectedKid: '',  // 右栏详情当前展示的密钥
+  balanceSeq: 0,    // 余额异步响应的竞态守卫：快速切换选中时丢弃晚到的旧响应
+};
 // keyLabelOf 由 kid 查密钥标签；无标签或缓存未热时返回空串，由调用方决定回落值。
 function keyLabelOf(kid) {
   const k = keysView.cache.find(x => x.kid === kid);
@@ -1282,15 +1286,6 @@ function cycleKeysNow(d = new Date()) {
 function todaySpent(k) {
   return k.daily_cycle_key === cycleKeysNow().daily ? k.daily_spent_micro_usd : 0;
 }
-function meterHTML(spent, limit) {
-  if (!limit || limit <= 0) return '<span class="pill mono">不限</span>';
-  const pct = Math.min(100, spent / limit * 100);
-  const state = pct >= 95 ? 'alarm' : pct >= 80 ? 'warn' : '';
-  return '<div class="meter slim" data-state="' + state + '">'
-    + '<div class="meter-track"><div class="meter-fill" style="width:' + pct.toFixed(1) + '%"></div></div>'
-    + '<div class="meter-readout"><span>' + pct.toFixed(0) + '%</span><b>'
-    + fmtUSD(spent) + ' / ' + fmtUSD(limit) + '</b></div></div>';
-}
 // balRow dialog 配额清单的一行：名称 + 单条进度 + 「余 X / 上限」，对齐排布。
 // limit 未设显示不限；余量缺失显示 — 而非伪装成额度耗尽。
 function balRow(name, limit, remain, fmt) {
@@ -1311,34 +1306,6 @@ function balRow(name, limit, remain, fmt) {
     + '<span class="bal-bar"><span style="width:' + pct.toFixed(1) + '%"></span></span>'
     + '<span class="bal-val mono">余 ' + fmt(Math.max(0, remain)) + ' / ' + fmt(limit) + '</span></div>';
 }
-// tokMeterHTML 密钥表的 token 额度列。
-// 优先展示总量档；只配了周期档时退回显示该档，避免整列空着看不出配了限额。
-function tokMeterHTML(k) {
-  const pick = [
-    ['token_limit', 'tokens_used', ''],
-    ['daily_token_limit', 'daily_tokens_used', '日'],
-    ['weekly_token_limit', 'weekly_tokens_used', '周'],
-    ['monthly_token_limit', 'monthly_tokens_used', '月'],
-  ].find(([lf]) => k[lf] !== null && k[lf] !== undefined);
-  if (!pick) return '<span class="pill mono">不限</span>';
-  const [limitField, usedField, tag] = pick;
-  const limit = Number(k[limitField]) || 0;
-  // 周期档需判断 cycle_key 是否当期，跨期则已用归零（与后端同口径）
-  let used = Number(k[usedField]) || 0;
-  if (tag) {
-    const cyc = cycleKeysNow();
-    const keyOf = { 日: k.daily_cycle_key, 周: k.weekly_cycle_key, 月: k.monthly_cycle_key }[tag];
-    const curOf = { 日: cyc.daily, 周: cyc.weekly, 月: cyc.monthly }[tag];
-    if (keyOf !== curOf) used = 0;
-  }
-  if (limit <= 0) return '<span class="pill mono">不限</span>';
-  const pct = Math.min(100, used / limit * 100);
-  const state = pct >= 95 ? 'alarm' : pct >= 80 ? 'warn' : '';
-  return '<div class="meter slim" data-state="' + state + '">'
-    + '<div class="meter-track"><div class="meter-fill" style="width:' + pct.toFixed(1) + '%"></div></div>'
-    + '<div class="meter-readout"><span>' + (tag || '总') + ' ' + pct.toFixed(0) + '%</span><b>'
-    + fmtTok(used) + ' / ' + fmtTok(limit) + '</b></div></div>';
-}
 function renderKeys() {
   const list = keysView.filtered;
   const totalAll = keysView.cache.length;
@@ -1346,25 +1313,27 @@ function renderKeys() {
     + (list.length !== totalAll ? ' · 筛选后 ' + list.length + ' 枚' : '');
   const start = keysView.page * keysView.size;
   const rows = list.slice(start, start + keysView.size);
+  // 选中项不在当前可见集合（翻页/筛选/删除后）时，自动选中第一条，
+  // 保证右栏详情始终有内容。
+  if (!rows.some(k => k.kid === keysView.selectedKid)) {
+    keysView.selectedKid = rows.length ? rows[0].kid : '';
+  }
   $('key-rows').innerHTML = rows.map(k => {
     const meta = STATUS_META[keyStatus(k)];
-    const conc = k.max_concurrent_requests > 0 ? '≤ ' + k.max_concurrent_requests : '不限';
-    return '<button type="button" class="key-card" data-kid="' + esc(k.kid) + '" title="查看详情">'
-      + '<span class="kc-top"><span class="pill ' + meta.pill + '">' + meta.label + '</span>'
-      + '<span class="kc-last">最近使用: ' + esc(rel(k.last_used_at)) + '</span></span>'
-      + '<span class="kc-label" title="' + esc(k.label || '') + '">' + (k.label ? esc(k.label) : '<i>无标签</i>') + '</span>'
-      + '<span class="kc-kid mono">' + esc(k.kid) + '</span>'
-      + '<span class="kc-meters">'
-      + '<span class="kc-meter-block"><span class="kc-meter-label">金额额度</span>' + meterHTML(k.spent_micro_usd, k.quota_micro_usd) + '</span>'
-      + '<span class="kc-meter-block"><span class="kc-meter-label">Token 额度</span>' + tokMeterHTML(k) + '</span>'
-      + '</span>'
-      + '<span class="kc-meta"><span class="mono">' + esc(k.caller_id) + '</span>'
-      + '<span>已用 <b>' + fmtUSD(k.spent_micro_usd) + '</b></span>'
-      + '<span>今日 <b>' + fmtUSD(todaySpent(k)) + '</b></span>'
-      + '<span>并发 <b>' + conc + '</b></span></span>'
-      + '</button>';
+    const sel = k.kid === keysView.selectedKid;
+    // 左栏迷你读数：设了金额上限显示「已用/上限」，否则只报已用。
+    const spentLine = k.quota_micro_usd && k.quota_micro_usd > 0
+      ? fmtUSD(k.spent_micro_usd) + ' / ' + fmtUSD(k.quota_micro_usd)
+      : '已用 ' + fmtUSD(k.spent_micro_usd);
+    return '<div class="km-item" data-kid="' + esc(k.kid) + '" role="option"'
+      + ' aria-selected="' + sel + '" tabindex="0">'
+      + '<span class="km-dot" data-state="' + keyStatus(k) + '" title="' + meta.label + '"></span>'
+      + '<span class="km-main">'
+      + '<span class="km-label">' + (k.label ? esc(k.label) : '<i>无标签</i>') + '</span>'
+      + '<span class="km-sub">' + spentLine + '</span>'
+      + '</span></div>';
   }).join('')
-    || '<div class="empty" style="grid-column:1/-1"><p class="empty-title">没有匹配的密钥</p>'
+    || '<div class="empty"><p class="empty-title">没有匹配的密钥</p>'
     + '<p class="empty-hint">调整筛选条件，或点击右上角「签发密钥」</p></div>';
 
   const pages = Math.max(1, Math.ceil(list.length / keysView.size));
@@ -1376,59 +1345,64 @@ function renderKeys() {
   const prev = $('key-prev'), next = $('key-next');
   if (prev) prev.onclick = () => { keysView.page--; renderKeys(); };
   if (next) next.onclick = () => { keysView.page++; renderKeys(); };
+
+  const selected = rows.find(k => k.kid === keysView.selectedKid);
+  if (selected) renderKeyDetail(selected);
+  else $('key-detail').innerHTML =
+    '<div class="empty"><p class="empty-title">未选择密钥</p>'
+    + '<p class="empty-hint">在左侧列表中选择一枚密钥查看余额与操作</p></div>';
 }
 
-// keyDetailSheet 点卡片弹出详情 dialog：密钥信息、余额仪表与全部操作集中一处。
-function keyDetailSheet(k) {
+// renderKeyDetail 右栏常驻详情：头部、facts、余额配额清单、操作按钮。
+// balanceSeq 守卫：快速切换选中时，晚返回的旧余额不得覆盖新选中项的面板。
+function renderKeyDetail(k) {
   const kid = k.kid;
   const st = keyStatus(k);
-  openSheet({
-    title: k.label || ('密钥 ' + kid),
-    okText: '关闭', noFocus: true,
-    body: (() => {
-      const meta = STATUS_META[st];
-      const conc = k.max_concurrent_requests > 0 ? '≤ ' + k.max_concurrent_requests : '不限';
-      return '<div class="detail-head"><span class="pill ' + meta.pill + '">' + meta.label + '</span>'
-        + '<span class="mono kid-line">' + esc(kid) + '</span>'
-        + '<span class="grow"></span><span class="note">最近使用: ' + esc(rel(k.last_used_at))
-        + ' · 并发 ' + conc + '</span></div>'
-        + '<div class="detail-facts">'
-        + fact('caller', k.caller_id || '-')
-        + fact('principal', k.principal || '-')
-        + fact('额度口径', k.caller_scope === 'key' ? '独立计额' : '归属 caller')
-        + fact('过期时间', k.expires_at ? fmtDT(k.expires_at) : '永不')
-        + fact('创建于', fmtDT(k.created_at))
-        + fact('周期计数', (k.daily_cycle_key || '-') + ' / ' + (k.weekly_cycle_key || '-') + ' / ' + (k.monthly_cycle_key || '-'))
-        + fact('指纹', k.fingerprint || '-')
-        + fact('可用模型', (k.allowed_models && k.allowed_models.length) ? k.allowed_models.join(', ') : '不限制')
-        + '</div>'
-        + '<div class="bal-wrap" id="kd-meters"><p class="note">余额核算中…</p></div>'
-        + '<div class="btn-row">'
-        + '<button type="button" class="btn small" data-act="edit">编辑</button>'
-        + '<button type="button" class="btn small" data-act="rotate">轮换</button>'
-        + '<button type="button" class="btn small" data-act="reveal">查看明文</button>'
-        + (st !== 'revoked' ? '<button type="button" class="btn small danger" data-act="revoke">撤销</button>' : '')
-        + '<button type="button" class="btn small danger" data-act="delete">删除</button>'
-        + '</div>';
-    })(),
-  });
-  // 操作按钮在弹窗内容就位后接线；撤销按钮按状态显隐。
-  const wire = act => $('sheet-body').querySelector('[data-act="' + act + '"]');
-  const editBtn = wire('edit'), rotateBtn = wire('rotate'), revealBtn = wire('reveal');
-  const revokeBtn = wire('revoke'), deleteBtn = wire('delete');
-  if (editBtn) editBtn.onclick = () => editKeySheet(k);
-  if (rotateBtn) rotateBtn.onclick = () => rotateSheet(kid);
-  if (revealBtn) revealBtn.onclick = () => revealSheet(kid);
-  if (revokeBtn) revokeBtn.onclick = () => confirmSheet('撤销密钥 ' + kid,
+  const meta = STATUS_META[st];
+  const conc = k.max_concurrent_requests > 0 ? '≤ ' + k.max_concurrent_requests : '不限';
+  $('key-detail').innerHTML =
+    '<div class="detail-head">'
+    + '<span class="kd-title">' + (k.label ? esc(k.label) : '<i>无标签</i>') + '</span>'
+    + '<span class="pill ' + meta.pill + '">' + meta.label + '</span>'
+    + '<span class="grow"></span>'
+    + '<span class="note">最近使用: ' + esc(rel(k.last_used_at)) + '</span></div>'
+    + '<div class="kd-kidline mono">' + esc(kid) + ' · caller ' + esc(k.caller_id || '-')
+    + ' · 并发 ' + conc + '</div>'
+    + '<div class="detail-facts">'
+    + fact('principal', k.principal || '-')
+    + fact('额度口径', k.caller_scope === 'key' ? '独立计额' : '归属 caller')
+    + fact('过期时间', k.expires_at ? fmtDT(k.expires_at) : '永不')
+    + fact('创建于', fmtDT(k.created_at))
+    + fact('周期计数', (k.daily_cycle_key || '-') + ' / ' + (k.weekly_cycle_key || '-') + ' / ' + (k.monthly_cycle_key || '-'))
+    + fact('指纹', k.fingerprint || '-')
+    + fact('可用模型', (k.allowed_models && k.allowed_models.length) ? k.allowed_models.join(', ') : '不限制')
+    + '</div>'
+    + '<div class="bal-wrap" id="kd-meters"><p class="note">余额核算中…</p></div>'
+    + '<div class="btn-row">'
+    + '<button type="button" class="btn small" data-act="edit">编辑</button>'
+    + '<button type="button" class="btn small" data-act="rotate">轮换</button>'
+    + '<button type="button" class="btn small" data-act="reveal">查看明文</button>'
+    + (st !== 'revoked' ? '<button type="button" class="btn small danger" data-act="revoke">撤销</button>' : '')
+    + '<button type="button" class="btn small danger" data-act="delete">删除</button>'
+    + '</div>';
+
+  const wire = act => $('key-detail').querySelector('[data-act="' + act + '"]');
+  wire('edit').onclick = () => editKeySheet(k);
+  wire('rotate').onclick = () => rotateSheet(kid);
+  wire('reveal').onclick = () => revealSheet(kid);
+  const rv = wire('revoke');
+  if (rv) rv.onclick = () => confirmSheet('撤销密钥 ' + kid,
     '撤销不可逆，该 Key 将立即无法通过鉴权。历史用量保留。',
     () => post('/keys/revoke', { kid, actor: 'console' }).then(refreshKeys));
-  if (deleteBtn) deleteBtn.onclick = () => confirmSheet('删除密钥 ' + kid,
+  wire('delete').onclick = () => confirmSheet('删除密钥 ' + kid,
     '永久删除该 Key（历史用量保留）。操作不可逆。',
     () => post('/keys/delete', { kid, actor: 'console' }).then(refreshKeys));
 
+  const seq = ++keysView.balanceSeq;
   api('/balance?key_id=' + encodeURIComponent(kid)).then(b => {
+    if (seq !== keysView.balanceSeq || keysView.selectedKid !== kid) return;
     const wrap = $('kd-meters');
-    if (!wrap) return; // 用户已关闭弹窗
+    if (!wrap) return;
     // 只有配了 token 限额的 Key 才显示 token 那组配额，避免未用该功能的 Key
     // 详情里多出四行「不限」的空清单。
     const hasTok = [k.token_limit, k.daily_token_limit, k.weekly_token_limit, k.monthly_token_limit]
@@ -1456,11 +1430,24 @@ function keyDetailSheet(k) {
 }
 
 $('key-rows').addEventListener('click', e => {
-  const card = e.target.closest('.key-card');
-  if (!card) return;
-  const k = keysView.cache.find(x => x.kid === card.dataset.kid);
-  if (k) keyDetailSheet(k);
+  const item = e.target.closest('.km-item');
+  if (!item) return;
+  keysView.selectedKid = item.dataset.kid;
+  syncSelection();
+  const k = keysView.cache.find(x => x.kid === keysView.selectedKid);
+  if (k) renderKeyDetail(k);
 });
+$('key-rows').addEventListener('keydown', e => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const item = e.target.closest('.km-item');
+  if (!item || e.target !== item) return;
+  e.preventDefault();
+  item.click();
+});
+function syncSelection() {
+  [...document.querySelectorAll('#key-rows .km-item')].forEach(el =>
+    el.setAttribute('aria-selected', String(el.dataset.kid === keysView.selectedKid)));
+}
 
 $('key-search').addEventListener('input', debounce(() => {
   keysView.search = $('key-search').value.trim();
