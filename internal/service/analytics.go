@@ -232,6 +232,13 @@ type Balance struct {
 	Monthly    *money.Micro `json:"monthly_remaining_micro_usd,omitempty"`
 	Held       money.Micro  `json:"held_micro_usd"`
 	Concurrent int64        `json:"concurrent"`
+
+	// Token 余量；nil 表示该档未设限。口径与费用一致（计费四类合计）。
+	TotalTokens   *int64 `json:"total_remaining_tokens,omitempty"`
+	DailyTokens   *int64 `json:"daily_remaining_tokens,omitempty"`
+	WeeklyTokens  *int64 `json:"weekly_remaining_tokens,omitempty"`
+	MonthlyTokens *int64 `json:"monthly_remaining_tokens,omitempty"`
+	HeldTokens    int64  `json:"held_tokens"`
 }
 
 func (s *Service) Balance(ctx context.Context, kid string, now time.Time) (Balance, error) {
@@ -245,13 +252,14 @@ func (s *Service) Balance(ctx context.Context, kid string, now time.Time) (Balan
 	cy := store.CyclesFor(now)
 	var held int64
 	var concurrent int64
+	var heldTokens int64
 	err = s.st.Read(ctx, func(q store.Querier) error {
-		return q.QueryRowContext(ctx, `SELECT COALESCE(SUM(held_micro_usd),0),COUNT(*) FROM reservations WHERE key_id=? AND status='held'`, kid).Scan(&held, &concurrent)
+		return q.QueryRowContext(ctx, `SELECT COALESCE(SUM(held_micro_usd),0),COUNT(*),COALESCE(SUM(reserved_tokens),0) FROM reservations WHERE key_id=? AND status='held'`, kid).Scan(&held, &concurrent, &heldTokens)
 	})
 	if err != nil {
 		return Balance{}, err
 	}
-	out := Balance{KeyID: kid, Held: money.Micro(held), Concurrent: concurrent}
+	out := Balance{KeyID: kid, Held: money.Micro(held), Concurrent: concurrent, HeldTokens: heldTokens}
 	remain := func(limit *money.Micro, spent money.Micro) *money.Micro {
 		if limit == nil {
 			return nil
@@ -269,5 +277,23 @@ func (s *Service) Balance(ctx context.Context, kid string, now time.Time) (Balan
 	out.Daily = remain(k.DailyMicroUSD, cycle(k.DailyCycleKey, cy.Daily, k.DailySpentMicroUSD)+out.Held)
 	out.Weekly = remain(k.WeeklyMicroUSD, cycle(k.WeeklyCycleKey, cy.Weekly, k.WeeklySpentMicroUSD)+out.Held)
 	out.Monthly = remain(k.MonthlyMicroUSD, cycle(k.MonthlyCycleKey, cy.Monthly, k.MonthlySpentMicroUSD)+out.Held)
+	// Token 余量：与金额同构（已用 + 在途预占 一并扣除）
+	remainTok := func(limit *int64, used int64) *int64 {
+		if limit == nil {
+			return nil
+		}
+		v := *limit - used
+		return &v
+	}
+	cycleTok := func(stored, current string, v int64) int64 {
+		if stored != current {
+			return 0
+		}
+		return v
+	}
+	out.TotalTokens = remainTok(k.TokenLimit, k.TokensUsed+heldTokens)
+	out.DailyTokens = remainTok(k.DailyTokenLimit, cycleTok(k.DailyCycleKey, cy.Daily, k.DailyTokensUsed)+heldTokens)
+	out.WeeklyTokens = remainTok(k.WeeklyTokenLimit, cycleTok(k.WeeklyCycleKey, cy.Weekly, k.WeeklyTokensUsed)+heldTokens)
+	out.MonthlyTokens = remainTok(k.MonthlyTokenLimit, cycleTok(k.MonthlyCycleKey, cy.Monthly, k.MonthlyTokensUsed)+heldTokens)
 	return out, nil
 }

@@ -418,13 +418,12 @@ func keyCSVRow(k KeySummary) []string {
 }
 
 var pricingCSVHeader = []string{"id", "match_kind", "pattern", "priority", "enabled",
-	"price_input", "price_output", "price_reasoning", "price_cached", "price_cache_read",
+	"price_input", "price_output", "price_cache_read",
 	"price_cache_creation", "accounting_mode", "billing_mode", "per_image_usd", "source", "models_dev_id"}
 
 func pricingCSVRow(r store.PricingRule) []string {
 	return []string{itoa(r.ID), r.MatchKind, r.Pattern, strconv.Itoa(r.Priority), strconv.FormatBool(r.Enabled),
 		r.PriceInput.USDPerMillionString(), r.PriceOutput.USDPerMillionString(),
-		r.PriceReasoning.USDPerMillionString(), r.PriceCached.USDPerMillionString(),
 		r.PriceCacheRead.USDPerMillionString(), r.PriceCacheCreation.USDPerMillionString(),
 		r.AccountingMode, r.BillingMode, r.PerImageMicroUSD.USDString(), r.Source, r.ModelsDevID}
 }

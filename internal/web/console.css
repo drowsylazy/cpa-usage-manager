@@ -321,7 +321,10 @@ h1,h2,h3,p{margin:0}
 .meter-readout b{font-family:var(--mono);font-weight:650;color:var(--fg);font-variant-numeric:tabular-nums}
 .meter.slim .meter-track{height:6px}
 .meter.slim .meter-readout{font-size:10.5px}
-.meter-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+/* 额度仪表容器。分组模式（金额组 / Token 组）下每组占一列，
+   组内四个周期表盘纵向排列，同口径的读数因此能上下对齐比较。 */
+.meter-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}
+.meter-grid>.note{grid-column:1/-1}
 
 /* ── 表格 ─────────────────────────────────────────────────────── */
 .table-wrap{overflow:auto;max-height:none}
@@ -507,6 +510,32 @@ tr.detail>td{background:var(--sunken);padding:14px 16px;white-space:normal;borde
 .sheet-note{flex:1;color:var(--fg3);font-size:11.5px}
 .form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
 .form-grid .wide{grid-column:1/-1}
+/* 表单分组小标题：把「金额限额」与「Token 限额」两组视觉隔开，
+   否则 8 个「日/周/月限额」输入框排在一起分不清哪组是哪个口径。 */
+.form-sep{
+  grid-column:1/-1;margin-top:4px;padding-bottom:5px;border-bottom:1px solid var(--line);
+  color:var(--fg2);font-size:11.5px;font-weight:700;letter-spacing:.02em;
+}
+.form-sep:first-child{margin-top:0}
+
+/* ⓘ 说明徽标：术语解释走原生 title（零依赖、可访问性由浏览器保证、
+   移动端长按亦可见）。表头与字段标签共用。 */
+.info{
+  display:inline-grid;place-items:center;width:13px;height:13px;margin-left:4px;
+  border:1px solid var(--line3);border-radius:50%;
+  color:var(--fg3);font:600 9px/1 var(--mono);
+  cursor:help;vertical-align:1px;text-transform:none;letter-spacing:0;
+  transition:border-color .14s ease,color .14s ease;
+}
+.info:hover,.info:focus-visible{border-color:var(--signal);color:var(--signal)}
+table.data th .info{vertical-align:0}
+
+/* 详情里的额度仪表分组（金额一组、Token 一组） */
+.meter-group{display:grid;gap:10px;align-content:start}
+.meter-group-head{
+  color:var(--fg2);font-size:11px;font-weight:700;letter-spacing:.04em;
+  padding-bottom:2px;border-bottom:1px solid var(--line);
+}
 .secret{
   display:grid;gap:8px;padding:12px;border-radius:10px;
   background:var(--signal-soft);border:1px solid var(--signal);

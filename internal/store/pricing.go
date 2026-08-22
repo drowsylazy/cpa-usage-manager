@@ -14,7 +14,7 @@ import (
 
 // pricingColumns 是 pricing_rules 表的完整列清单。
 const pricingColumns = `id, match_kind, pattern, priority, enabled,
-	price_input, price_output, price_reasoning, price_cached,
+	price_input, price_output,
 	price_cache_read, price_cache_creation,
 	accounting_mode, billing_mode, per_image_micro_usd,
 	source, models_dev_id, created_at, updated_at`
@@ -24,10 +24,10 @@ func scanPricingRule(sc interface{ Scan(...any) error }) (PricingRule, error) {
 	var r PricingRule
 	var enabled int
 	var created, updated int64
-	var in, out, reason, cached, cacheRead, cacheCreate, perImage int64
+	var in, out, cacheRead, cacheCreate, perImage int64
 	err := sc.Scan(
 		&r.ID, &r.MatchKind, &r.Pattern, &r.Priority, &enabled,
-		&in, &out, &reason, &cached, &cacheRead, &cacheCreate,
+		&in, &out, &cacheRead, &cacheCreate,
 		&r.AccountingMode, &r.BillingMode, &perImage,
 		&r.Source, &r.ModelsDevID, &created, &updated,
 	)
@@ -37,8 +37,6 @@ func scanPricingRule(sc interface{ Scan(...any) error }) (PricingRule, error) {
 	r.Enabled = enabled != 0
 	r.PriceInput = money.Price(in)
 	r.PriceOutput = money.Price(out)
-	r.PriceReasoning = money.Price(reason)
-	r.PriceCached = money.Price(cached)
 	r.PriceCacheRead = money.Price(cacheRead)
 	r.PriceCacheCreation = money.Price(cacheCreate)
 	r.PerImageMicroUSD = money.Micro(perImage)
@@ -128,8 +126,6 @@ func (s *Store) UpsertPricingRule(ctx context.Context, r PricingRule) (PricingRu
 						enabled              = ?,
 						price_input          = ?,
 						price_output         = ?,
-						price_reasoning      = ?,
-						price_cached         = ?,
 						price_cache_read     = ?,
 						price_cache_creation = ?,
 						accounting_mode      = ?,
@@ -140,7 +136,7 @@ func (s *Store) UpsertPricingRule(ctx context.Context, r PricingRule) (PricingRu
 						updated_at           = ?
 					WHERE id = ?`,
 					r.Priority, boolInt(r.Enabled),
-					int64(r.PriceInput), int64(r.PriceOutput), int64(r.PriceReasoning), int64(r.PriceCached),
+					int64(r.PriceInput), int64(r.PriceOutput),
 					int64(r.PriceCacheRead), int64(r.PriceCacheCreation),
 					r.AccountingMode, r.BillingMode, int64(r.PerImageMicroUSD),
 					r.Source, r.ModelsDevID, now, r.ID); e != nil {
@@ -156,18 +152,16 @@ func (s *Store) UpsertPricingRule(ctx context.Context, r PricingRule) (PricingRu
 		_, err := tx.ExecContext(ctx,
 			`INSERT INTO pricing_rules (
 				match_kind, pattern, priority, enabled,
-				price_input, price_output, price_reasoning, price_cached,
+				price_input, price_output,
 				price_cache_read, price_cache_creation,
 				accounting_mode, billing_mode, per_image_micro_usd,
 				source, models_dev_id, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(match_kind, pattern) DO UPDATE SET
 				priority             = excluded.priority,
 				enabled              = excluded.enabled,
 				price_input          = excluded.price_input,
 				price_output         = excluded.price_output,
-				price_reasoning      = excluded.price_reasoning,
-				price_cached         = excluded.price_cached,
 				price_cache_read     = excluded.price_cache_read,
 				price_cache_creation = excluded.price_cache_creation,
 				accounting_mode      = excluded.accounting_mode,
@@ -177,7 +171,7 @@ func (s *Store) UpsertPricingRule(ctx context.Context, r PricingRule) (PricingRu
 				models_dev_id        = excluded.models_dev_id,
 				updated_at           = excluded.updated_at`,
 			r.MatchKind, r.Pattern, r.Priority, boolInt(r.Enabled),
-			int64(r.PriceInput), int64(r.PriceOutput), int64(r.PriceReasoning), int64(r.PriceCached),
+			int64(r.PriceInput), int64(r.PriceOutput),
 			int64(r.PriceCacheRead), int64(r.PriceCacheCreation),
 			r.AccountingMode, r.BillingMode, int64(r.PerImageMicroUSD),
 			r.Source, r.ModelsDevID, now, now)
@@ -359,18 +353,16 @@ func (s *Store) ReplaceModelsDevRules(ctx context.Context, rules []PricingRule, 
 		stmt, perr := tx.PrepareContext(ctx,
 			`INSERT INTO pricing_rules (
 				match_kind, pattern, priority, enabled,
-				price_input, price_output, price_reasoning, price_cached,
+				price_input, price_output,
 				price_cache_read, price_cache_creation,
 				accounting_mode, billing_mode, per_image_micro_usd,
 				source, models_dev_id, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(match_kind, pattern) DO UPDATE SET
 				priority             = excluded.priority,
 				enabled              = excluded.enabled,
 				price_input          = excluded.price_input,
 				price_output         = excluded.price_output,
-				price_reasoning      = excluded.price_reasoning,
-				price_cached         = excluded.price_cached,
 				price_cache_read     = excluded.price_cache_read,
 				price_cache_creation = excluded.price_cache_creation,
 				accounting_mode      = excluded.accounting_mode,
@@ -401,7 +393,7 @@ func (s *Store) ReplaceModelsDevRules(ctx context.Context, rules []PricingRule, 
 			}
 			if _, eerr := stmt.ExecContext(ctx,
 				r.MatchKind, r.Pattern, r.Priority, boolInt(r.Enabled),
-				int64(r.PriceInput), int64(r.PriceOutput), int64(r.PriceReasoning), int64(r.PriceCached),
+				int64(r.PriceInput), int64(r.PriceOutput),
 				int64(r.PriceCacheRead), int64(r.PriceCacheCreation),
 				r.AccountingMode, r.BillingMode, int64(r.PerImageMicroUSD),
 				PricingSourceModelsDev, r.ModelsDevID, ts, ts); eerr != nil {

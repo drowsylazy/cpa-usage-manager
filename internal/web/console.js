@@ -27,6 +27,19 @@ function fmtTok(n) {
   if (a >= 999.5) return dec(n / 1e3) + 'K';
   return String(n);
 }
+// parseTokens 解析 token 数输入，接受 1000 / 1k / 1.5m / 2b 与含千分位逗号的写法。
+// 空串返回 null（表示不限），非法输入抛错由调用方转成提示。
+function parseTokens(raw) {
+  const s = String(raw ?? '').trim().replace(/[,，\s_]/g, '');
+  if (!s) return null;
+  const m = /^(\d+(?:\.\d+)?)([kKmMbB])?$/.exec(s);
+  if (!m) throw new Error('Token 限额格式非法：' + raw + '（可写 500000 或 500k / 1.5m）');
+  const mult = { k: 1e3, m: 1e6, b: 1e9 }[(m[2] || '').toLowerCase()] || 1;
+  const n = Math.round(parseFloat(m[1]) * mult);
+  if (!Number.isFinite(n) || n < 0) throw new Error('Token 限额必须为非负整数');
+  if (!Number.isSafeInteger(n)) throw new Error('Token 限额过大');
+  return n;
+}
 function fmtUSD(micro) {
   if (micro === null || micro === undefined) return '不限';
   const v = (Number(micro) || 0) / 1e6, neg = v < 0, a = Math.abs(v);
@@ -601,6 +614,41 @@ function staySheet(okText) {
 function fieldRow(label, inner, cls) {
   return '<label class="field ' + (cls || '') + '"><span class="field-label">' + label + '</span>' + inner + '</label>';
 }
+// infoTip 生成一个 ⓘ 徽标，鼠标悬浮/键盘聚焦显示说明。
+//
+// 面板里有若干术语对中文读者并不自明（「缓存写」「缓存读」「额度口径」等），
+// 它们背后是上游计费口径的差异，靠标题文字讲不清也不该占版面。用原生 title
+// 承载完整说明：零依赖、可访问性由浏览器保证、移动端长按亦可见。
+function infoTip(text) {
+  return '<span class="info" tabindex="0" role="img" aria-label="说明：' + esc(text) + '"'
+    + ' title="' + esc(text) + '">i</span>';
+}
+// labelWithTip 给字段标签追加 ⓘ 说明。
+function labelWithTip(label, tip) {
+  return esc(label) + infoTip(tip);
+}
+// TIPS 集中收拢术语解释，避免同一说明在多处漂移。
+const TIPS = {
+  cacheRead: '缓存读：命中上游提示词缓存的输入 token，单价通常远低于普通输入。'
+    + '两种上游口径已归一——Claude 的 cache_read_tokens 独立于输入，'
+    + 'OpenAI/Gemini 的 cached_tokens 含在输入内，取较大者避免重复计费。',
+  cacheWrite: '缓存写：为建立提示词缓存而写入的 token，只在首次或缓存失效时产生，'
+    + '单价通常高于普通输入（Claude 约为 1.25 倍）。后续命中即按「缓存读」计费。',
+  input: '输入：本次请求发送给模型的提示词 token（已扣除命中缓存的部分）。',
+  output: '输出：模型生成的 token。推理（thinking）token 也并入此项按输出价计费，'
+    + '因此无需单独设置推理价。',
+  tokenLimit: 'Token 限额与金额限额并列生效，任一触顶即拒绝请求。'
+    + '统计口径为计费四类合计（输入＋输出＋缓存读＋缓存写），与费用同一口径。'
+    + '混合模型时价差可达数十倍，用 token 约束用量比金额更精确。留空为不限。',
+  moneyLimit: '按实际结算金额扣减，跨周期自动归零。留空为不限。',
+  callerScope: '归属 caller 共享：额度与同一 caller 下的其他 Key 合并计算。'
+    + '独立计额：本 Key 单独一份额度，不受同伴影响。',
+  accountingMode: '缓存口径：inclusive 表示上游把缓存命中计入了输入总数（OpenAI/Gemini），'
+    + 'exclusive 表示缓存命中独立于输入（Claude）。default 按上游字段自动判断。',
+  billingMode: 'token 按 token 计价；per_image 按张计价（图像模型）；free 恒为免费。',
+  priority: '同一模型命中多条规则时，优先级数值大的先生效；相同优先级按 id 升序。',
+  matchKind: 'exact 完全匹配模型名；glob 支持 * 与 ? 通配；regexp 为正则匹配。',
+};
 function fact(name, value) {
   return '<dl class="fact"><dt>' + esc(name) + '</dt><dd>' + esc(value) + '</dd></dl>';
 }
@@ -1244,13 +1292,75 @@ function meterHTML(spent, limit) {
     + fmtUSD(spent) + ' / ' + fmtUSD(limit) + '</b></div></div>';
 }
 function remainMeter(name, limit, remain) {
-  const used = limit ? limit - Math.max(0, remain ?? 0) : 0;
-  const pct = limit ? Math.min(100, used / limit * 100) : 0;
-  const state = !limit ? 'idle' : pct >= 95 ? 'alarm' : pct >= 80 ? 'warn' : '';
+  if (!limit || limit <= 0) {
+    return '<div class="meter slim" data-state="idle">'
+      + '<div class="meter-track"><div class="meter-fill" style="width:0%"></div></div>'
+      + '<div class="meter-readout"><span>' + name + '</span><b>不限</b></div></div>';
+  }
+  // 设了上限但余量缺失，说明数据没取到（如字段名写错）。此时显示 "—" 而不是
+  // 静默按 0 处理 —— 后者会把「读不到数据」伪装成「额度已耗尽 100%」。
+  if (remain === null || remain === undefined) {
+    return '<div class="meter slim" data-state="idle">'
+      + '<div class="meter-track"><div class="meter-fill" style="width:0%"></div></div>'
+      + '<div class="meter-readout"><span>' + name + '</span><b title="余量数据缺失">—</b></div></div>';
+  }
+  const used = limit - Math.max(0, remain);
+  const pct = Math.min(100, Math.max(0, used / limit * 100));
+  const state = pct >= 95 ? 'alarm' : pct >= 80 ? 'warn' : '';
   return '<div class="meter slim" data-state="' + state + '">'
     + '<div class="meter-track"><div class="meter-fill" style="width:' + pct.toFixed(1) + '%"></div></div>'
     + '<div class="meter-readout"><span>' + name + '</span><b>'
-    + (limit ? '余 ' + fmtUSD(Math.max(0, remain ?? 0)) : '不限') + '</b></div></div>';
+    + '余 ' + fmtUSD(Math.max(0, remain)) + '</b></div></div>';
+}
+// remainTokMeter 与 remainMeter 同构，读数用 token 单位（K/M/B）而非金额。
+// limit 为 null/undefined 表示该档未设 token 限额。
+function remainTokMeter(name, limit, remain) {
+  const has = limit !== null && limit !== undefined && limit > 0;
+  if (!has) {
+    return '<div class="meter slim" data-state="idle">'
+      + '<div class="meter-track"><div class="meter-fill" style="width:0%"></div></div>'
+      + '<div class="meter-readout"><span>' + name + '</span><b>不限</b></div></div>';
+  }
+  if (remain === null || remain === undefined) {
+    return '<div class="meter slim" data-state="idle">'
+      + '<div class="meter-track"><div class="meter-fill" style="width:0%"></div></div>'
+      + '<div class="meter-readout"><span>' + name + '</span><b title="余量数据缺失">—</b></div></div>';
+  }
+  const used = limit - Math.max(0, remain);
+  const pct = Math.min(100, Math.max(0, used / limit * 100));
+  const state = pct >= 95 ? 'alarm' : pct >= 80 ? 'warn' : '';
+  return '<div class="meter slim" data-state="' + state + '">'
+    + '<div class="meter-track"><div class="meter-fill" style="width:' + pct.toFixed(1) + '%"></div></div>'
+    + '<div class="meter-readout"><span>' + name + '</span><b>'
+    + '余 ' + fmtTok(Math.max(0, remain)) + '</b></div></div>';
+}
+// tokMeterHTML 密钥表的 token 额度列。
+// 优先展示总量档；只配了周期档时退回显示该档，避免整列空着看不出配了限额。
+function tokMeterHTML(k) {
+  const pick = [
+    ['token_limit', 'tokens_used', ''],
+    ['daily_token_limit', 'daily_tokens_used', '日'],
+    ['weekly_token_limit', 'weekly_tokens_used', '周'],
+    ['monthly_token_limit', 'monthly_tokens_used', '月'],
+  ].find(([lf]) => k[lf] !== null && k[lf] !== undefined);
+  if (!pick) return '<span class="pill mono">不限</span>';
+  const [limitField, usedField, tag] = pick;
+  const limit = Number(k[limitField]) || 0;
+  // 周期档需判断 cycle_key 是否当期，跨期则已用归零（与后端同口径）
+  let used = Number(k[usedField]) || 0;
+  if (tag) {
+    const cyc = cycleKeysNow();
+    const keyOf = { 日: k.daily_cycle_key, 周: k.weekly_cycle_key, 月: k.monthly_cycle_key }[tag];
+    const curOf = { 日: cyc.daily, 周: cyc.weekly, 月: cyc.monthly }[tag];
+    if (keyOf !== curOf) used = 0;
+  }
+  if (limit <= 0) return '<span class="pill mono">不限</span>';
+  const pct = Math.min(100, used / limit * 100);
+  const state = pct >= 95 ? 'alarm' : pct >= 80 ? 'warn' : '';
+  return '<div class="meter slim" data-state="' + state + '">'
+    + '<div class="meter-track"><div class="meter-fill" style="width:' + pct.toFixed(1) + '%"></div></div>'
+    + '<div class="meter-readout"><span>' + (tag || '总') + ' ' + pct.toFixed(0) + '%</span><b>'
+    + fmtTok(used) + ' / ' + fmtTok(limit) + '</b></div></div>';
 }
 function renderKeys() {
   const list = keysView.filtered;
@@ -1269,13 +1379,14 @@ function renderKeys() {
       + '<td class="cell-mono">' + esc(k.caller_id) + '</td>'
       + '<td><span class="pill ' + meta.pill + '">' + meta.label + '</span></td>'
       + '<td class="w-meter">' + meterHTML(k.spent_micro_usd, k.quota_micro_usd) + '</td>'
+      + '<td class="w-meter">' + tokMeterHTML(k) + '</td>'
       + '<td class="num">' + fmtUSD(k.spent_micro_usd) + '</td>'
       + '<td class="num">' + fmtUSD(todaySpent(k)) + '</td>'
       + '<td class="num">' + conc + '</td>'
       + '<td class="cell-dim">' + esc(rel(k.last_used_at)) + '</td>'
       + '<td class="w-chev"><svg class="chev" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg></td></tr>';
   }).join('')
-    || '<tr><td colspan="9"><div class="empty"><p class="empty-title">没有匹配的密钥</p>'
+    || '<tr><td colspan="10"><div class="empty"><p class="empty-title">没有匹配的密钥</p>'
     + '<p class="empty-hint">调整筛选条件，或点击右上角「签发密钥」</p></div></td></tr>';
 
   const pages = Math.max(1, Math.ceil(list.length / keysView.size));
@@ -1306,7 +1417,7 @@ $('key-rows').addEventListener('click', async e => {
   const st = keyStatus(k);
   const dtr = document.createElement('tr');
   dtr.className = 'detail';
-  dtr.innerHTML = '<td colspan="9"><div class="detail-grid"><div class="detail-facts">'
+  dtr.innerHTML = '<td colspan="10"><div class="detail-grid"><div class="detail-facts">'
     + fact('指纹', k.fingerprint || '-')
     + fact('principal', k.principal || '-')
     + fact('额度口径', k.caller_scope === 'key' ? '独立计额' : '归属 caller')
@@ -1339,12 +1450,32 @@ $('key-rows').addEventListener('click', async e => {
     const b = await api('/balance?key_id=' + encodeURIComponent(kid));
     const box = $('kd-meters');
     if (!box) return;
+    // 只有配了 token 限额的 Key 才显示 token 那组仪表，避免未用该功能的 Key
+    // 详情里多出四个「不限」的空表盘。
+    const hasTok = [k.token_limit, k.daily_token_limit, k.weekly_token_limit, k.monthly_token_limit]
+      .some(v => v !== null && v !== undefined);
+    // 字段名必须与 service.Balance 的 JSON tag 一致。
+    // 既有缺陷：此处原读 b.total / b.daily / b.held，而接口返回的是
+    // total_remaining_micro_usd 等，全部 undefined → 金额表盘长期显示
+    // 「余 $0 / 100% alarm」（与同一行表格里的真实占用比矛盾）。
     box.innerHTML =
-      remainMeter('总额度', k.quota_micro_usd, b.total)
-      + remainMeter('今日', k.daily_micro_usd, b.daily)
-      + remainMeter('本周', k.weekly_micro_usd, b.weekly)
-      + remainMeter('本月', k.monthly_micro_usd, b.monthly)
-      + '<p class="note">在途预占 ' + fmtUSD(b.held) + ' · 并发 ' + b.concurrent
+      '<div class="meter-group"><div class="meter-group-head">金额额度（USD）</div>'
+      + remainMeter('总额度', k.quota_micro_usd, b.total_remaining_micro_usd)
+      + remainMeter('今日', k.daily_micro_usd, b.daily_remaining_micro_usd)
+      + remainMeter('本周', k.weekly_micro_usd, b.weekly_remaining_micro_usd)
+      + remainMeter('本月', k.monthly_micro_usd, b.monthly_remaining_micro_usd)
+      + '</div>'
+      + (hasTok
+        ? '<div class="meter-group"><div class="meter-group-head">Token 限额</div>'
+          + remainTokMeter('总量', k.token_limit, b.total_remaining_tokens)
+          + remainTokMeter('今日', k.daily_token_limit, b.daily_remaining_tokens)
+          + remainTokMeter('本周', k.weekly_token_limit, b.weekly_remaining_tokens)
+          + remainTokMeter('本月', k.monthly_token_limit, b.monthly_remaining_tokens)
+          + '</div>'
+        : '')
+      + '<p class="note">在途预占 ' + fmtUSD(b.held_micro_usd || 0)
+      + (hasTok ? ' / ' + fmtTok(b.held_tokens) + ' token' : '')
+      + ' · 并发 ' + b.concurrent
       + (k.max_concurrent_requests > 0 ? ' / ' + k.max_concurrent_requests : '')
       + ' · 当前周期 ' + cycleKeysNow().daily + '</p>';
   } catch (e) { /* 余额核算失败不打断详情 */ }
@@ -1398,18 +1529,27 @@ $('key-issue-btn').addEventListener('click', () => {
       + fieldRow('标签', '<input id="f-label" placeholder="如：张三的测试 Key">')
       + fieldRow('principal', '<input id="f-principal" placeholder="可选，属主标识">')
       + fieldRow('caller', '<select id="f-caller">' + callerOptionsHTML() + '</select>')
-      + fieldRow('额度口径', '<select id="f-scope"><option value="caller">归属 caller 共享</option><option value="key">独立计额</option></select>')
+      + fieldRow(labelWithTip('额度口径', TIPS.callerScope),
+        '<select id="f-scope"><option value="caller">归属 caller 共享</option><option value="key">独立计额</option></select>')
       + fieldRow('过期时间', '<input id="f-expires" type="datetime-local">')
       + fieldRow('最大并发', '<input id="f-conc" type="number" min="0" placeholder="0 为不限">')
-      + fieldRow('总额度（USD）', '<input id="f-quota" inputmode="decimal" placeholder="留空为不限">')
-      + fieldRow('日限额（USD）', '<input id="f-daily" inputmode="decimal" placeholder="留空为不限">')
-      + fieldRow('周限额（USD）', '<input id="f-weekly" inputmode="decimal" placeholder="留空为不限">')
-      + fieldRow('月限额（USD）', '<input id="f-monthly" inputmode="decimal" placeholder="留空为不限">')
+      + '<div class="form-sep wide">' + labelWithTip('金额限额（USD）', TIPS.moneyLimit) + '</div>'
+      + fieldRow('总额度', '<input id="f-quota" inputmode="decimal" placeholder="留空为不限">')
+      + fieldRow('日限额', '<input id="f-daily" inputmode="decimal" placeholder="留空为不限">')
+      + fieldRow('周限额', '<input id="f-weekly" inputmode="decimal" placeholder="留空为不限">')
+      + fieldRow('月限额', '<input id="f-monthly" inputmode="decimal" placeholder="留空为不限">')
+      + '<div class="form-sep wide">' + labelWithTip('Token 限额', TIPS.tokenLimit) + '</div>'
+      + fieldRow('总量', '<input id="f-tok" inputmode="numeric" placeholder="留空为不限">')
+      + fieldRow('日限额', '<input id="f-tok-daily" inputmode="numeric" placeholder="留空为不限">')
+      + fieldRow('周限额', '<input id="f-tok-weekly" inputmode="numeric" placeholder="留空为不限">')
+      + fieldRow('月限额', '<input id="f-tok-monthly" inputmode="numeric" placeholder="留空为不限">')
       + fieldRow('可用模型', '<textarea id="f-models" placeholder="逗号或换行分隔，支持 * 通配；留空不限制"></textarea>', 'wide')
       + '</div>',
-    note: '明文只在签发结果里出现一次。',
+    note: '明文只在签发结果里出现一次。金额与 Token 限额可同时设置，任一触顶即拒绝。',
     onOk: async () => {
       const num = id => { const v = $(id).value.trim(); return v ? Math.round(parseFloat(v) * 1e6) : null; };
+      // token 数支持 1000 / 1k / 1.5m / 2b 几种写法，避免手数零
+      const tok = id => parseTokens($(id).value);
       const models = $('f-models').value.split(/[\n,，]/).map(s => s.trim()).filter(Boolean);
       const expires = $('f-expires').value ? new Date($('f-expires').value).toISOString() : null;
       const r = await post('/keys/issue', {
@@ -1421,6 +1561,10 @@ $('key-issue-btn').addEventListener('click', () => {
         daily_micro_usd: num('f-daily'),
         weekly_micro_usd: num('f-weekly'),
         monthly_micro_usd: num('f-monthly'),
+        token_limit: tok('f-tok'),
+        daily_token_limit: tok('f-tok-daily'),
+        weekly_token_limit: tok('f-tok-weekly'),
+        monthly_token_limit: tok('f-tok-monthly'),
         max_concurrent_requests: parseInt($('f-conc').value, 10) || 0,
         allowed_models: models,
         expires_at: expires,
@@ -1441,11 +1585,20 @@ $('key-issue-btn').addEventListener('click', () => {
 // 编辑
 function editKeySheet(k) {
   const MONEY_FIELDS = [
-    ['e-quota', 'quota_micro_usd', '总额度（USD）'],
-    ['e-daily', 'daily_micro_usd', '日限额（USD）'],
-    ['e-weekly', 'weekly_micro_usd', '周限额（USD）'],
-    ['e-monthly', 'monthly_micro_usd', '月限额（USD）'],
+    ['e-quota', 'quota_micro_usd', '总额度'],
+    ['e-daily', 'daily_micro_usd', '日限额'],
+    ['e-weekly', 'weekly_micro_usd', '周限额'],
+    ['e-monthly', 'monthly_micro_usd', '月限额'],
   ];
+  const TOKEN_FIELDS = [
+    ['e-tok', 'token_limit', '总量'],
+    ['e-tok-daily', 'daily_token_limit', '日限额'],
+    ['e-tok-weekly', 'weekly_token_limit', '周限额'],
+    ['e-tok-monthly', 'monthly_token_limit', '月限额'],
+  ];
+  // 占位符显示当前值，让「留空=不改」这条语义下用户仍能看到现状
+  const curMoney = f => k[f] === null || k[f] === undefined ? '当前：不限' : '当前：' + fmtUSD(k[f]);
+  const curTok = f => k[f] === null || k[f] === undefined ? '当前：不限' : '当前：' + fmtTok(k[f]);
   openSheet({
     title: '编辑密钥 ' + k.kid,
     okText: '保存',
@@ -1457,12 +1610,18 @@ function editKeySheet(k) {
       + fieldRow('过期时间', '<input id="e-expires" type="datetime-local" value="'
         + (k.expires_at ? toLocalInput(new Date(k.expires_at)) : '') + '">')
       + fieldRow('最大并发', '<input id="e-conc" type="number" min="0" value="' + (k.max_concurrent_requests || 0) + '">')
-      + MONEY_FIELDS.map(([id, , label]) =>
-        fieldRow(label, '<input id="' + id + '" inputmode="decimal" placeholder="留空不改，输入 null 清空">')).join('')
+      + '<div class="form-sep wide">' + labelWithTip('金额限额（USD）', TIPS.moneyLimit) + '</div>'
+      + MONEY_FIELDS.map(([id, field, label]) =>
+        fieldRow(label, '<input id="' + id + '" inputmode="decimal" placeholder="'
+          + esc(curMoney(field)) + '">')).join('')
+      + '<div class="form-sep wide">' + labelWithTip('Token 限额', TIPS.tokenLimit) + '</div>'
+      + TOKEN_FIELDS.map(([id, field, label]) =>
+        fieldRow(label, '<input id="' + id + '" inputmode="numeric" placeholder="'
+          + esc(curTok(field)) + '">')).join('')
       + fieldRow('可用模型', '<textarea id="e-models" placeholder="留空清空清单；输入 null 表示不修改">'
         + esc((k.allowed_models || []).join(', ')) + '</textarea>', 'wide')
       + '</div>',
-    note: '金额字段留空表示不修改；输入 null 表示清除限制。模型清单留空表示不限制。',
+    note: '限额字段留空表示不修改；输入 null 表示清除该限制（改为不限）。Token 可写 500k / 1.5m。',
     onOk: async () => {
       const body = { kid: k.kid, actor: 'console' };
       const label = $('e-label').value.trim();
@@ -1474,6 +1633,13 @@ function editKeySheet(k) {
       const conc = $('e-conc').value;
       if (conc !== '' && (parseInt(conc, 10) || 0) !== k.max_concurrent_requests)
         body.max_concurrent_requests = parseInt(conc, 10) || 0;
+      for (const [id, field] of TOKEN_FIELDS) {
+        const v = $(id).value.trim();
+        if (v === '') continue;
+        if (v.toLowerCase() === 'null') { body[field] = null; continue; }
+        const n = parseTokens(v); // 非法写法直接抛错，由 sheet 捕获成提示
+        if (n !== k[field]) body[field] = n;
+      }
       for (const [id, field] of MONEY_FIELDS) {
         const v = $(id).value.trim();
         if (v === '') continue;
@@ -1554,18 +1720,24 @@ const REQ_COLS = [
   },
   {
     id: 'toks', label: '输入 / 输出 / 缓存读', num: true,
+    tip: '三段分别为 输入 / 输出 / 缓存读。' + TIPS.cacheRead,
     cell: x => '<td class="num"><span class="cell-toks" title="输入 ' + esc(fmtTok(x.input_tokens))
       + ' · 输出 ' + esc(fmtTok(x.output_tokens)) + ' · 缓存读 ' + esc(fmtTok(cacheReadOf(x))) + '">'
       + '<span class="tk">' + fmtTok(x.input_tokens) + '</span><span class="sep">/</span>'
       + '<span class="tk out">' + fmtTok(x.output_tokens) + '</span><span class="sep">/</span>'
       + '<span class="tk cr">' + fmtTok(cacheReadOf(x)) + '</span></span></td>',
   },
-  { id: 'tokens', label: '总 Token', sort: 'tokens', num: true, cell: x => '<td class="num">' + reqTokenCell(x) + '</td>' },
+  {
+    id: 'tokens', label: '总 Token', sort: 'tokens', num: true,
+    tip: '计费四类合计：输入＋输出＋缓存读＋缓存写。与 Token 限额同一口径。',
+    cell: x => '<td class="num">' + reqTokenCell(x) + '</td>',
+  },
   { id: 'cost', label: '费用', sort: 'cost', num: true, cell: x => '<td class="num">' + fmtUSD(x.cost_micro_usd) + '</td>' },
   {
     // 排序键指向 latency（总延迟）。旧版把「首字」表头标成 data-sort="latency"，
     // 而 latency 在后端映射到 latency_ms，点「首字」实际按总延迟排 —— 表头与行为不一致。
     id: 'lat', label: '延迟 首字→总', sort: 'latency', num: true,
+    tip: '首字延迟 → 总延迟。首字延迟是收到第一个 token 的耗时，总延迟含整段生成。',
     cell: x => '<td class="num"><span class="cell-lat"><span class="ttft">' + fmtSec(x.ttft_ms)
       + '</span><span class="arrow">→</span><span>' + fmtSec(x.latency_ms) + '</span></span></td>',
   },
@@ -1721,7 +1893,7 @@ async function loadRequests() {
   $('req-head').innerHTML = cols.map(c => '<th' + (c.num ? ' class="num' + (c.sort ? ' sort' : '') + '"'
     : (c.sort ? ' class="sort"' : '')) + (c.sort ? ' data-sort="' + c.sort + '"' : '')
     + (c.sort && reqView.sort === c.sort ? ' data-dir="' + reqView.order + '"' : '')
-    + '>' + esc(c.label) + '</th>').join('');
+    + '>' + (c.tip ? labelWithTip(c.label, c.tip) : esc(c.label)) + '</th>').join('');
   $('req-rows').innerHTML = items.map(x =>
     '<tr class="row" data-id="' + esc(x.id) + '">' + cols.map(c => c.cell(x)).join('') + '</tr>').join('')
     || '<tr><td colspan="' + cols.length + '"><div class="empty"><p class="empty-title">没有匹配的请求</p>'
@@ -1848,6 +2020,16 @@ loaders.pricing = async () => {
     ? 'USD→CNY ' + (fx.usd_to_cny_micro / 1e6).toFixed(4) + ' · ' + fx.source + (fx.fallback ? '（兜底）' : '') : '';
   const items = (r.items || []).slice().sort((a, b) => b.priority - a.priority || a.id - b.id);
   pricingCache.items = items;
+  // 表头带 ⓘ 说明：「缓存读/缓存写」这类术语中文里不自明，悬浮给出上游口径解释
+  $('pricing-head').innerHTML =
+    '<th class="num">' + labelWithTip('优先级', TIPS.priority) + '</th>'
+    + '<th>' + labelWithTip('匹配', TIPS.matchKind) + '</th>'
+    + '<th class="w-grow">模式</th><th>状态</th>'
+    + '<th class="num">' + labelWithTip('输入', TIPS.input) + '</th>'
+    + '<th class="num">' + labelWithTip('输出', TIPS.output) + '</th>'
+    + '<th class="num">' + labelWithTip('缓存读', TIPS.cacheRead) + '</th>'
+    + '<th class="num">' + labelWithTip('缓存写', TIPS.cacheWrite) + '</th>'
+    + '<th>来源</th><th class="w-act"></th>';
   $('pricing-rows').innerHTML = items.map(p => '<tr>'
     + '<td class="num cell-mono">' + p.priority + '</td>'
     + '<td><span class="pill signal mono">' + esc(p.match_kind) + '</span></td>'
@@ -1881,18 +2063,18 @@ function pricingFormBody(p) {
   const kindSel = p
     ? ['exact', 'glob', 'regexp'].map(k => sel(k, p.match_kind)).join('')
     : '<option value="exact">exact 完全匹配</option><option value="glob" selected>glob 通配</option><option value="regexp">regexp 正则</option>';
+  // 只保留真正参与计算的四档：推理并入输出、cached 并入缓存读，独立档位无处可用。
   return '<div class="form-grid">'
-    + fieldRow('匹配方式', '<select id="p-kind">' + kindSel + '</select>')
-    + fieldRow('优先级', '<input id="p-priority" type="number" value="' + (p ? p.priority : 100) + '">')
+    + fieldRow(labelWithTip('匹配方式', TIPS.matchKind), '<select id="p-kind">' + kindSel + '</select>')
+    + fieldRow(labelWithTip('优先级', TIPS.priority), '<input id="p-priority" type="number" value="' + (p ? p.priority : 100) + '">')
     + fieldRow('模式', '<input id="p-pattern" value="' + (p ? esc(p.pattern) : '') + '" placeholder="如 gpt-* 或 claude-sonnet-4" spellcheck="false">')
-    + fieldRow('输入价 $/M', '<input id="p-in" inputmode="decimal" value="' + (p ? priceInputVal(p.price_input) : '') + '" placeholder="0">')
-    + fieldRow('输出价 $/M', '<input id="p-out" inputmode="decimal" value="' + (p ? priceInputVal(p.price_output) : '') + '" placeholder="0">')
-    + fieldRow('推理价 $/M', '<input id="p-reasoning" inputmode="decimal" value="' + (p ? priceInputVal(p.price_reasoning) : '') + '" placeholder="0">')
-    + fieldRow('缓存价 $/M', '<input id="p-cached" inputmode="decimal" value="' + (p ? priceInputVal(p.price_cached) : '') + '" placeholder="0">')
-    + fieldRow('缓存读 $/M', '<input id="p-cache-read" inputmode="decimal" value="' + (p ? priceInputVal(p.price_cache_read) : '') + '" placeholder="0">')
-    + fieldRow('缓存写 $/M', '<input id="p-cache-create" inputmode="decimal" value="' + (p ? priceInputVal(p.price_cache_creation) : '') + '" placeholder="0">')
     + fieldRow('状态', '<select id="p-enabled"><option value="true"' + (!p || p.enabled ? ' selected' : '') + '>启用</option>'
       + '<option value="false"' + (p && !p.enabled ? ' selected' : '') + '>停用</option></select>')
+    + '<div class="form-sep wide">单价（每百万 token 美元）</div>'
+    + fieldRow(labelWithTip('输入', TIPS.input), '<input id="p-in" inputmode="decimal" value="' + (p ? priceInputVal(p.price_input) : '') + '" placeholder="0">')
+    + fieldRow(labelWithTip('输出', TIPS.output), '<input id="p-out" inputmode="decimal" value="' + (p ? priceInputVal(p.price_output) : '') + '" placeholder="0">')
+    + fieldRow(labelWithTip('缓存读', TIPS.cacheRead), '<input id="p-cache-read" inputmode="decimal" value="' + (p ? priceInputVal(p.price_cache_read) : '') + '" placeholder="0">')
+    + fieldRow(labelWithTip('缓存写', TIPS.cacheWrite), '<input id="p-cache-create" inputmode="decimal" value="' + (p ? priceInputVal(p.price_cache_creation) : '') + '" placeholder="0">')
     + '</div>';
 }
 function pricingSubmit() {
@@ -1903,7 +2085,6 @@ function pricingSubmit() {
     priority: parseInt($('p-priority').value, 10) || 0,
     enabled: $('p-enabled').value === 'true',
     price_input: num('p-in'), price_output: num('p-out'),
-    price_reasoning: num('p-reasoning'), price_cached: num('p-cached'),
     price_cache_read: num('p-cache-read'), price_cache_creation: num('p-cache-create'),
     accounting_mode: 'default', billing_mode: 'token', per_image_micro_usd: 0,
     source: 'manual',
@@ -2005,7 +2186,6 @@ $('pricing-search-results').addEventListener('click', async e => {
     await post('/pricing', {
       match_kind: 'exact', pattern: c.pattern, priority: 100, enabled: true,
       price_input: c.price_input, price_output: c.price_output,
-      price_reasoning: c.price_reasoning, price_cached: c.price_cached,
       price_cache_read: c.price_cache_read, price_cache_creation: c.price_cache_creation,
       accounting_mode: 'default', billing_mode: 'token', per_image_micro_usd: 0,
       source: c.source, models_dev_id: c.models_dev_id,

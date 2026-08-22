@@ -180,6 +180,10 @@ type IssueRequest struct {
 	DailyMicroUSD         *money.Micro `json:"daily_micro_usd"`
 	WeeklyMicroUSD        *money.Micro `json:"weekly_micro_usd"`
 	MonthlyMicroUSD       *money.Micro `json:"monthly_micro_usd"`
+	TokenLimit            *int64       `json:"token_limit"`
+	DailyTokenLimit       *int64       `json:"daily_token_limit"`
+	WeeklyTokenLimit      *int64       `json:"weekly_token_limit"`
+	MonthlyTokenLimit     *int64       `json:"monthly_token_limit"`
 	MaxConcurrentRequests int          `json:"max_concurrent_requests"`
 	AllowedModels         []string     `json:"allowed_models"`
 	Actor                 string       `json:"actor"`
@@ -207,7 +211,7 @@ func (s *Service) IssueKey(ctx context.Context, r IssueRequest) (IssuedKey, erro
 	if err != nil {
 		return IssuedKey{}, err
 	}
-	rec, err := s.st.InsertKey(ctx, store.InsertKeyParams{KID: kid, KeyHash: hash, EncryptedMaterial: enc, PepperID: p.ID, Fingerprint: fingerprint(plain), Principal: r.Principal, CallerScope: r.CallerScope, CallerID: r.CallerID, Label: r.Label, ExpiresAt: r.ExpiresAt, QuotaMicroUSD: r.QuotaMicroUSD, DailyMicroUSD: r.DailyMicroUSD, WeeklyMicroUSD: r.WeeklyMicroUSD, MonthlyMicroUSD: r.MonthlyMicroUSD, MaxConcurrentRequests: r.MaxConcurrentRequests, AllowedModels: r.AllowedModels})
+	rec, err := s.st.InsertKey(ctx, store.InsertKeyParams{KID: kid, KeyHash: hash, EncryptedMaterial: enc, PepperID: p.ID, Fingerprint: fingerprint(plain), Principal: r.Principal, CallerScope: r.CallerScope, CallerID: r.CallerID, Label: r.Label, ExpiresAt: r.ExpiresAt, QuotaMicroUSD: r.QuotaMicroUSD, DailyMicroUSD: r.DailyMicroUSD, WeeklyMicroUSD: r.WeeklyMicroUSD, MonthlyMicroUSD: r.MonthlyMicroUSD, TokenLimit: r.TokenLimit, DailyTokenLimit: r.DailyTokenLimit, WeeklyTokenLimit: r.WeeklyTokenLimit, MonthlyTokenLimit: r.MonthlyTokenLimit, MaxConcurrentRequests: r.MaxConcurrentRequests, AllowedModels: r.AllowedModels})
 	if err != nil {
 		return IssuedKey{}, err
 	}
@@ -406,7 +410,14 @@ func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req
 			}
 		}
 	}
-	out, err := s.st.SettleReservation(ctx, id, cost, time.Now(), req)
+	// 结算 token 与费用同一口径：Billable() 已把 inclusive/exclusive 归一、
+	// cached 并入缓存读不重复计、推理并入输出。u 为零值（上游未回用量）时
+	// 退回预占的估算值，与 cost 走 HeldMicroUSD 的兜底逻辑保持对称。
+	billableTokens := billableForRule(rule, u).Sum()
+	if u.IsZero() {
+		billableTokens = r.ReservedTokens
+	}
+	out, err := s.st.SettleReservation(ctx, id, cost, billableTokens, time.Now(), req)
 	if err == nil {
 		_ = s.st.AppendAudit(ctx, store.AuditEvent{Action: "quota.settle", EntityType: "reservation", EntityID: id, Detail: map[string]any{"cost_micro_usd": cost}})
 		// 落库后对账：宿主 usage.handle 的被动行可能先于本结算落库（双写竞态），

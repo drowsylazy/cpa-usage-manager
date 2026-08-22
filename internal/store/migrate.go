@@ -8,7 +8,7 @@ import (
 
 // SchemaVersion 是本代码期望的数据库 schema 版本。
 // 打开库时若发现库版本更高，说明是被更新版插件写过的库，拒绝降级使用。
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 // migration 是一次版本化迁移。
 type migration struct {
@@ -249,6 +249,30 @@ var migrations = []migration{
 				heartbeat_at INTEGER NOT NULL,
 				handover_to  TEXT    NOT NULL DEFAULT ''
 			)`,
+		},
+	},
+	{
+		version: 2,
+		name:    "token_limits_and_pricing_cleanup",
+		stmts: []string{
+			// ---- Token 限额：与金额限额完全对称的四个上限 + 三个周期计数器 ----
+			// NULL 表示不限（与 *_micro_usd 同语义）。累计器复用金额那套 cycle_key
+			// 归零机制，不额外加列：同一次结算里两种口径的周期必然相同。
+			`ALTER TABLE plugin_keys ADD COLUMN token_limit          INTEGER`,
+			`ALTER TABLE plugin_keys ADD COLUMN daily_token_limit    INTEGER`,
+			`ALTER TABLE plugin_keys ADD COLUMN weekly_token_limit   INTEGER`,
+			`ALTER TABLE plugin_keys ADD COLUMN monthly_token_limit  INTEGER`,
+			`ALTER TABLE plugin_keys ADD COLUMN tokens_used          INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE plugin_keys ADD COLUMN daily_tokens_used    INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE plugin_keys ADD COLUMN weekly_tokens_used   INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE plugin_keys ADD COLUMN monthly_tokens_used  INTEGER NOT NULL DEFAULT 0`,
+
+			// ---- 计价表清理：删除从不参与费用计算的两档 ----
+			// costForRule 只用 输入/输出/缓存读/缓存写 四档：推理 token 由
+			// Billable() 并入输出按输出价计，cached 并入缓存读按缓存读价计。
+			// price_reasoning / price_cached 填了永远不生效，留着会误导配置者。
+			`ALTER TABLE pricing_rules DROP COLUMN price_reasoning`,
+			`ALTER TABLE pricing_rules DROP COLUMN price_cached`,
 		},
 	},
 }

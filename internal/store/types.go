@@ -84,6 +84,14 @@ type PluginKey struct {
 	WeeklyMicroUSD  *money.Micro `json:"weekly_micro_usd,omitempty"`
 	MonthlyMicroUSD *money.Micro `json:"monthly_micro_usd,omitempty"`
 
+	// Token 上限；nil 表示不限。与金额限额并列生效（任一触顶即拒绝），
+	// 口径为计费四类合计（输入+输出+缓存读+缓存写，见 usageparse.Billable）。
+	// 金额限额控制成本，token 限额控制用量 —— 混合模型价差大时后者更精确。
+	TokenLimit        *int64 `json:"token_limit,omitempty"`
+	DailyTokenLimit   *int64 `json:"daily_token_limit,omitempty"`
+	WeeklyTokenLimit  *int64 `json:"weekly_token_limit,omitempty"`
+	MonthlyTokenLimit *int64 `json:"monthly_token_limit,omitempty"`
+
 	// MaxConcurrentRequests 为 0 表示不限。
 	MaxConcurrentRequests int `json:"max_concurrent_requests"`
 	// AllowedModels 为空表示不限制模型。
@@ -97,6 +105,12 @@ type PluginKey struct {
 	WeeklySpentMicroUSD  money.Micro `json:"weekly_spent_micro_usd"`
 	MonthlyCycleKey      string      `json:"monthly_cycle_key,omitempty"`
 	MonthlySpentMicroUSD money.Micro `json:"monthly_spent_micro_usd"`
+
+	// Token 累计器；周期归零复用金额那套 *CycleKey（同一次结算两种口径周期必然相同）。
+	TokensUsed        int64 `json:"tokens_used"`
+	DailyTokensUsed   int64 `json:"daily_tokens_used"`
+	WeeklyTokensUsed  int64 `json:"weekly_tokens_used"`
+	MonthlyTokensUsed int64 `json:"monthly_tokens_used"`
 
 	CreatedAt  time.Time  `json:"created_at"`
 	UpdatedAt  time.Time  `json:"updated_at"`
@@ -139,6 +153,15 @@ func spentForCycle(storedKey, currentKey string, spent money.Micro) money.Micro 
 	return spent
 }
 
+// tokensForCycle 与 spentForCycle 同语义，用于 token 累计器：
+// 存储的周期标识与当前周期不同说明已跨期，累计值作废按 0 计。
+func tokensForCycle(storedKey, currentKey string, used int64) int64 {
+	if storedKey != currentKey {
+		return 0
+	}
+	return used
+}
+
 // PricingRule 是一条计价规则。价格单位为「每百万 token 的 micro-USD」。
 type PricingRule struct {
 	ID        int64  `json:"id"`
@@ -147,10 +170,12 @@ type PricingRule struct {
 	Priority  int    `json:"priority"`
 	Enabled   bool   `json:"enabled"`
 
+	// 计价四档，与 costForRule 的计费口径一一对应。
+	// 不设「推理价」与「缓存价」：推理 token 由 usageparse.Billable() 并入输出
+	// 按输出价计，上游的 cached_tokens 并入缓存读按缓存读价计 —— 独立档位
+	// 无处可用，留着只会让配置者以为设了就生效（v0.3.4 起已从库与 API 移除）。
 	PriceInput         money.Price `json:"price_input"`
 	PriceOutput        money.Price `json:"price_output"`
-	PriceReasoning     money.Price `json:"price_reasoning"`
-	PriceCached        money.Price `json:"price_cached"`
 	PriceCacheRead     money.Price `json:"price_cache_read"`
 	PriceCacheCreation money.Price `json:"price_cache_creation"`
 
@@ -172,8 +197,8 @@ func (r *PricingRule) IsFallback() bool {
 
 // Free 报告该规则的所有计价档位是否均为 0。
 func (r *PricingRule) Free() bool {
-	return r.PriceInput == 0 && r.PriceOutput == 0 && r.PriceReasoning == 0 &&
-		r.PriceCached == 0 && r.PriceCacheRead == 0 && r.PriceCacheCreation == 0 &&
+	return r.PriceInput == 0 && r.PriceOutput == 0 &&
+		r.PriceCacheRead == 0 && r.PriceCacheCreation == 0 &&
 		r.PerImageMicroUSD == 0
 }
 
@@ -200,8 +225,6 @@ func (r *PricingRule) Validate() error {
 	prices := map[string]money.Price{
 		"price_input":          r.PriceInput,
 		"price_output":         r.PriceOutput,
-		"price_reasoning":      r.PriceReasoning,
-		"price_cached":         r.PriceCached,
 		"price_cache_read":     r.PriceCacheRead,
 		"price_cache_creation": r.PriceCacheCreation,
 	}
@@ -395,4 +418,21 @@ func moneyPtr(v *int64) *money.Micro {
 	}
 	m := money.Micro(*v)
 	return &m
+}
+
+// int64Ptr 复制可空整数（token 限额列直接是 int64，不经 money 类型）。
+func int64Ptr(v *int64) *int64 {
+	if v == nil {
+		return nil
+	}
+	n := *v
+	return &n
+}
+
+// countPtr 把可空整数转为可空 SQL 参数。
+func countPtr(v *int64) any {
+	if v == nil {
+		return nil
+	}
+	return *v
 }

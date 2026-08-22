@@ -58,6 +58,8 @@ type keySpec struct {
 	label   string
 	quota   *money.Micro // nil = 不限
 	daily   *money.Micro
+	tokLim  *int64 // token 总量上限；nil = 不限
+	tokDay  *int64
 	conc    int
 	weight  int
 	fill    float64 // 目标额度占用比（驱动仪表状态：idle/ok/warn/alarm）
@@ -66,14 +68,17 @@ type keySpec struct {
 }
 
 func mic(usd float64) *money.Micro { m := money.Micro(usd * 1e6); return &m }
+func tk(n int64) *int64            { return &n }
 
 var keySpecs = []keySpec{
 	{label: "本地开发", quota: mic(50), daily: mic(5), conc: 4, weight: 22, fill: .34},
-	{label: "CI 流水线", quota: mic(200), daily: mic(20), conc: 12, weight: 26, fill: .82}, // warn
-	{label: "移动端 App", quota: mic(120), conc: 8, weight: 18, fill: .97},                  // alarm
-	{label: "数据分析脚本", quota: nil, conc: 0, weight: 14, fill: 0},                          // 不限
-	{label: "", quota: mic(30), conc: 2, weight: 8, fill: .11},                          // 无标签
-	{label: "长标签测试：市场部门季度报告自动生成流水线（负责人：李四）", quota: mic(80), conc: 3, weight: 6, fill: .58},
+	// 同时配金额与 token 限额：两把闸并列
+	{label: "CI 流水线", quota: mic(200), daily: mic(20), tokLim: tk(50_000_000), tokDay: tk(5_000_000), conc: 12, weight: 26, fill: .82},
+	{label: "移动端 App", quota: mic(120), conc: 8, weight: 18, fill: .97},
+	// 只配 token 限额、不配金额：证明 token 是独立的一把闸
+	{label: "数据分析脚本", tokLim: tk(20_000_000), tokDay: tk(2_000_000), conc: 0, weight: 14, fill: .62},
+	{label: "", quota: mic(30), conc: 2, weight: 8, fill: .11},
+	{label: "长标签测试：市场部门季度报告自动生成流水线（负责人：李四）", quota: mic(80), tokDay: tk(800_000), conc: 3, weight: 6, fill: .58},
 	{label: "已停用的旧密钥", quota: mic(25), conc: 1, weight: 3, fill: .44, disable: true},
 	{label: "已撤销的泄露密钥", quota: mic(10), conc: 1, weight: 1, fill: .9, revoke: true},
 }
@@ -151,6 +156,10 @@ func main() {
 	for _, ks := range keySpecs {
 		req := service.IssueRequest{
 			Label: ks.label, CallerID: store.DefaultCallerID,
+			// 独立计额：默认的 caller 口径下所有 Key 共享同一个额度池，
+			// 一枚 Key 的累计会挤占其他 Key 的余量，面板上每行的仪表就失去了
+			// 单独含义（也会让下面按目标比例灌数的逻辑相互撞限额）。
+			CallerScope:           store.CallerScopeKey,
 			MaxConcurrentRequests: ks.conc, Actor: "seed",
 		}
 		if ks.quota != nil {
@@ -160,6 +169,14 @@ func main() {
 		if ks.daily != nil {
 			d := *ks.daily
 			req.DailyMicroUSD = &d
+		}
+		if ks.tokLim != nil {
+			v := *ks.tokLim
+			req.TokenLimit = &v
+		}
+		if ks.tokDay != nil {
+			v := *ks.tokDay
+			req.DailyTokenLimit = &v
 		}
 		ik, err := svc.IssueKey(ctx, req)
 		if err != nil {
@@ -282,10 +299,10 @@ func main() {
 				KeyID:    kid,
 				CallerID: store.DefaultCallerID,
 				Model:    m.name, Provider: m.provider, Source: m.source,
-				AuthType: authTypeOf(m.provider),
-				AuthID:   m.provider + "-acct-" + fmt.Sprint(1+rng.Intn(2)),
-				Tier:     tierOf(rng),
-				Result:   result,
+				AuthType:    authTypeOf(m.provider),
+				AuthID:      m.provider + "-acct-" + fmt.Sprint(1+rng.Intn(2)),
+				Tier:        tierOf(rng),
+				Result:      result,
 				InputTokens: in, OutputTokens: out, ReasoningTokens: reasoning,
 				CachedTokens: cached, CacheReadTokens: cacheR, CacheCreationTokens: cacheW,
 				TotalTokens: total,
@@ -298,6 +315,22 @@ func main() {
 			}
 			inserted++
 		}
+	}
+
+	// ── 额度计数器：走真实 预占→结算 路径喂到目标占用比 ──────────
+	// RecordUsage 只写请求与聚合，不动 Key 的累计器；不补这一步的话面板上
+	// 所有额度仪表都停在 0%，看不出 warn/alarm 配色，也测不到 token 限额。
+	//
+	// 必须**按天分摊**：一次性灌满总额度会撞上日限额（限额是真的在生效，
+	// 一把灌会被 ErrQuotaExceeded 拒掉）。每天最多灌该档日限的 90%，
+	// 用当天的时间戳结算，逐日累加到目标总量 —— 这也更接近真实的用量积累。
+	for _, k := range live {
+		want := k.spec.fill
+		if want <= 0 {
+			continue
+		}
+		fillCounter(ctx, st, k.kid, now, "money", want, k.spec.quota, k.spec.daily)
+		fillCounter(ctx, st, k.kid, now, "token", want, k.spec.tokLim, k.spec.tokDay)
 	}
 
 	// ── 密钥状态：禁用 / 撤销 ────────────────────────────────────
@@ -368,4 +401,65 @@ func priceOf(m modelSpec, in, out, cacheR, cacheW int64) money.Micro {
 	}
 	return ceilDiv(in, m.inPrice) + ceilDiv(out, m.outPrice) +
 		ceilDiv(cacheR, m.cacheR) + ceilDiv(cacheW, m.cacheW)
+}
+
+// fillCounter 把某个 Key 的累计器（金额或 token）喂到 total 的 want 比例。
+//
+// kind 决定灌哪一路："money" 走 held_micro_usd/cost，"token" 走 reserved_tokens。
+// 关键约束：每天投放量不超过日限的 90%，并用当天的时间戳结算，否则会撞日限被拒。
+// 泛型化会牵进 money.Micro 与 int64 的转换噪音，这里用 int64 统一算，出口再转。
+func fillCounter[T ~int64](ctx context.Context, st *store.Store, kid string, now time.Time,
+	kind string, want float64, total *T, daily *T) {
+	if total == nil {
+		return // 该档不限，无累计目标
+	}
+	target := int64(float64(*total) * want)
+	if target <= 0 {
+		return
+	}
+	perDay := target
+	if daily != nil && int64(*daily) > 0 {
+		if cap90 := int64(float64(*daily) * 0.9); cap90 < perDay {
+			perDay = cap90
+		}
+	}
+	if perDay <= 0 {
+		return
+	}
+	// 从最早的一天往今天推，逐日投放；最多回溯 60 天避免极端配置下死循环。
+	days := int((target + perDay - 1) / perDay)
+	if days > 60 {
+		days = 60
+	}
+	remain := target
+	for d := days - 1; d >= 0 && remain > 0; d-- {
+		amt := perDay
+		if amt > remain {
+			amt = remain
+		}
+		ts := now.AddDate(0, 0, -d)
+		id := fmt.Sprintf("seed-%s-fill-%s-%d", kind, kid, d)
+		p := store.HoldReservationParams{
+			ID: id, KeyID: kid, CallerID: store.DefaultCallerID, Model: "claude-sonnet-4",
+			ExpiresAt: ts.Add(time.Hour), Now: ts,
+		}
+		var cost money.Micro
+		var toks int64
+		if kind == "money" {
+			p.HeldMicroUSD = money.Micro(amt)
+			cost = money.Micro(amt)
+		} else {
+			p.ReservedTokens = amt
+			toks = amt
+		}
+		if _, _, err := st.HoldReservation(ctx, p); err != nil {
+			log.Printf("%s 预占 %s 第 %d 天失败（忽略）：%v", kind, kid, d, err)
+			return
+		}
+		if _, err := st.SettleReservation(ctx, id, cost, toks, ts, nil); err != nil {
+			log.Printf("%s 结算 %s 第 %d 天失败（忽略）：%v", kind, kid, d, err)
+			return
+		}
+		remain -= amt
+	}
 }

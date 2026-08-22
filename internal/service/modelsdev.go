@@ -182,8 +182,6 @@ type ModelsDevCandidate struct {
 	Label              string      `json:"label,omitempty"`
 	PriceInput         money.Price `json:"price_input"`
 	PriceOutput        money.Price `json:"price_output"`
-	PriceReasoning     money.Price `json:"price_reasoning"`
-	PriceCached        money.Price `json:"price_cached"`
 	PriceCacheRead     money.Price `json:"price_cache_read"`
 	PriceCacheCreation money.Price `json:"price_cache_creation"`
 	MatchKind          string      `json:"match_kind"`
@@ -262,8 +260,6 @@ func (s *Service) SearchModelsDev(ctx context.Context, syncer *ModelsDevSyncer, 
 					Label:              name,
 					PriceInput:         rule.PriceInput,
 					PriceOutput:        rule.PriceOutput,
-					PriceReasoning:     rule.PriceReasoning,
-					PriceCached:        rule.PriceCached,
 					PriceCacheRead:     rule.PriceCacheRead,
 					PriceCacheCreation: rule.PriceCacheCreation,
 					MatchKind:          "exact",
@@ -376,10 +372,9 @@ func ruleForModel(providerID, modelID string, m ModelsDevModel) (store.PricingRu
 	if err != nil {
 		return store.PricingRule{}, fmt.Errorf("output 价格无法解析: %w", err)
 	}
-	reasoning, err := priceFromNumber(m.Cost.Reasoning)
-	if err != nil {
-		return store.PricingRule{}, fmt.Errorf("reasoning 价格无法解析: %w", err)
-	}
+	// models.dev 的 reasoning 价格本插件不落库：推理 token 由 usageparse.Billable()
+	// 并入输出按输出价计（引擎无独立推理档），存了也不会参与计算。绝大多数提供方
+	// 二者同价；若某模型确实不同价，这里会按输出价计（既有限制，非本次引入）。
 	cacheRead, err := priceFromNumber(m.Cost.CacheRead)
 	if err != nil {
 		return store.PricingRule{}, fmt.Errorf("cache_read 价格无法解析: %w", err)
@@ -392,8 +387,13 @@ func ruleForModel(providerID, modelID string, m ModelsDevModel) (store.PricingRu
 	if err != nil {
 		return store.PricingRule{}, fmt.Errorf("input_cached 价格无法解析: %w", err)
 	}
-	// models.dev 未给出 cache_read 时按输入价计（多数提供方的缓存读取更便宜，
-	// 取输入价是保守侧，不会低估费用）。
+	// 缓存读价的取值顺序：cache_read（Claude 口径）→ input_cached（OpenAI 口径）
+	// → 输入价兜底。input_cached 原先落进从不参与计算的 price_cached，等于被丢弃，
+	// OpenAI 系模型的缓存读会按输入价高估；现在归到缓存读档，计价更准。
+	if cacheRead == 0 && cached > 0 {
+		cacheRead = cached
+	}
+	// 两个字段都没给时按输入价计（多数提供方缓存读更便宜，取输入价是保守侧）。
 	if cacheRead == 0 && input > 0 && m.Cost.CacheRead.String() == "" {
 		cacheRead = input
 	}
@@ -405,8 +405,6 @@ func ruleForModel(providerID, modelID string, m ModelsDevModel) (store.PricingRu
 		Enabled:            true,
 		PriceInput:         input,
 		PriceOutput:        output,
-		PriceReasoning:     reasoning,
-		PriceCached:        cached,
 		PriceCacheRead:     cacheRead,
 		PriceCacheCreation: cacheWrite,
 		AccountingMode:     store.AccountingModeDefault,

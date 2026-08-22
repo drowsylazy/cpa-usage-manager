@@ -120,8 +120,8 @@ usage.handle(record)
 | 表 | 关键列 | 说明 |
 |---|---|---|
 | `callers` | id, display_name, enabled | 归属记录（组织/团队），不承载额度 |
-| `plugin_keys` | kid, key_hash, encrypted_material, pepper_id, fingerprint, principal, caller_scope, caller_id, label, enabled, revoked_at, expires_at, quota/daily/weekly/monthly_micro_usd, max_concurrent_requests, allowed_models_json, last_used_at | 签发策略与安全材料 |
-| `pricing_rules` | id, match_kind(exact/glob/regexp), pattern, priority, enabled, price_input/output/reasoning/cached/cache_read/cache_creation, accounting_mode, billing_mode, per_image_micro_usd, source(manual/models_dev), models_dev_id | 统一计价表，结算与展示共用 |
+| `plugin_keys` | kid, key_hash, encrypted_material, pepper_id, fingerprint, principal, caller_scope, caller_id, label, enabled, revoked_at, expires_at, quota/daily/weekly/monthly_micro_usd, **token_limit / daily_token_limit / weekly_token_limit / monthly_token_limit**, max_concurrent_requests, allowed_models_json, 累计器（spent_micro_usd + \*_cycle_key + \*_spent_micro_usd、**tokens_used + \*_tokens_used**）, last_used_at | 签发策略与安全材料 |
+| `pricing_rules` | id, match_kind(exact/glob/regexp), pattern, priority, enabled, price_input/output/cache_read/cache_creation（四档，见下方锁定决策）, accounting_mode, billing_mode, per_image_micro_usd, source(manual/models_dev), models_dev_id | 统一计价表，结算与展示共用 |
 | `reservations` | id, key_id, caller_id, model, idempotency_key, status(held/settled/released), held/settled_micro_usd, reserved_tokens, expires_at, heartbeat_at | 预占与在途 |
 | `requests` | id, key_id, caller_id, model, provider, source, auth_*, tier, result, ts, input/output/reasoning/cached/cache_read/cache_creation_tokens, total_tokens, latency_ms, ttft_ms, generation_ms, tps, thinking_intensity, cost_micro_usd, reservation_id | 逐请求记录 |
 | `usage_rollups` | bucket_minute, model, key_id, caller_id, provider, source, auth_type, tier, result, req_count, fail_count, in/out/reasoning/cached/cache_read/cache_creation_tokens, latency_sum, ttft_sum, generation_sum, tps_sum, cost_micro_usd | 分钟聚合，面板快速加载 |
@@ -220,6 +220,23 @@ reset                   POST  重置统计（body {"confirm":"reset"}）
 ```
 
 路由表在 `internal/httpapi` 集中声明 + 注册期校验唯一性。
+
+---
+
+### 5.3 双口径额度（金额 + Token）
+
+每枚 Key 有两组互相独立的上限，**任一触顶即拒绝请求**：
+
+| 口径 | 字段 | 单位 | 用途 |
+|---|---|---|---|
+| 金额 | `quota/daily/weekly/monthly_micro_usd` | 整数 micro-USD | 控制成本 |
+| Token | `token_limit` / `daily/weekly/monthly_token_limit` | 整数 token | 控制用量 |
+
+- 两者均为 `NULL` 表示该档不限；可只配一种
+- **Token 口径 = 计费四类合计**（Input＋Output＋Cache Read＋Cache Creation，即 `Billable().Sum()`），与费用同一口径：inclusive/exclusive 已归一、`cached` 不重复计、推理已并入 Output
+- **判定时机与金额对称**：预占期按估算 token 判定（`reservations.reserved_tokens`，在途预占计入用量），结算时按真实 token 回写累计器；上游未回用量时退回预占估算值
+- Token 累计器**复用金额那套 `*_cycle_key`** 归零机制，并在同一条 `UPDATE` 内推进，保证两种口径的跨期点严格一致（不会出现金额已跨期而 token 未跨期）
+- 存在的理由：混合模型下单价差可达数十倍（haiku vs opus），同一笔预算对应的 token 量相差极大，只用金额无法精确约束用量
 
 ---
 

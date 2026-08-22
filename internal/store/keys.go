@@ -15,9 +15,11 @@ import (
 const keyColumns = `kid, key_hash, encrypted_material, pepper_id, fingerprint, principal,
 	caller_scope, caller_id, label, enabled, revoked_at, expires_at,
 	quota_micro_usd, daily_micro_usd, weekly_micro_usd, monthly_micro_usd,
+	token_limit, daily_token_limit, weekly_token_limit, monthly_token_limit,
 	max_concurrent_requests, allowed_models_json,
 	spent_micro_usd, daily_cycle_key, daily_spent_micro_usd,
 	weekly_cycle_key, weekly_spent_micro_usd, monthly_cycle_key, monthly_spent_micro_usd,
+	tokens_used, daily_tokens_used, weekly_tokens_used, monthly_tokens_used,
 	created_at, updated_at, last_used_at`
 
 // scanKey 从一行结果扫描 PluginKey。
@@ -27,18 +29,24 @@ func scanKey(sc interface{ Scan(...any) error }) (PluginKey, error) {
 		enabled                          int
 		revokedAt, expiresAt, lastUsedAt *int64
 		quota, daily, weekly, monthly    *int64
+		tokLimit, tokDaily               *int64
+		tokWeekly, tokMonthly            *int64
 		modelsJSON                       string
 		spent, dailySpent                int64
 		weeklySpent, monthlySpent        int64
+		tokUsed, tokDailyUsed            int64
+		tokWeeklyUsed, tokMonthlyUsed    int64
 		created, updated                 int64
 	)
 	err := sc.Scan(
 		&k.KID, &k.KeyHash, &k.EncryptedMaterial, &k.PepperID, &k.Fingerprint, &k.Principal,
 		&k.CallerScope, &k.CallerID, &k.Label, &enabled, &revokedAt, &expiresAt,
 		&quota, &daily, &weekly, &monthly,
+		&tokLimit, &tokDaily, &tokWeekly, &tokMonthly,
 		&k.MaxConcurrentRequests, &modelsJSON,
 		&spent, &k.DailyCycleKey, &dailySpent,
 		&k.WeeklyCycleKey, &weeklySpent, &k.MonthlyCycleKey, &monthlySpent,
+		&tokUsed, &tokDailyUsed, &tokWeeklyUsed, &tokMonthlyUsed,
 		&created, &updated, &lastUsedAt,
 	)
 	if err != nil {
@@ -52,10 +60,18 @@ func scanKey(sc interface{ Scan(...any) error }) (PluginKey, error) {
 	k.DailyMicroUSD = moneyPtr(daily)
 	k.WeeklyMicroUSD = moneyPtr(weekly)
 	k.MonthlyMicroUSD = moneyPtr(monthly)
+	k.TokenLimit = int64Ptr(tokLimit)
+	k.DailyTokenLimit = int64Ptr(tokDaily)
+	k.WeeklyTokenLimit = int64Ptr(tokWeekly)
+	k.MonthlyTokenLimit = int64Ptr(tokMonthly)
 	k.SpentMicroUSD = money.Micro(spent)
 	k.DailySpentMicroUSD = money.Micro(dailySpent)
 	k.WeeklySpentMicroUSD = money.Micro(weeklySpent)
 	k.MonthlySpentMicroUSD = money.Micro(monthlySpent)
+	k.TokensUsed = tokUsed
+	k.DailyTokensUsed = tokDailyUsed
+	k.WeeklyTokensUsed = tokWeeklyUsed
+	k.MonthlyTokensUsed = tokMonthlyUsed
 	k.CreatedAt = time.UnixMilli(created).UTC()
 	k.UpdatedAt = time.UnixMilli(updated).UTC()
 
@@ -87,6 +103,11 @@ type InsertKeyParams struct {
 	DailyMicroUSD   *money.Micro
 	WeeklyMicroUSD  *money.Micro
 	MonthlyMicroUSD *money.Micro
+
+	TokenLimit        *int64
+	DailyTokenLimit   *int64
+	WeeklyTokenLimit  *int64
+	MonthlyTokenLimit *int64
 
 	MaxConcurrentRequests int
 	AllowedModels         []string
@@ -124,6 +145,16 @@ func (p *InsertKeyParams) Validate() error {
 			return fmt.Errorf("%s 不能为负，得到 %d", name, *q)
 		}
 	}
+	for name, t := range map[string]*int64{
+		"token_limit":         p.TokenLimit,
+		"daily_token_limit":   p.DailyTokenLimit,
+		"weekly_token_limit":  p.WeeklyTokenLimit,
+		"monthly_token_limit": p.MonthlyTokenLimit,
+	} {
+		if t != nil && *t < 0 {
+			return fmt.Errorf("%s 不能为负，得到 %d", name, *t)
+		}
+	}
 	return nil
 }
 
@@ -154,17 +185,21 @@ func (s *Store) InsertKey(ctx context.Context, p InsertKeyParams) (PluginKey, er
 				kid, key_hash, encrypted_material, pepper_id, fingerprint, principal,
 				caller_scope, caller_id, label, enabled, revoked_at, expires_at,
 				quota_micro_usd, daily_micro_usd, weekly_micro_usd, monthly_micro_usd,
+				token_limit, daily_token_limit, weekly_token_limit, monthly_token_limit,
 				max_concurrent_requests, allowed_models_json,
 				spent_micro_usd, daily_cycle_key, daily_spent_micro_usd,
 				weekly_cycle_key, weekly_spent_micro_usd,
 				monthly_cycle_key, monthly_spent_micro_usd,
+				tokens_used, daily_tokens_used, weekly_tokens_used, monthly_tokens_used,
 				created_at, updated_at, last_used_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, ?, ?, ?,
-			          0, '', 0, '', 0, '', 0, ?, ?, NULL)`,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			          0, '', 0, '', 0, '', 0, 0, 0, 0, 0, ?, ?, NULL)`,
 			p.KID, p.KeyHash, p.EncryptedMaterial, p.PepperID, p.Fingerprint, p.Principal,
 			p.CallerScope, p.CallerID, p.Label, millisPtr(p.ExpiresAt),
 			microPtr(p.QuotaMicroUSD), microPtr(p.DailyMicroUSD),
 			microPtr(p.WeeklyMicroUSD), microPtr(p.MonthlyMicroUSD),
+			countPtr(p.TokenLimit), countPtr(p.DailyTokenLimit),
+			countPtr(p.WeeklyTokenLimit), countPtr(p.MonthlyTokenLimit),
 			p.MaxConcurrentRequests, modelsJSON, now, now)
 		if isUniqueViolation(err) {
 			return fmt.Errorf("%w: Key %q 已存在", ErrConflict, p.KID)
@@ -300,6 +335,11 @@ type KeyUpdate struct {
 	WeeklyMicroUSD  **money.Micro
 	MonthlyMicroUSD **money.Micro
 
+	TokenLimit        **int64
+	DailyTokenLimit   **int64
+	WeeklyTokenLimit  **int64
+	MonthlyTokenLimit **int64
+
 	MaxConcurrentRequests *int
 	AllowedModels         *[]string
 }
@@ -358,6 +398,25 @@ func (s *Store) UpdateKey(ctx context.Context, kid string, u KeyUpdate) (PluginK
 			return PluginKey{}, fmt.Errorf("%s 不能为负，得到 %d", qf.name, **qf.val)
 		}
 		add(qf.col+` = ?`, microPtr(*qf.val))
+	}
+	tokenFields := []struct {
+		name string
+		col  string
+		val  **int64
+	}{
+		{"token_limit", `token_limit`, u.TokenLimit},
+		{"daily_token_limit", `daily_token_limit`, u.DailyTokenLimit},
+		{"weekly_token_limit", `weekly_token_limit`, u.WeeklyTokenLimit},
+		{"monthly_token_limit", `monthly_token_limit`, u.MonthlyTokenLimit},
+	}
+	for _, tf := range tokenFields {
+		if tf.val == nil {
+			continue
+		}
+		if *tf.val != nil && **tf.val < 0 {
+			return PluginKey{}, fmt.Errorf("%s 不能为负，得到 %d", tf.name, **tf.val)
+		}
+		add(tf.col+` = ?`, countPtr(*tf.val))
 	}
 	if u.MaxConcurrentRequests != nil {
 		if *u.MaxConcurrentRequests < 0 {

@@ -308,11 +308,49 @@ func buildKeyUpdate(raw map[string]json.RawMessage) (store.KeyUpdate, error) {
 		if v, ok := raw[c.key]; ok {
 			p := (*money.Micro)(nil)
 			if string(v) != "null" {
-				m, e := money.ParseUSD(jsonStr(v))
+				// 口径与签发路径一致：*_micro_usd 是**整数 micro-USD**，不是美元字符串。
+				//
+				// 既有缺陷：此处原为 money.ParseUSD(jsonStr(v))，把该字段当成美元
+				// 字符串（"$1.50"）解析。而签发路径直接 json.Unmarshal 到 money.Micro
+				// （整数 micro），面板也发裸整数 —— jsonStr 对裸数字返回空串，
+				// ParseUSD 随即报「金额格式非法」，导致**金额限额编辑从未成功过**。
+				// 两条路径必须同口径，否则同一个字段名在签发与更新时含义差 1e6 倍。
+				n, e := jsonInt64(v)
 				if e != nil {
-					return u, fmt.Errorf("%s 金额格式非法：%w", c.key, e)
+					return u, fmt.Errorf("%s 必须是整数 micro-USD：%w", c.key, e)
 				}
+				if n < 0 {
+					return u, fmt.Errorf("%s 不能为负", c.key)
+				}
+				m := money.Micro(n)
 				p = &m
+			}
+			*c.dst = &p
+		}
+	}
+	// Token 限额：与金额同样的三态语义（缺省=不改，null=清空，数字=设值）
+	for _, c := range []struct {
+		key string
+		dst ***int64
+	}{
+		{"token_limit", &u.TokenLimit},
+		{"daily_token_limit", &u.DailyTokenLimit},
+		{"weekly_token_limit", &u.WeeklyTokenLimit},
+		{"monthly_token_limit", &u.MonthlyTokenLimit},
+	} {
+		if v, ok := raw[c.key]; ok {
+			p := (*int64)(nil)
+			if string(v) != "null" {
+				// 值可能是 JSON 数字（500000）或字符串（"500000"）。jsonStr 只认
+				// 字符串，对裸数字返回空串 —— 必须先按数字解，再回退按字符串解。
+				n, e := jsonInt64(v)
+				if e != nil {
+					return u, fmt.Errorf("%s 必须是整数", c.key)
+				}
+				if n < 0 {
+					return u, fmt.Errorf("%s 不能为负", c.key)
+				}
+				p = &n
 			}
 			*c.dst = &p
 		}
@@ -341,6 +379,24 @@ func jsonStr(v json.RawMessage) string {
 	var s string
 	_ = json.Unmarshal(v, &s)
 	return s
+}
+
+// jsonInt64 解析一个可能是 JSON 数字或数字字符串的值。
+//
+// 面板发的是裸数字（token_limit: 500000），但历史上金额字段走的是字符串口径，
+// 两种都得接。只用 jsonStr 会把裸数字读成空串（json.Unmarshal 到 string 失败
+// 但错误被忽略），进而报「必须是整数」——一个只在数字入参时触发的伪校验失败。
+func jsonInt64(v json.RawMessage) (int64, error) {
+	var n int64
+	if err := json.Unmarshal(v, &n); err == nil {
+		return n, nil
+	}
+	// 回退：带引号的数字，或带千分位/单位的写法（前端已归一，这里只兜底纯数字）
+	var s string
+	if err := json.Unmarshal(v, &s); err != nil {
+		return 0, fmt.Errorf("既非数字也非字符串: %s", string(v))
+	}
+	return strconv.ParseInt(strings.TrimSpace(s), 10, 64)
 }
 func jsonBool(v json.RawMessage) bool {
 	var b bool
