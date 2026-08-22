@@ -27,7 +27,7 @@ func requestFilter(f UsageFilter) (string, []any) {
 		args = append(args, f.To.UTC().UnixMilli())
 	}
 	for _, item := range []struct{ column, value string }{
-		{"key_id", f.KeyID}, {"caller_id", f.CallerID}, {"model", f.Model},
+		{"key_id", f.KeyID}, {"caller_id", f.CallerID},
 		{"provider", f.Provider}, {"result", f.Result},
 	} {
 		if item.value != "" {
@@ -35,10 +35,23 @@ func requestFilter(f UsageFilter) (string, []any) {
 			args = append(args, item.value)
 		}
 	}
+	if f.Model != "" {
+		// 模型按「精确名或渠道/后缀」匹配：输入 ox-alpha 应能命中
+		// openrouter/ox-alpha；完整名则精确命中。与库内判重口径一致。
+		where = append(where, "(model = ? OR model LIKE ? ESCAPE '\\')")
+		args = append(args, f.Model, "%/"+escapeLikeValue(f.Model))
+	}
 	if len(where) == 0 {
 		return "", args
 	}
 	return " WHERE " + strings.Join(where, " AND "), args
+}
+
+// escapeLikeValue 转义 LIKE 通配符，用户输入按字面匹配。
+func escapeLikeValue(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	return strings.ReplaceAll(s, `_`, `\_`)
 }
 
 type UsageSummary struct {

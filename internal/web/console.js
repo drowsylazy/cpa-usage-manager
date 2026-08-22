@@ -1087,9 +1087,22 @@ function revealSheet(kid) {
 // ---------- 用量 ----------
 const reqView = { page: 0, size: 20, sort: 'ts', order: 'desc', model: '', keyId: '', result: '' };
 
+// fillReqSuggestions 填充模型/密钥筛选框的联想候选（datalist 原生下拉 + 手动输入）。
+function fillReqSuggestions() {
+  api('/usage/dimension?' + new URLSearchParams({ dimension: 'model', limit: '200' }))
+    .then(r => {
+      $('req-model-options').innerHTML = (r.rows || [])
+        .filter(x => x.value).map(x => '<option value="' + esc(x.value) + '"></option>').join('');
+    })
+    .catch(() => {});
+  $('req-key-options').innerHTML = keysView.cache.map(k =>
+    '<option value="' + esc(k.kid) + '">' + esc(k.label || '') + '</option>').join('');
+}
+
 loaders.usage = async () => {
   await Promise.all([loadDim(), loadCosts()]);
   await loadRequests();
+  fillReqSuggestions();
   stamp();
 };
 async function loadDim() {
@@ -1119,9 +1132,14 @@ async function loadDim() {
       + '<td class="num">' + fmtTok(effTokens(row)) + '</td>'
       + '<td class="num">' + fmtUSD(row.cost_micro_usd) + '</td>'
       + '<td class="num">' + fmtSec(row.latency_avg_ms) + '</td>'
-      + '<td class="num">' + (row.tps_avg_milli ? (row.tps_avg_milli / 1000).toFixed(1) : '-') + '</td></tr>').join('')
+      + '<td class="num">' + fmtTPS(row.tps_avg_milli) + '</td></tr>').join('')
     + '</tbody></table></div>';
 }
+// fmtTPS 展示 TPS：超过 3000 token/s 视为宿主缓冲整转产生的坏测量
+// （与后端落库上限同口径），v0.3.0 之前入库的历史脏行在展示层一并隐藏。
+const maxPlausibleTPS = 3000;
+const fmtTPS = milli => milli > 0 && milli / 1000 <= maxPlausibleTPS ? (milli / 1000).toFixed(1) : '-';
+
 function kv(name, value) { return '<div class="kv-row"><dt>' + name + '</dt><dd>' + value + '</dd></div>'; }
 async function loadCosts() {
   const costs = await api('/costs?' + new URLSearchParams(rangeParams()));
@@ -1159,7 +1177,7 @@ async function loadRequests() {
       : '<b>' + fmtTok(effTokens(x)) + '</b>';
     return '<tr class="row" data-id="' + esc(x.id) + '">'
     + '<td class="cell-mono">' + fmtDT(x.ts, true) + '</td>'
-    + '<td class="cell-mono">' + esc(x.key_id || '-') + '</td>'
+    + '<td class="cell-mono" title="' + esc(x.key_id || '') + '">' + esc(keyLabelOf(x.key_id) || x.key_id || '-') + '</td>'
     + '<td class="cell-mono" title="' + esc(x.model) + '">' + esc(x.model || '-') + '</td>'
     + '<td class="cell-dim">' + esc(x.provider || '-') + '</td>'
     + '<td><span class="pill ' + (x.result === 'ok' ? 'live' : x.result === 'blocked' ? 'warn' : 'alarm') + '">'
@@ -1171,7 +1189,7 @@ async function loadRequests() {
     + '<td class="num">' + fmtUSD(x.cost_micro_usd) + '</td>'
     + '<td class="num">' + fmtSec(x.ttft_ms) + '</td>'
     + '<td class="num">' + fmtSec(x.latency_ms) + '</td>'
-    + '<td class="num">' + (x.tps_milli ? (x.tps_milli / 1000).toFixed(1) : '-') + '</td></tr>';
+    + '<td class="num">' + fmtTPS(x.tps_milli) + '</td></tr>';
   }).join('')
     || '<tr><td colspan="13"><div class="empty"><p class="empty-title">没有匹配的请求</p>'
     + '<p class="empty-hint">调整筛选条件或时间范围</p></div></td></tr>';
@@ -1221,7 +1239,7 @@ $('req-rows').addEventListener('click', e => {
         ? fact('用量捕获', '上游未返回用量，费用按预占估算扣费') : '')
       + fact('首字延迟', fmtSec(x.ttft_ms))
       + fact('生成耗时', fmtSec(x.generation_ms))
-      + fact('TPS', x.tps_milli ? (x.tps_milli / 1000).toFixed(2) : '-')
+      + fact('TPS', fmtTPS(x.tps_milli))
       + fact('总延迟', fmtSec(x.latency_ms))
       + fact('费用', fmtUSD(x.cost_micro_usd)) + fact('命中计价', x.priced ? '是' : '否')
       + (x.reservation_id ? fact('预占 ID', x.reservation_id) : '')
@@ -1370,20 +1388,30 @@ async function pricingSearchRun() {
   if (!q) { toast('先输入模型关键词', 'err'); return; }
   const box = $('pricing-search-results');
   box.hidden = false;
-  box.innerHTML = '<p class="note" style="padding:10px 14px">正在搜索 models.dev…</p>';
+  box.innerHTML = pricingSearchHead() + '<p class="note" style="padding:10px 14px">正在搜索 models.dev…</p>';
   try {
     const list = await api('/pricing/search?' + new URLSearchParams({ q, limit: '20' }));
     box.dataset.items = JSON.stringify(list);
-    box.innerHTML = list.length
-      ? '<div class="search-list">' + list.map((c, i) =>
-        '<div class="search-item"><div class="si-main">'
-        + '<span class="si-name">' + esc(c.name || c.model_id) + '</span>'
-        + '<span class="si-id mono">' + esc(c.provider_id) + '/' + esc(c.model_id) + '</span></div>'
-        + '<span class="si-price mono">入 ' + fmtPrice(c.price_input) + ' · 出 ' + fmtPrice(c.price_output) + '</span>'
-        + '<button type="button" class="btn small primary" data-si="' + i + '">添加</button></div>').join('') + '</div>'
-      : '<p class="note" style="padding:10px 14px">没有匹配的模型，换个关键词试试。</p>';
-  } catch (e) { box.innerHTML = '<p class="note" style="padding:10px 14px">' + esc(e.message) + '</p>'; }
+    box.innerHTML = pricingSearchHead()
+      + (list.length
+        ? '<div class="search-list">' + list.map((c, i) =>
+          '<div class="search-item"><div class="si-main">'
+          + '<span class="si-name">' + esc(c.name || c.model_id) + '</span>'
+          + '<span class="si-id mono">' + esc(c.provider_id) + '/' + esc(c.model_id) + '</span></div>'
+          + '<span class="si-price mono">入 ' + fmtPrice(c.price_input) + ' · 出 ' + fmtPrice(c.price_output) + '</span>'
+          + '<button type="button" class="btn small primary" data-si="' + i + '">添加</button></div>').join('') + '</div>'
+        : '<p class="note" style="padding:10px 14px">没有匹配的模型，换个关键词试试。</p>');
+  } catch (e) { box.innerHTML = pricingSearchHead() + '<p class="note" style="padding:10px 14px">' + esc(e.message) + '</p>'; }
 }
+// pricingSearchHead 搜索结果面板的标题栏，带关闭按钮（结果面板本身没有原生收起入口）。
+function pricingSearchHead() {
+  return '<div class="search-head"><span>models.dev 搜索结果</span>'
+    + '<button type="button" class="btn small" data-search-close>关闭</button></div>';
+}
+$('pricing-search-results').addEventListener('click', e => {
+  if (!e.target.closest('[data-search-close]')) return;
+  $('pricing-search-results').hidden = true;
+});
 $('pricing-search-btn').addEventListener('click', pricingSearchRun);
 $('pricing-search-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') { e.preventDefault(); pricingSearchRun(); }

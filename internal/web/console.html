@@ -201,8 +201,10 @@
     <div class="panel-head">
       <div><h2 class="panel-title">请求明细</h2><p class="panel-sub" id="req-count">—</p></div>
       <div class="panel-tools">
-        <input class="btn input" id="req-model" placeholder="模型" spellcheck="false">
-        <input class="btn input" id="req-key" placeholder="密钥 kid" spellcheck="false">
+        <input class="btn input" id="req-model" placeholder="模型" spellcheck="false" list="req-model-options" aria-label="按模型过滤">
+        <datalist id="req-model-options"></datalist>
+        <input class="btn input" id="req-key" placeholder="密钥（标签或 kid）" spellcheck="false" list="req-key-options" aria-label="按密钥过滤">
+        <datalist id="req-key-options"></datalist>
         <select class="btn select" id="req-result" aria-label="按结果过滤">
           <option value="">全部结果</option><option value="ok">ok</option><option value="error">error</option>
         </select>

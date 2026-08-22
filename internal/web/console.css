@@ -315,6 +315,7 @@ tr.detail>td{background:var(--sunken);padding:14px 16px;white-space:normal;borde
 
 /* models.dev 搜索结果 */
 .search-list{display:grid}
+.search-head{display:flex;align-items:center;justify-content:space-between;padding:8px 16px;border-bottom:1px solid var(--line);color:var(--fg3);font-size:12px;font-weight:650}
 .search-item{display:flex;align-items:center;gap:12px;padding:8px 16px;border-bottom:1px solid var(--line)}
 .search-item:last-child{border-bottom:none}
 .search-item .si-main{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}

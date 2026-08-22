@@ -9,6 +9,46 @@ import (
 	"github.com/drowsylazy/cpa-usage-manager/internal/store"
 )
 
+// TestListRequestsModelSuffixMatch 覆盖模型筛选的「精确名或渠道/后缀」匹配：
+// 输入裸名 ox-alpha 应命中 openrouter/ox-alpha，完整名精确命中，无关名不命中。
+func TestListRequestsModelSuffixMatch(t *testing.T) {
+	s, st := testService(t)
+	ctx := context.Background()
+	i, err := s.IssueKey(ctx, IssueRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := time.Date(2026, 8, 20, 10, 3, 0, 0, time.UTC)
+	for _, r := range []store.Request{
+		{ID: "a", TS: ts, KeyID: i.KID, CallerID: store.DefaultCallerID, Model: "openrouter/ox-alpha", Result: store.ResultOK},
+		{ID: "b", TS: ts, KeyID: i.KID, CallerID: store.DefaultCallerID, Model: "stealth/ox-alpha", Result: store.ResultOK},
+		{ID: "c", TS: ts, KeyID: i.KID, CallerID: store.DefaultCallerID, Model: "stepfun/step-3.7-flash", Result: store.ResultOK},
+	} {
+		if err := st.RecordUsage(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := []struct {
+		model string
+		want  int
+	}{
+		{"ox-alpha", 2},               // 裸名命中两个渠道前缀
+		{"openrouter/ox-alpha", 1},    // 完整名精确命中
+		{"stepfun/step-3.7-flash", 1}, // 含下划线语义字符的字面匹配
+		{"step-3.7-flash", 1},         // 渠道后缀
+		{"nope", 0},                   // 无关名
+	}
+	for _, c := range cases {
+		page, err := s.ListRequests(ctx, UsageFilter{KeyID: i.KID, Model: c.model}, 10, 0, "ts", "desc")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page.Total != int64(c.want) {
+			t.Fatalf("model=%q 命中 %d 条, 期望 %d", c.model, page.Total, c.want)
+		}
+	}
+}
+
 func TestAnalyticsSummaryRequestsTrendsBalance(t *testing.T) {
 	s, st := testService(t)
 	ctx := context.Background()
