@@ -227,6 +227,10 @@ func (a *API) issue(w http.ResponseWriter, r *http.Request) {
 		jsonOut(w, map[string]string{"error": e.Error()}, 400)
 		return
 	}
+	if e := normalizeIssueLimits(&in); e != nil {
+		jsonOut(w, map[string]string{"error": e.Error()}, 400)
+		return
+	}
 	out, e := a.svc.IssueKey(r.Context(), in)
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 400)
@@ -236,7 +240,50 @@ func (a *API) issue(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, out, 200)
 }
 
-// updateKey 部分更新 Key 的策略字段。显式 null 表示清空对应字段。
+// limitI64 限额数值语义（签发与更新共用）：-1 表示不限，0 表示禁用
+// （真实限额：引擎按 已用>上限 判定，0 上限即全部拒付），其余负值拒绝。
+func limitI64(n int64) (int64, error) {
+	if n == -1 || n >= 0 {
+		return n, nil
+	}
+	return 0, fmt.Errorf("限额不接受 %d；-1 表示不限，0 表示禁用", n)
+}
+
+// normalizeIssueLimits 把签发请求里的 -1 归一为 nil（不限），拒绝其余负值。
+func normalizeIssueLimits(in *service.IssueRequest) error {
+	toks := []**int64{&in.TokenLimit, &in.DailyTokenLimit, &in.WeeklyTokenLimit, &in.MonthlyTokenLimit}
+	for _, p := range toks {
+		if *p == nil || **p >= 0 {
+			continue
+		}
+		if _, e := limitI64(**p); e != nil {
+			return fmt.Errorf("token_limit: %w", e)
+		}
+		*p = nil
+	}
+	micros := []struct {
+		name string
+		p    **money.Micro
+	}{
+		{"quota_micro_usd", &in.QuotaMicroUSD},
+		{"daily_micro_usd", &in.DailyMicroUSD},
+		{"weekly_micro_usd", &in.WeeklyMicroUSD},
+		{"monthly_micro_usd", &in.MonthlyMicroUSD},
+	}
+	for _, c := range micros {
+		if *c.p == nil || **c.p >= 0 {
+			continue
+		}
+		if **c.p == -1 {
+			*c.p = nil
+			continue
+		}
+		return fmt.Errorf("%s 不接受 %d；-1 表示不限", c.name, int64(**c.p))
+	}
+	return nil
+}
+
+// updateKey 部分更新 Key 的策略字段。显式 null 或 -1 表示清空对应限制（改为不限）。
 func (a *API) updateKey(w http.ResponseWriter, r *http.Request) {
 	var raw map[string]json.RawMessage
 	if e := decode(r, &raw); e != nil {
@@ -319,16 +366,21 @@ func buildKeyUpdate(raw map[string]json.RawMessage) (store.KeyUpdate, error) {
 				if e != nil {
 					return u, fmt.Errorf("%s 必须是整数 micro-USD：%w", c.key, e)
 				}
-				if n < 0 {
-					return u, fmt.Errorf("%s 不能为负", c.key)
+				switch {
+				case n == -1:
+					// -1 = 不限（面板口径）：与显式 null 同效，落库不留负值。
+				case n < 0:
+					return u, fmt.Errorf("%s 不能为负；-1 表示不限，0 表示禁用", c.key)
+				default:
+					m := money.Micro(n)
+					p = &m
 				}
-				m := money.Micro(n)
-				p = &m
 			}
 			*c.dst = &p
 		}
 	}
-	// Token 限额：与金额同样的三态语义（缺省=不改，null=清空，数字=设值）
+	// Token 限额：与金额同样的语义（缺省=不改，null/-1=不限即清空，数字=设值，
+	// 0 是真实限额=禁用）
 	for _, c := range []struct {
 		key string
 		dst ***int64
@@ -347,10 +399,14 @@ func buildKeyUpdate(raw map[string]json.RawMessage) (store.KeyUpdate, error) {
 				if e != nil {
 					return u, fmt.Errorf("%s 必须是整数", c.key)
 				}
-				if n < 0 {
-					return u, fmt.Errorf("%s 不能为负", c.key)
+				switch {
+				case n == -1:
+					// -1 = 不限：与显式 null 同效。
+				case n < 0:
+					return u, fmt.Errorf("%s 不能为负；-1 表示不限，0 表示禁用", c.key)
+				default:
+					p = &n
 				}
-				p = &n
 			}
 			*c.dst = &p
 		}

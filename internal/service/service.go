@@ -195,7 +195,22 @@ type IssuedKey struct {
 	Record      store.PluginKey
 }
 
+// quotaModeConflict 钉住产品口径：金额限额与 Token 限额互斥，
+// 一个 Key 只能选一种计费口径（「双闸任一触顶即拒」的旧语义已废弃）。
+func quotaModeConflict(hasMoney, hasTok bool) error {
+	if hasMoney && hasTok {
+		return errors.New("service: 金额限额与 Token 限额二选一，不能同时配置")
+	}
+	return nil
+}
+
 func (s *Service) IssueKey(ctx context.Context, r IssueRequest) (IssuedKey, error) {
+	if err := quotaModeConflict(
+		r.QuotaMicroUSD != nil || r.DailyMicroUSD != nil || r.WeeklyMicroUSD != nil || r.MonthlyMicroUSD != nil,
+		r.TokenLimit != nil || r.DailyTokenLimit != nil || r.WeeklyTokenLimit != nil || r.MonthlyTokenLimit != nil,
+	); err != nil {
+		return IssuedKey{}, err
+	}
 	if r.CallerID == "" {
 		r.CallerID = store.DefaultCallerID
 	}
@@ -460,6 +475,35 @@ func (s *Service) ReconcileRequestDuplicates(ctx context.Context, anchorID strin
 
 // UpdateKey、RevokeKey、DeleteKey 是管理面调用的薄封装，并统一写审计。
 func (s *Service) UpdateKey(ctx context.Context, kid string, u store.KeyUpdate, actor string) (store.PluginKey, error) {
+	// 二选一按「合并后的最终状态」校验：部分更新只改 label 时若存量已双配，
+	// 也会被拦下，强制用户在下次编辑时选边（面板表单总是全量提交两族限额）。
+	cur, err := s.st.GetKey(ctx, kid)
+	if err != nil {
+		return store.PluginKey{}, err
+	}
+	effMicro := func(a *money.Micro, b **money.Micro) *money.Micro {
+		if b != nil {
+			return *b
+		}
+		return a
+	}
+	effInt64 := func(a *int64, b **int64) *int64 {
+		if b != nil {
+			return *b
+		}
+		return a
+	}
+	hasMoney := effMicro(cur.QuotaMicroUSD, u.QuotaMicroUSD) != nil ||
+		effMicro(cur.DailyMicroUSD, u.DailyMicroUSD) != nil ||
+		effMicro(cur.WeeklyMicroUSD, u.WeeklyMicroUSD) != nil ||
+		effMicro(cur.MonthlyMicroUSD, u.MonthlyMicroUSD) != nil
+	hasTok := effInt64(cur.TokenLimit, u.TokenLimit) != nil ||
+		effInt64(cur.DailyTokenLimit, u.DailyTokenLimit) != nil ||
+		effInt64(cur.WeeklyTokenLimit, u.WeeklyTokenLimit) != nil ||
+		effInt64(cur.MonthlyTokenLimit, u.MonthlyTokenLimit) != nil
+	if err := quotaModeConflict(hasMoney, hasTok); err != nil {
+		return store.PluginKey{}, err
+	}
 	k, err := s.st.UpdateKey(ctx, kid, u)
 	if err == nil {
 		_ = s.st.AppendAudit(ctx, store.AuditEvent{Actor: actor, Action: "key.update", EntityType: "key", EntityID: kid})

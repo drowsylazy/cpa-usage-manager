@@ -360,6 +360,15 @@ table.data td.cell-clip{max-width:340px;overflow:hidden;text-overflow:ellipsis}
    卡片网格负责扫读：状态芯片、可复制 kid、大数字余量；
    点击卡片自右缘滑出抽屉，承载完整 facts、余额核算与操作。
    层级：backdrop/drawer 60/61 < 下拉 70 < toast 80；原生 dialog 恒最上层。 */
+/* 面板头：标题+计数靠左一行，签发按钮右对齐 */
+.ky-head{
+  display:flex;align-items:center;gap:12px;
+  padding:14px 20px;border-bottom:1px solid var(--line);
+}
+.ky-heading{flex:1;min-width:0;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.ky-title{
+  margin:0;font-size:17px;font-weight:750;letter-spacing:-.01em;color:var(--fg);
+}
 .keys-toolbar{
   display:flex;align-items:center;gap:10px;flex-wrap:wrap;
   padding:12px 20px;border-bottom:1px solid var(--line);
@@ -409,19 +418,22 @@ table.data td.cell-clip{max-width:340px;overflow:hidden;text-overflow:ellipsis}
 .ky-card:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
 .ky-card-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .ky-when{color:var(--fg4);font-size:11px;white-space:nowrap}
+/* 标签与 kid 芯片同一行：标签占满剩余宽度，kid 靠右 */
+.ky-name-row{display:flex;align-items:center;gap:8px;min-width:0}
 .ky-name{
-  margin:0;font-size:15px;font-weight:700;letter-spacing:-.01em;color:var(--fg);
+  flex:1;min-width:0;margin:0;font-size:15px;font-weight:700;
+  letter-spacing:-.01em;color:var(--fg);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
-.ky-name i,.ky-drawer-id h3 i{color:var(--fg4);font-weight:400;font-style:italic}
+.ky-name i,.kd-head h3 i{color:var(--fg4);font-weight:400;font-style:italic}
 .ky-kid{
   justify-self:start;display:inline-flex;align-items:center;gap:6px;
-  max-width:100%;padding:3px 9px;border-radius:var(--r-chip);
-  border:1px dashed var(--line2);background:var(--sunken);
+  max-width:100%;padding:3px 10px;border-radius:var(--r-chip);
+  border:1px solid var(--line);background:var(--sunken);
   color:var(--fg3);font-size:11px;text-align:left;cursor:pointer;
-  transition:border-color .14s ease,color .14s ease;
+  transition:border-color .14s ease,color .14s ease,background .14s ease;
 }
-.ky-kid:hover{border-color:var(--signal);color:var(--signal)}
+.ky-kid:hover{border-color:var(--signal);color:var(--signal);background:var(--signal-soft)}
 .ky-kid:focus-visible{outline:2px solid var(--focus);outline-offset:1px}
 .ky-kid span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ky-kid svg{width:12px;height:12px;flex:none;stroke:currentColor;fill:none;stroke-width:1.8}
@@ -431,26 +443,44 @@ table.data td.cell-clip{max-width:340px;overflow:hidden;text-overflow:ellipsis}
   border-radius:var(--r-ctl);padding:7px 10px;font-size:12px;font-family:var(--mono);
 }
 
-.ky-quota{display:grid;gap:5px}
-.ky-quota-row{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
-.ky-quota-num{
-  font-size:21px;font-weight:750;letter-spacing:-.02em;line-height:1.1;
-  color:var(--fg);font-variant-numeric:tabular-nums;
+/* 卡片余额：从中间分成两块，左金额右 Token，中间竖分割线；
+   计费方式二选一后通常只有一档，独占整行。
+   两半的进度条同高贴底，像卡片下缘的刻度带。 */
+.ky-split{display:grid;grid-template-columns:1fr 1fr;padding-top:2px}
+.ky-split.ky-single{grid-template-columns:1fr}
+.ky-cell{display:flex;flex-direction:column;gap:5px;min-width:0}
+.ky-cell:first-child{padding-right:14px}
+.ky-split:not(.ky-single) .ky-cell + .ky-cell{border-left:1px solid var(--line);padding-left:14px}
+.ky-cell-label{
+  color:var(--fg4);font-size:10px;font-weight:700;
+  letter-spacing:.06em;text-transform:uppercase;
 }
-.ky-quota-cap{
-  font-size:11px;color:var(--fg3);white-space:nowrap;
+.ky-quota-row{display:flex;align-items:baseline;justify-content:space-between;gap:8px;min-width:0}
+.ky-quota-num{
+  font-size:19px;font-weight:750;letter-spacing:-.02em;line-height:1.15;
+  color:var(--fg);white-space:nowrap;font-variant-numeric:tabular-nums;
+}
+.ky-used{
+  font-size:10.5px;color:var(--fg4);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;
   font-variant-numeric:tabular-nums;
 }
-.ky-bar{height:4px;border-radius:2px;background:var(--track);overflow:hidden}
+.ky-bar{
+  margin-top:auto;height:6px;border-radius:0 0 3px 3px;
+  background:var(--track);overflow:hidden;
+}
 .ky-bar>span{
-  display:block;height:100%;border-radius:2px;background:var(--signal);
+  display:block;height:100%;border-radius:0 3px 3px 0;background:var(--signal);
   transition:width .25s ease;
 }
-.ky-quota[data-kind="tok"] .ky-bar>span{background:var(--trace)}
-.ky-quota[data-state="warn"] .ky-bar>span,
-.ky-quota[data-kind="tok"][data-state="warn"] .ky-bar>span{background:var(--warn)}
-.ky-quota[data-state="alarm"] .ky-bar>span,
-.ky-quota[data-kind="tok"][data-state="alarm"] .ky-bar>span{background:var(--alarm)}
+.ky-cell[data-kind="tok"] .ky-bar>span{background:var(--trace)}
+.ky-cell[data-state="warn"] .ky-bar>span,
+.ky-cell[data-kind="tok"][data-state="warn"] .ky-bar>span{background:var(--warn)}
+.ky-cell[data-state="alarm"] .ky-bar>span,
+.ky-cell[data-kind="tok"][data-state="alarm"] .ky-bar>span{background:var(--alarm)}
+.ky-spent{
+  padding-top:2px;color:var(--fg3);font-size:12px;
+}
 
 .ky-meta{
   display:flex;align-items:center;gap:6px;flex-wrap:wrap;
@@ -458,49 +488,68 @@ table.data td.cell-clip{max-width:340px;overflow:hidden;text-overflow:ellipsis}
   color:var(--fg4);font-size:11px;
 }
 .ky-meta>span+span::before{content:'·';margin-right:6px;color:var(--line3)}
+/* caller 与计费口径是一对语义：紧贴成组，再以分隔点接并发 */
+.ky-pair{display:inline-flex;align-items:center;gap:5px;min-width:0}
+.ky-pair b{font-family:var(--mono);font-weight:600;color:var(--fg2)}
 
-.ky-backdrop{
-  position:fixed;inset:0;z-index:60;
-  background:rgba(11,16,22,.32);backdrop-filter:blur(2px);
-  opacity:0;transition:opacity .22s ease;
-}
-.ky-backdrop.open{opacity:1}
-.ky-drawer{
-  position:fixed;top:0;right:0;bottom:0;z-index:61;
-  width:min(430px,94vw);display:flex;flex-direction:column;
-  background:var(--bezel);border-left:1px solid var(--line);
+/* 详情 dialog：居中弹窗。宿主管理页右上角自带按钮小面板，右缘滑出层会盖住它，
+   故详情用原生 <dialog>（top-layer、Esc 原生关闭、::backdrop 承载遮罩）。 */
+.kd-dialog{
+  width:min(620px,94vw);max-height:min(760px,92vh);
+  padding:0;border:1px solid var(--line);border-radius:var(--r-panel);
+  background:var(--bezel);color:var(--fg);
   box-shadow:var(--shadow-pop);
-  transform:translateX(calc(100% + 24px));
-  transition:transform .24s cubic-bezier(.32,.72,.28,1);
 }
-.ky-drawer.open{transform:none}
-.ky-drawer-head{
-  display:flex;align-items:flex-start;justify-content:space-between;gap:10px;
-  padding:16px 18px 12px;border-bottom:1px solid var(--line);
+.kd-dialog::backdrop{
+  background:rgba(11,16,22,.34);backdrop-filter:blur(2px);
 }
-.ky-drawer-id{display:flex;align-items:center;gap:9px;flex-wrap:wrap;min-width:0}
-.ky-drawer-id h3{
-  margin:0;max-width:280px;font-size:17px;font-weight:750;
+.kd-head{
+  display:flex;align-items:center;gap:9px;
+  padding:14px 16px;border-bottom:1px solid var(--line);
+}
+.kd-head h3{
+  flex:1;min-width:0;margin:0;font-size:15.5px;font-weight:750;
   letter-spacing:-.01em;color:var(--fg);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
-.ky-drawer-close{
+.kd-close{
   flex:none;display:inline-flex;align-items:center;justify-content:center;
   width:30px;height:30px;border-radius:8px;
   border:0;background:transparent;cursor:pointer;color:var(--fg3);
   transition:background .14s ease,color .14s ease;
 }
-.ky-drawer-close:hover{background:var(--sunken);color:var(--fg)}
-.ky-drawer-close:focus-visible{outline:2px solid var(--focus)}
-.ky-drawer-close svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2}
-.ky-drawer-body{
-  overflow-y:auto;display:grid;gap:14px;align-content:start;
-  padding:16px 18px 20px;
+.kd-close:hover{background:var(--sunken);color:var(--fg)}
+.kd-close:focus-visible{outline:2px solid var(--focus)}
+.kd-close svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2}
+.kd-body{
+  overflow-y:auto;display:grid;gap:13px;align-content:start;
+  padding:15px 16px 17px;
 }
+/* 金额 | Token 对半两块；只有一档时独占整行 */
+.kd-meters{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.kd-quota-block{
+  display:grid;gap:6px;align-content:start;min-width:0;
+  padding:11px 12px;border-radius:10px;background:var(--sunken);
+}
+.kd-quota-block:only-child{grid-column:1/-1}
+@media (prefers-reduced-motion:no-preference){
+  .kd-dialog[open]{animation:kd-pop .18s ease}
+  .kd-dialog[open]::backdrop{animation:kd-fade .18s ease}
+  .kd-dialog.closing{animation:kd-out .15s ease forwards}
+  .kd-dialog.closing::backdrop{animation:kd-fadeout .15s ease forwards}
+}
+@keyframes kd-pop{from{opacity:0;transform:translateY(8px) scale(.985)}}
+@keyframes kd-fade{from{opacity:0}}
+@keyframes kd-out{to{opacity:0;transform:translateY(6px) scale(.985)}}
+@keyframes kd-fadeout{to{opacity:0}}
+/* 骨架屏：余额加载占位与数据行同构，到达后原位替换零跳动 */
+.bal-bar>.skel{width:38%;background:var(--line2);animation:kd-pulse 1.2s ease-in-out infinite}
+@keyframes kd-pulse{50%{opacity:.4}}
+#kd-meters>.kd-quota-block{animation:kd-fade .25s ease}
 @media (prefers-reduced-motion:reduce){
-  .ky-card,.ky-chip,.ky-kid,.ky-bar>span,.ky-backdrop,.ky-drawer,.ky-drawer-close{
-    transition:none!important;
-  }
+  .ky-card,.ky-chip,.ky-kid,.ky-bar>span,.kd-close{transition:none!important}
+  .bal-bar>.skel{animation:none!important}
+  .kd-dialog[open],.kd-dialog[open]::backdrop,#kd-meters>.kd-quota-block{animation:none!important}
 }
 .detail-facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px 18px}
 .fact{display:grid;gap:1px}
@@ -667,28 +716,45 @@ table.data td.cell-clip{max-width:340px;overflow:hidden;text-overflow:ellipsis}
 .info:hover,.info:focus-visible{border-color:var(--signal);color:var(--signal)}
 table.data th .info{vertical-align:0}
 
-/* dialog 配额清单：名称 + 单条进度 + 「余 X / 上限」三列对齐，
-   取代原先每档一条独立仪表的散乱布局 */
-.bal-wrap{display:grid;gap:14px}
-.bal-sec{display:grid;gap:7px}
+/* dialog 配额清单：名称+「余 X / 上限」一行、细进度条一行；
+   窄栏（对半分块）下不挤，「不限」行保持单行 */
 .bal-title{
   color:var(--fg4);font-size:10px;font-weight:700;
   letter-spacing:.06em;text-transform:uppercase;
 }
-.bal-row{
-  display:grid;grid-template-columns:52px minmax(0,1fr) auto;
-  gap:10px;align-items:center;font-size:12px;
+
+/* 计费方式分段选择（金额 | Token 二选一）与表单分组显隐。
+   fg-sub 用 display:contents 融入外层 form-grid 网格流；
+   隐藏走 .off 类而不是 hidden 属性（display:contents 会压掉 UA 的 hidden 规则）。 */
+.seg{
+  display:inline-flex;padding:2px;border-radius:var(--r-ctl);
+  background:var(--sunken);border:1px solid var(--line);
 }
-.bal-name{color:var(--fg2)}
-.bal-bar{height:6px;border-radius:3px;background:var(--track);overflow:hidden}
-.bal-bar>span{display:block;height:100%;border-radius:3px;background:var(--signal)}
+.seg button{
+  padding:5px 14px;border-radius:calc(var(--r-ctl) - 2px);
+  border:0;background:transparent;color:var(--fg3);
+  font:600 12px/1.4 var(--ui);cursor:pointer;white-space:nowrap;
+  transition:background .14s ease,color .14s ease;
+}
+.seg button:hover{color:var(--fg)}
+.seg button.on{background:var(--bezel);color:var(--signal);box-shadow:var(--shadow)}
+.seg button:focus-visible{outline:2px solid var(--focus);outline-offset:1px}
+.kd-mode-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.fg-sub{display:contents}
+.fg-sub.off{display:none}
+.bal-row{display:grid;gap:4px;font-size:12px}
+.bal-line{display:flex;align-items:baseline;justify-content:space-between;gap:8px;min-width:0}
+.bal-name{color:var(--fg2);flex:none}
+.bal-bar{height:5px;border-radius:2.5px;background:var(--track);overflow:hidden}
+.bal-bar>span{display:block;height:100%;border-radius:2.5px;background:var(--signal)}
 .bal-row[data-state="warn"] .bal-bar>span{background:var(--warn)}
 .bal-row[data-state="alarm"] .bal-bar>span{background:var(--alarm)}
 .bal-val{
   font-variant-numeric:tabular-nums;color:var(--fg2);
   white-space:nowrap;font-size:11.5px;
+  overflow:hidden;text-overflow:ellipsis;
 }
-.bal-row.bal-off{grid-template-columns:52px auto}
+.bal-off{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .bal-off .bal-free{color:var(--fg4)}
 .secret{
   display:grid;gap:8px;padding:12px;border-radius:10px;

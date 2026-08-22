@@ -1244,11 +1244,11 @@ async function refreshKeys() {
   const r = await api('/keys?' + q);
   keysView.cache = r.items || [];
   applyKeyFilter();
-  // 抽屉开着时同步刷新其内容；对象已被删除则收起抽屉。
-  const d = $('key-drawer');
-  if (!d.hidden && d.dataset.kid) {
+  // 详情 dialog 开着时同步刷新其内容；对象已被删除则关闭。
+  const d = $('key-dialog');
+  if (d.open && d.dataset.kid) {
     const nk = keysView.cache.find(x => x.kid === d.dataset.kid);
-    if (nk) renderKeyDrawer(nk); else closeKeyDrawer();
+    if (nk) renderKeyDialog(nk); else animateCloseKeyDialog();
   }
   stamp();
 }
@@ -1291,7 +1291,7 @@ function cycleKeysNow(d = new Date()) {
 function todaySpent(k) {
   return k.daily_cycle_key === cycleKeysNow().daily ? k.daily_spent_micro_usd : 0;
 }
-// balRow dialog 配额清单的一行：名称 + 单条进度 + 「余 X / 上限」，对齐排布。
+// balRow 配额清单的一行：名称+「余 X / 上限」一行、细进度条一行，窄栏（对半分块）下不挤。
 // limit 未设显示不限；余量缺失显示 — 而非伪装成额度耗尽。
 function balRow(name, limit, remain, fmt) {
   if (!limit || limit <= 0) {
@@ -1299,17 +1299,16 @@ function balRow(name, limit, remain, fmt) {
       + '<span class="bal-free">不限</span></div>';
   }
   if (remain === null || remain === undefined) {
-    return '<div class="bal-row"><span class="bal-name">' + name + '</span>'
-      + '<span class="bal-bar"><span></span></span>'
-      + '<span class="bal-val" title="余量数据缺失">—</span></div>';
+    return '<div class="bal-row"><div class="bal-line"><span class="bal-name">' + name + '</span>'
+      + '<span class="bal-val" title="余量数据缺失">—</span></div></div>';
   }
   const used = Math.min(limit, Math.max(0, limit - remain));
   const pct = Math.min(100, Math.max(0, used / limit * 100));
   const state = pct >= 95 ? 'alarm' : pct >= 80 ? 'warn' : '';
   return '<div class="bal-row" data-state="' + state + '">'
-    + '<span class="bal-name">' + name + '</span>'
-    + '<span class="bal-bar"><span style="width:' + pct.toFixed(1) + '%"></span></span>'
-    + '<span class="bal-val mono">余 ' + fmt(Math.max(0, remain)) + ' / ' + fmt(limit) + '</span></div>';
+    + '<div class="bal-line"><span class="bal-name">' + name + '</span>'
+    + '<span class="bal-val mono">余 ' + fmt(Math.max(0, remain)) + ' / ' + fmt(limit) + '</span></div>'
+    + '<span class="bal-bar"><span style="width:' + pct.toFixed(1) + '%"></span></span></div>';
 }
 function renderKeys() {
   const list = keysView.filtered;
@@ -1335,75 +1334,92 @@ function renderKeys() {
 
 // usdPick / tokPick 选出卡片余量块展示的那一档：优先总额，其次当前周期
 // 尚未滚动的日/周/月（cycle key 不匹配即已跨期归零，读数按 0 计）。
+// 用 null 判空而非真值判断：0 是「禁用」级真实限额，要照常渲染。
 function usdPick(k) {
   const c = cycleKeysNow();
-  if (k.quota_micro_usd) return { lim: k.quota_micro_usd, used: k.spent_micro_usd };
-  if (k.daily_micro_usd) return { lim: k.daily_micro_usd, used: k.daily_cycle_key === c.daily ? k.daily_spent_micro_usd : 0 };
-  if (k.weekly_micro_usd) return { lim: k.weekly_micro_usd, used: k.weekly_cycle_key === c.weekly ? k.weekly_spent_micro_usd : 0 };
-  if (k.monthly_micro_usd) return { lim: k.monthly_micro_usd, used: k.monthly_cycle_key === c.monthly ? k.monthly_spent_micro_usd : 0 };
+  if (k.quota_micro_usd !== null && k.quota_micro_usd !== undefined) return { lim: k.quota_micro_usd, used: k.spent_micro_usd };
+  if (k.daily_micro_usd !== null && k.daily_micro_usd !== undefined) return { lim: k.daily_micro_usd, used: k.daily_cycle_key === c.daily ? k.daily_spent_micro_usd : 0 };
+  if (k.weekly_micro_usd !== null && k.weekly_micro_usd !== undefined) return { lim: k.weekly_micro_usd, used: k.weekly_cycle_key === c.weekly ? k.weekly_spent_micro_usd : 0 };
+  if (k.monthly_micro_usd !== null && k.monthly_micro_usd !== undefined) return { lim: k.monthly_micro_usd, used: k.monthly_cycle_key === c.monthly ? k.monthly_spent_micro_usd : 0 };
   return null;
 }
 function tokPick(k) {
   const c = cycleKeysNow();
-  if (k.token_limit) return { lim: k.token_limit, used: k.tokens_used };
-  if (k.daily_token_limit) return { lim: k.daily_token_limit, used: k.daily_cycle_key === c.daily ? k.daily_tokens_used : 0 };
-  if (k.weekly_token_limit) return { lim: k.weekly_token_limit, used: k.weekly_cycle_key === c.weekly ? k.weekly_tokens_used : 0 };
-  if (k.monthly_token_limit) return { lim: k.monthly_token_limit, used: k.monthly_cycle_key === c.monthly ? k.monthly_tokens_used : 0 };
+  if (k.token_limit !== null && k.token_limit !== undefined) return { lim: k.token_limit, used: k.tokens_used };
+  if (k.daily_token_limit !== null && k.daily_token_limit !== undefined) return { lim: k.daily_token_limit, used: k.daily_cycle_key === c.daily ? k.daily_tokens_used : 0 };
+  if (k.weekly_token_limit !== null && k.weekly_token_limit !== undefined) return { lim: k.weekly_token_limit, used: k.weekly_cycle_key === c.weekly ? k.weekly_tokens_used : 0 };
+  if (k.monthly_token_limit !== null && k.monthly_token_limit !== undefined) return { lim: k.monthly_token_limit, used: k.monthly_cycle_key === c.monthly ? k.monthly_tokens_used : 0 };
   return null;
 }
-// keyQuota 卡片余量块：大数字余量 + 细进度条 + 「已用 / 上限」说明。
-function keyQuota(q, kind, fmt) {
+// keyQuotaCell 卡片半格：标签、大字「余额 + 已用」一行，细进度条贴底
+// 像一条边框带；两半的条同高对齐，读起来就是卡片下缘的一圈刻度。
+function keyQuotaCell(q, kind, label, fmt) {
   const remain = Math.max(0, q.lim - q.used);
-  const pct = Math.min(100, q.used / q.lim * 100);
-  return '<div class="ky-quota" data-kind="' + kind + '"'
-    + ' data-state="' + (pct >= 95 ? 'alarm' : pct >= 80 ? 'warn' : '') + '">'
-    + '<div class="ky-quota-row"><span class="ky-quota-num mono">' + fmt(remain) + '</span>'
-    + '<span class="ky-quota-cap mono">已用 ' + fmt(q.used) + ' / ' + fmt(q.lim) + '</span></div>'
-    + '<div class="ky-bar"><span style="width:' + pct.toFixed(1) + '%"></span></div>'
+  const pct = q.lim > 0 ? Math.min(100, q.used / q.lim * 100) : 100;
+  const state = q.lim <= 0 || pct >= 95 ? 'alarm' : pct >= 80 ? 'warn' : '';
+  return '<div class="ky-cell" data-kind="' + kind + '" data-state="' + state + '"'
+    + ' title="已用 ' + fmt(q.used) + ' / 上限 ' + fmt(q.lim) + '">'
+    + '<span class="ky-cell-label">' + label + '</span>'
+    + '<span class="ky-quota-row"><span class="ky-quota-num mono">余 ' + fmt(remain) + '</span>'
+    + '<span class="ky-used mono">已用 ' + fmt(q.used) + '</span></span>'
+    + '<span class="ky-bar"><span style="width:' + pct.toFixed(1) + '%"></span></span>'
     + '</div>';
 }
 const COPY_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
 function kidShort(kid) {
-  return kid.length > 18 ? kid.slice(0, 8) + '…' + kid.slice(-6) : kid;
+  return kid.length > 12 ? kid.slice(0, 6) + '…' + kid.slice(-4) : kid;
 }
 function keyCardHTML(k) {
   const meta = STATUS_META[keyStatus(k)];
   const u = usdPick(k), t = tokPick(k);
+  const cells =
+    (u ? keyQuotaCell(u, 'usd', '金额（USD）', fmtUSD) : '')
+    + (t ? keyQuotaCell(t, 'tok', 'Token', fmtTok) : '');
   return '<article class="ky-card" data-kid="' + esc(k.kid) + '" role="listitem" tabindex="0">'
     + '<div class="ky-card-top">'
     + '<span class="pill ' + meta.pill + '">' + meta.label + '</span>'
     + '<span class="ky-when">' + esc(rel(k.last_used_at)) + '</span></div>'
+    + '<div class="ky-name-row">'
     + '<h3 class="ky-name">' + (k.label ? esc(k.label) : '<i>无标签</i>') + '</h3>'
-    + '<button type="button" class="ky-kid mono" data-copy="' + esc(k.kid) + '" title="点击复制完整 kid">'
+    + '<button type="button" class="ky-kid mono" data-copy="' + esc(k.kid) + '" title="点击复制完整 kid：' + esc(k.kid) + '">'
     + '<span>' + esc(kidShort(k.kid)) + '</span>' + COPY_SVG + '</button>'
-    + (u ? keyQuota(u, 'usd', fmtUSD) : '')
-    + (t ? keyQuota(t, 'tok', fmtTok) : '')
+    + '</div>'
+    + (cells
+      ? '<div class="ky-split' + (u && t ? '' : ' ky-single') + '">' + cells + '</div>'
+      : '<div class="ky-spent mono">累计已用 ' + fmtUSD(k.spent_micro_usd) + '</div>')
     + '<footer class="ky-meta">'
-    + '<span class="mono">' + esc(k.caller_id || '-') + '</span>'
+    + '<span class="ky-pair"><b>' + esc(k.caller_id || '-') + '</b>' + (k.caller_scope === 'key' ? '独立计额' : '归属 caller') + '</span>'
     + '<span>并发 ' + (k.max_concurrent_requests > 0 ? '≤ ' + k.max_concurrent_requests : '不限') + '</span>'
-    + '<span>' + (k.caller_scope === 'key' ? '独立计额' : '归属 caller') + '</span>'
     + '</footer></article>';
 }
 
-// ---------- 详情抽屉 ----------
-// balanceSeq 守卫：快速连续打开抽屉时，晚返回的旧余额不得覆盖当前内容。
-function renderKeyDrawer(k) {
+// ---------- 详情 dialog ----------
+// balanceSeq 守卫：快速连续打开时，晚返回的旧余额不得覆盖当前内容。
+// balSkeletonRow 余额加载占位行：与 balRow 结构一致，数据到达原位替换不跳动。
+function balSkeletonRow(name) {
+  return '<div class="bal-row"><div class="bal-line"><span class="bal-name">' + name + '</span>'
+    + '<span class="bal-val">—</span></div>'
+    + '<span class="bal-bar"><span class="skel"></span></span></div>';
+}
+function renderKeyDialog(k) {
   const kid = k.kid;
   const st = keyStatus(k);
   const meta = STATUS_META[st];
-  const d = $('key-drawer');
+  // 只有配了 token 限额的 Key 才显示 token 那组配额，避免未用该功能的 Key
+  // 详情里多出四行「不限」的空清单。骨架结构据此预先确定。
+  const hasTok = [k.token_limit, k.daily_token_limit, k.weekly_token_limit, k.monthly_token_limit]
+    .some(v => v !== null && v !== undefined);
+  const d = $('key-dialog');
   d.dataset.kid = kid;
   d.innerHTML =
-    '<header class="ky-drawer-head">'
-    + '<div class="ky-drawer-id">'
+    '<header class="kd-head">'
     + '<h3>' + (k.label ? esc(k.label) : '<i>无标签</i>') + '</h3>'
     + '<span class="pill ' + meta.pill + '">' + meta.label + '</span>'
-    + '</div>'
-    + '<button type="button" class="ky-drawer-close" aria-label="关闭详情">'
+    + '<button type="button" class="kd-close" aria-label="关闭详情">'
     + '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>'
     + '</button></header>'
-    + '<div class="ky-drawer-body">'
-    + '<button type="button" class="ky-kid wide mono" data-copy="' + esc(kid) + '" title="点击复制完整 kid">'
+    + '<div class="kd-body">'
+    + '<button type="button" class="ky-kid wide mono" data-copy="' + esc(kid) + '" title="点击复制完整 kid：' + esc(kid) + '">'
     + '<span>' + esc(kid) + '</span>' + COPY_SVG + '</button>'
     + '<div class="detail-facts">'
     + fact('principal', k.principal || '-')
@@ -1415,9 +1431,20 @@ function renderKeyDrawer(k) {
     + fact('可用模型', (k.allowed_models && k.allowed_models.length) ? k.allowed_models.join(', ') : '不限制')
     + fact('最近使用', rel(k.last_used_at))
     + '</div>'
-    + '<div class="bal-wrap" id="kd-meters"><p class="note">余额核算中…</p></div>'
+    // 金额 | Token 对半两块；未配 token 时金额块独占整行
+    + '<div class="kd-meters" id="kd-meters">'
+    + '<section class="kd-quota-block"><div class="bal-title">金额额度（USD）</div>'
+    + balSkeletonRow('总额度') + balSkeletonRow('今日') + balSkeletonRow('本周') + balSkeletonRow('本月')
+    + '</section>'
+    + (hasTok
+      ? '<section class="kd-quota-block"><div class="bal-title">Token 限额</div>'
+        + balSkeletonRow('总量') + balSkeletonRow('今日') + balSkeletonRow('本周') + balSkeletonRow('本月')
+        + '</section>'
+      : '')
+    + '</div>'
+    + '<p class="note" id="kd-note">余额核算中…</p>'
     + '<div class="btn-row">'
-    + '<button type="button" class="btn small" data-act="edit">编辑</button>'
+    + '<button type="button" class="btn small primary" data-act="edit">编辑</button>'
     + '<button type="button" class="btn small" data-act="rotate">轮换</button>'
     + '<button type="button" class="btn small" data-act="reveal">查看明文</button>'
     + (st !== 'revoked' ? '<button type="button" class="btn small danger" data-act="revoke">撤销</button>' : '')
@@ -1435,63 +1462,50 @@ function renderKeyDrawer(k) {
   wire('delete').onclick = () => confirmSheet('删除密钥 ' + kid,
     '永久删除该 Key（历史用量保留）。操作不可逆。',
     () => post('/keys/delete', { kid, actor: 'console' }).then(refreshKeys));
-  d.querySelector('.ky-drawer-close').onclick = closeKeyDrawer;
+  d.querySelector('.kd-close').onclick = animateCloseKeyDialog;
 
   const seq = ++keysView.balanceSeq;
   api('/balance?key_id=' + encodeURIComponent(kid)).then(b => {
-    if (seq !== keysView.balanceSeq || d.hidden || d.dataset.kid !== kid) return;
+    if (seq !== keysView.balanceSeq || !d.open || d.dataset.kid !== kid) return;
     const wrap = $('kd-meters');
     if (!wrap) return;
-    // 只有配了 token 限额的 Key 才显示 token 那组配额，避免未用该功能的 Key
-    // 详情里多出四行「不限」的空清单。
-    const hasTok = [k.token_limit, k.daily_token_limit, k.weekly_token_limit, k.monthly_token_limit]
-      .some(v => v !== null && v !== undefined);
-    // 字段名必须与 service.Balance 的 JSON tag 一致。
+    // 字段名必须与 service.Balance 的 JSON tag 一致。结构与骨架一致，原位替换无跳动。
     wrap.innerHTML =
-      '<div class="bal-sec"><div class="bal-title">金额额度（USD）</div>'
+      '<section class="kd-quota-block"><div class="bal-title">金额额度（USD）</div>'
       + balRow('总额度', k.quota_micro_usd, b.total_remaining_micro_usd, fmtUSD)
       + balRow('今日', k.daily_micro_usd, b.daily_remaining_micro_usd, fmtUSD)
       + balRow('本周', k.weekly_micro_usd, b.weekly_remaining_micro_usd, fmtUSD)
       + balRow('本月', k.monthly_micro_usd, b.monthly_remaining_micro_usd, fmtUSD)
-      + '</div>'
+      + '</section>'
       + (hasTok
-        ? '<div class="bal-sec"><div class="bal-title">Token 限额</div>'
+        ? '<section class="kd-quota-block"><div class="bal-title">Token 限额</div>'
           + balRow('总量', k.token_limit, b.total_remaining_tokens, fmtTok)
           + balRow('今日', k.daily_token_limit, b.daily_remaining_tokens, fmtTok)
           + balRow('本周', k.weekly_token_limit, b.weekly_remaining_tokens, fmtTok)
           + balRow('本月', k.monthly_token_limit, b.monthly_remaining_tokens, fmtTok)
-          + '</div>'
-        : '')
-      + '<p class="note">在途预占 ' + fmtUSD(b.held_micro_usd || 0)
+          + '</section>'
+        : '');
+    const note = $('kd-note');
+    if (note) note.textContent = '在途预占 ' + fmtUSD(b.held_micro_usd || 0)
       + (hasTok ? ' / ' + fmtTok(b.held_tokens) + ' token' : '')
-      + ' · 当前周期 ' + cycleKeysNow().daily + '</p>';
+      + ' · 当前周期 ' + cycleKeysNow().daily;
   }).catch(() => { /* 余额核算失败不打断详情 */ });
 }
 
-let kdOpener = null;   // 关闭抽屉后焦点回到打开它的卡片
-function openKeyDrawer(kid, opener) {
+let kdOpener = null;   // 关闭 dialog 后焦点回到打开它的卡片
+function openKeyDialog(kid, opener) {
   const k = keysView.cache.find(x => x.kid === kid);
   if (!k) return;
   if (opener) kdOpener = opener;
-  renderKeyDrawer(k);
-  $('kd-backdrop').hidden = false;
-  const d = $('key-drawer');
-  d.hidden = false;
-  requestAnimationFrame(() => {
-    $('kd-backdrop').classList.add('open');
-    d.classList.add('open');
-  });
-  const closeBtn = d.querySelector('.ky-drawer-close');
-  if (closeBtn) closeBtn.focus();
+  renderKeyDialog(k);
+  $('key-dialog').showModal();
 }
-function closeKeyDrawer() {
-  const d = $('key-drawer');
-  if (d.hidden) return;
-  d.classList.remove('open');
-  $('kd-backdrop').classList.remove('open');
-  setTimeout(() => { d.hidden = true; $('kd-backdrop').hidden = true; }, 230);
-  if (kdOpener && document.contains(kdOpener)) kdOpener.focus();
-  kdOpener = null;
+// 关闭过渡：原生 close() 是瞬时消失，先播退出动画再真正关闭
+function animateCloseKeyDialog() {
+  const dlg = $('key-dialog');
+  if (!dlg.open || dlg.classList.contains('closing')) return;
+  dlg.classList.add('closing');
+  setTimeout(() => { dlg.classList.remove('closing'); dlg.close(); }, 150);
 }
 
 $('key-rows').addEventListener('click', e => {
@@ -1501,22 +1515,29 @@ $('key-rows').addEventListener('click', e => {
     return;
   }
   const card = e.target.closest('.ky-card');
-  if (card) openKeyDrawer(card.dataset.kid, card);
+  if (card) openKeyDialog(card.dataset.kid, card);
 });
 $('key-rows').addEventListener('keydown', e => {
   if (e.key !== 'Enter' && e.key !== ' ') return;
   const card = e.target.closest('.ky-card');
   if (!card || e.target !== card) return;
   e.preventDefault();
-  openKeyDrawer(card.dataset.kid, card);
+  openKeyDialog(card.dataset.kid, card);
 });
-$('kd-backdrop').addEventListener('click', closeKeyDrawer);
-// Esc 逐层关闭：下拉/范围弹层/对话框优先（各自的处理器负责），轮到抽屉才关。
-window.addEventListener('keydown', e => {
-  if (e.key !== 'Escape' || $('key-drawer').hidden) return;
-  if (openSel || !$('range-pop').hidden || document.querySelector('dialog[open]')) return;
+// dialog：背板点击关闭；内部 kid 复制行与网格同一套 data-copy 约定。
+// Esc 经 cancel 事件接入同一套退出动画（preventDefault 后自行关闭）。
+$('key-dialog').addEventListener('click', e => {
+  if (e.target === e.currentTarget) { animateCloseKeyDialog(); return; }
+  const copy = e.target.closest('[data-copy]');
+  if (copy) copyText(copy.dataset.copy).then(() => toast('kid 已复制')).catch(() => toast('复制失败', 'err'));
+});
+$('key-dialog').addEventListener('cancel', e => {
   e.preventDefault();
-  closeKeyDrawer();
+  animateCloseKeyDialog();
+});
+$('key-dialog').addEventListener('close', () => {
+  if (kdOpener && document.contains(kdOpener)) kdOpener.focus();
+  kdOpener = null;
 });
 
 $('key-search').addEventListener('input', debounce(() => {
@@ -1578,23 +1599,42 @@ $('key-issue-btn').addEventListener('click', () => {
         '<select id="f-scope"><option value="caller">归属 caller 共享</option><option value="key">独立计额</option></select>')
       + fieldRow('过期时间', '<input id="f-expires" type="datetime-local">')
       + fieldRow('最大并发', '<input id="f-conc" type="number" min="0" placeholder="0 为不限">')
-      + '<div class="form-sep wide">' + labelWithTip('金额限额（USD）', TIPS.moneyLimit) + '</div>'
-      + fieldRow('总额度', '<input id="f-quota" inputmode="decimal" placeholder="留空为不限">')
+      + '<div class="form-sep wide kd-mode-row"><div class="seg" id="f-mode" role="group" aria-label="计费方式">'
+      + '<button type="button" data-m="usd">按金额（USD）</button>'
+      + '<button type="button" data-m="tok">按 Token</button></div>'
+      + '<span class="note">二选一：一个 Key 只能用一种计费方式</span></div>'
+      + '<div class="fg-sub" id="g-money">'
+      + fieldRow(labelWithTip('总额度', TIPS.moneyLimit), '<input id="f-quota" inputmode="decimal" placeholder="留空为不限">')
       + fieldRow('日限额', '<input id="f-daily" inputmode="decimal" placeholder="留空为不限">')
       + fieldRow('周限额', '<input id="f-weekly" inputmode="decimal" placeholder="留空为不限">')
       + fieldRow('月限额', '<input id="f-monthly" inputmode="decimal" placeholder="留空为不限">')
-      + '<div class="form-sep wide">' + labelWithTip('Token 限额', TIPS.tokenLimit) + '</div>'
-      + fieldRow('总量', '<input id="f-tok" inputmode="numeric" placeholder="留空为不限">')
+      + '</div>'
+      + '<div class="fg-sub off" id="g-tok">'
+      + fieldRow(labelWithTip('总量', TIPS.tokenLimit), '<input id="f-tok" inputmode="numeric" placeholder="留空为不限，支持 500k / 1.5m">')
       + fieldRow('日限额', '<input id="f-tok-daily" inputmode="numeric" placeholder="留空为不限">')
       + fieldRow('周限额', '<input id="f-tok-weekly" inputmode="numeric" placeholder="留空为不限">')
       + fieldRow('月限额', '<input id="f-tok-monthly" inputmode="numeric" placeholder="留空为不限">')
+      + '</div>'
       + fieldRow('可用模型', '<textarea id="f-models" placeholder="逗号或换行分隔，支持 * 通配；留空不限制"></textarea>', 'wide')
       + '</div>',
-    note: '明文只在签发结果里出现一次。金额与 Token 限额可同时设置，任一触顶即拒绝。',
+    note: '明文只在签发结果里出现一次。计费方式金额/Token 二选一；限额留空为不限。',
     onOk: async () => {
-      const num = id => { const v = $(id).value.trim(); return v ? Math.round(parseFloat(v) * 1e6) : null; };
+      const mode = document.querySelector('#f-mode button.on').dataset.m;
+      const num = id => {
+        const v = $(id).value.trim();
+        if (!v || v === '-1') return null;
+        const n = parseFloat(v);
+        if (!isFinite(n) || n < 0) throw new Error('金额限额须为不小于 0 的数字');
+        return Math.round(n * 1e6);
+      };
       // token 数支持 1000 / 1k / 1.5m / 2b 几种写法，避免手数零
-      const tok = id => parseTokens($(id).value);
+      const tok = id => {
+        const v = $(id).value.trim();
+        if (!v || v === '-1') return null;
+        const n = parseTokens(v);
+        if (n < 0) throw new Error('Token 限额不接受负数');
+        return n;
+      };
       const models = $('f-models').value.split(/[\n,，]/).map(s => s.trim()).filter(Boolean);
       const expires = $('f-expires').value ? new Date($('f-expires').value).toISOString() : null;
       const r = await post('/keys/issue', {
@@ -1602,14 +1642,14 @@ $('key-issue-btn').addEventListener('click', () => {
         principal: $('f-principal').value.trim(),
         caller_id: $('f-caller').value || 'default',
         caller_scope: $('f-scope').value,
-        quota_micro_usd: num('f-quota'),
-        daily_micro_usd: num('f-daily'),
-        weekly_micro_usd: num('f-weekly'),
-        monthly_micro_usd: num('f-monthly'),
-        token_limit: tok('f-tok'),
-        daily_token_limit: tok('f-tok-daily'),
-        weekly_token_limit: tok('f-tok-weekly'),
-        monthly_token_limit: tok('f-tok-monthly'),
+        quota_micro_usd: mode === 'usd' ? num('f-quota') : null,
+        daily_micro_usd: mode === 'usd' ? num('f-daily') : null,
+        weekly_micro_usd: mode === 'usd' ? num('f-weekly') : null,
+        monthly_micro_usd: mode === 'usd' ? num('f-monthly') : null,
+        token_limit: mode === 'tok' ? tok('f-tok') : null,
+        daily_token_limit: mode === 'tok' ? tok('f-tok-daily') : null,
+        weekly_token_limit: mode === 'tok' ? tok('f-tok-weekly') : null,
+        monthly_token_limit: mode === 'tok' ? tok('f-tok-monthly') : null,
         max_concurrent_requests: parseInt($('f-conc').value, 10) || 0,
         allowed_models: models,
         expires_at: expires,
@@ -1625,6 +1665,17 @@ $('key-issue-btn').addEventListener('click', () => {
       return false;
     },
   });
+  // 计费方式切换（openSheet 同步建好 DOM，这里直接绑）
+  const setMode = m => {
+    $('g-money').classList.toggle('off', m !== 'usd');
+    $('g-tok').classList.toggle('off', m !== 'tok');
+    document.querySelectorAll('#f-mode button').forEach(b => b.classList.toggle('on', b.dataset.m === m));
+  };
+  $('f-mode').addEventListener('click', e => {
+    const b = e.target.closest('button[data-m]');
+    if (b) setMode(b.dataset.m);
+  });
+  setMode('usd');
 });
 
 // 编辑
@@ -1641,68 +1692,82 @@ function editKeySheet(k) {
     ['e-tok-weekly', 'weekly_token_limit', '周限额'],
     ['e-tok-monthly', 'monthly_token_limit', '月限额'],
   ];
-  // 占位符显示当前值，让「留空=不改」这条语义下用户仍能看到现状
-  const curMoney = f => k[f] === null || k[f] === undefined ? '当前：不限' : '当前：' + fmtUSD(k[f]);
-  const curTok = f => k[f] === null || k[f] === undefined ? '当前：不限' : '当前：' + fmtTok(k[f]);
+  // 全量回填当前生效值：不限显示 -1，用户在现有基础上直接改。
+  // 提交时所有字段原样发回（-1 由后端归一为不限），不再有「留空=不改」的隐式语义。
+  const curMoney = f => k[f] === null || k[f] === undefined ? '-1' : String(k[f] / 1e6);
+  const curTok = f => k[f] === null || k[f] === undefined ? '-1' : String(k[f]);
   openSheet({
     title: '编辑密钥 ' + k.kid,
     okText: '保存',
     body: '<div class="form-grid">'
       + fieldRow('标签', '<input id="e-label" value="' + esc(k.label || '') + '">')
-      + fieldRow('启用', '<select id="e-enabled"><option value="">保持不变</option>'
-        + '<option value="true"' + (k.enabled ? ' selected' : '') + '>是</option>'
+      + fieldRow('启用', '<select id="e-enabled"><option value="true"' + (k.enabled ? ' selected' : '') + '>是</option>'
         + '<option value="false"' + (!k.enabled ? ' selected' : '') + '>否</option></select>')
       + fieldRow('过期时间', '<input id="e-expires" type="datetime-local" value="'
         + (k.expires_at ? toLocalInput(new Date(k.expires_at)) : '') + '">')
       + fieldRow('最大并发', '<input id="e-conc" type="number" min="0" value="' + (k.max_concurrent_requests || 0) + '">')
-      + '<div class="form-sep wide">' + labelWithTip('金额限额（USD）', TIPS.moneyLimit) + '</div>'
+      + '<div class="form-sep wide kd-mode-row"><div class="seg" id="e-mode" role="group" aria-label="计费方式">'
+      + '<button type="button" data-m="usd">按金额（USD）</button>'
+      + '<button type="button" data-m="tok">按 Token</button></div>'
+      + '<span class="note">二选一：切换后另一族限额会被清除</span></div>'
+      + '<div class="fg-sub" id="g-money">'
       + MONEY_FIELDS.map(([id, field, label]) =>
-        fieldRow(label, '<input id="' + id + '" inputmode="decimal" placeholder="'
+        fieldRow(label, '<input id="' + id + '" inputmode="decimal" value="'
           + esc(curMoney(field)) + '">')).join('')
-      + '<div class="form-sep wide">' + labelWithTip('Token 限额', TIPS.tokenLimit) + '</div>'
+      + '</div>'
+      + '<div class="fg-sub off" id="g-tok">'
       + TOKEN_FIELDS.map(([id, field, label]) =>
-        fieldRow(label, '<input id="' + id + '" inputmode="numeric" placeholder="'
+        fieldRow(label, '<input id="' + id + '" inputmode="numeric" value="'
           + esc(curTok(field)) + '">')).join('')
-      + fieldRow('可用模型', '<textarea id="e-models" placeholder="留空清空清单；输入 null 表示不修改">'
+      + '</div>'
+      + fieldRow('可用模型', '<textarea id="e-models" placeholder="留空表示不限制模型">'
         + esc((k.allowed_models || []).join(', ')) + '</textarea>', 'wide')
       + '</div>',
-    note: '限额字段留空表示不修改；输入 null 表示清除该限制（改为不限）。Token 可写 500k / 1.5m。',
+    note: '字段已按当前值回填，改完保存即可。计费方式金额/Token 二选一，切换后另一族清除。限额：正数=上限，0=禁用，-1=不限；Token 也接受 500k / 1.5m 写法。过期时间留空表示永不过期。',
     onOk: async () => {
+      const mode = $('g-tok').classList.contains('off') ? 'usd' : 'tok';
       const body = { kid: k.kid, actor: 'console' };
-      const label = $('e-label').value.trim();
-      if (label !== (k.label || '')) body.label = label;
-      if ($('e-enabled').value !== '') body.enabled = $('e-enabled').value === 'true';
+      body.label = $('e-label').value.trim();
+      body.enabled = $('e-enabled').value === 'true';
       const exp = $('e-expires').value;
-      if (exp) body.expires_at = new Date(exp).toISOString();
-      else if (k.expires_at) body.expires_at = null;
-      const conc = $('e-conc').value;
-      if (conc !== '' && (parseInt(conc, 10) || 0) !== k.max_concurrent_requests)
-        body.max_concurrent_requests = parseInt(conc, 10) || 0;
+      body.expires_at = exp ? new Date(exp).toISOString() : null;
+      body.max_concurrent_requests = parseInt($('e-conc').value, 10) || 0;
       for (const [id, field] of TOKEN_FIELDS) {
-        const v = $(id).value.trim();
-        if (v === '') continue;
-        if (v.toLowerCase() === 'null') { body[field] = null; continue; }
-        const n = parseTokens(v); // 非法写法直接抛错，由 sheet 捕获成提示
-        if (n !== k[field]) body[field] = n;
+        if (mode !== 'tok') { body[field] = -1; continue; }
+        const raw = $(id).value.trim();
+        if (raw === '' || raw === '-1') { body[field] = -1; continue; }
+        const n = parseTokens(raw); // 非法写法直接抛错，由 sheet 捕获成提示
+        if (n < 0) throw new Error('Token 限额不接受负数；-1 表示不限');
+        body[field] = n;
       }
       for (const [id, field] of MONEY_FIELDS) {
-        const v = $(id).value.trim();
-        if (v === '') continue;
-        if (v.toLowerCase() === 'null') { body[field] = null; continue; }
-        const m = Math.round(parseFloat(v) * 1e6);
-        const cur = k[field];
-        if (cur === null || cur === undefined || m !== cur) body[field] = m;
+        if (mode !== 'usd') { body[field] = -1; continue; }
+        const raw = $(id).value.trim();
+        if (raw === '' || raw === '-1') { body[field] = -1; continue; }
+        const numv = parseFloat(raw);
+        if (!isFinite(numv) || numv < 0) throw new Error('金额限额须为不小于 0 的数字（-1 表示不限）');
+        body[field] = Math.round(numv * 1e6);
       }
       const modelsRaw = $('e-models').value.trim();
-      const modelsCur = (k.allowed_models || []).join(', ');
-      if (modelsRaw.toLowerCase() === 'null') { /* 保持不变 */ }
-      else if (modelsRaw !== modelsCur)
-        body.allowed_models = modelsRaw ? modelsRaw.split(/[\n,，]/).map(s => s.trim()).filter(Boolean) : [];
+      body.allowed_models = modelsRaw
+        ? modelsRaw.split(/[\n,，]/).map(s => s.trim()).filter(Boolean)
+        : [];
       await post('/keys/update', body);
       toast('密钥已更新', 'ok');
       refreshKeys().catch(() => {});
     },
   });
+  // 计费方式切换：默认沿用该 Key 现有口径（配了 token 即 tok），切换后另一族提交 -1 清除
+  const setMode = m => {
+    $('g-money').classList.toggle('off', m !== 'usd');
+    $('g-tok').classList.toggle('off', m !== 'tok');
+    document.querySelectorAll('#e-mode button').forEach(b => b.classList.toggle('on', b.dataset.m === m));
+  };
+  $('e-mode').addEventListener('click', e => {
+    const b = e.target.closest('button[data-m]');
+    if (b) setMode(b.dataset.m);
+  });
+  setMode(tokPick(k) ? 'tok' : 'usd');
 }
 function rotateSheet(kid) {
   openSheet({

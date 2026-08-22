@@ -138,12 +138,12 @@
         <h2 class="ky-title">密钥</h2>
         <p class="panel-sub" id="key-count">—</p>
       </div>
+    </header>
+    <div class="keys-toolbar">
       <button type="button" class="btn primary" id="key-issue-btn">
         <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
         <span>签发密钥</span>
       </button>
-    </header>
-    <div class="keys-toolbar">
       <div class="ky-search">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
         <input id="key-search" type="search" placeholder="搜索标签或 kid…" spellcheck="false" aria-label="搜索密钥">
@@ -156,9 +156,8 @@
   </article>
 </section>
 
-<!-- 密钥详情抽屉（右侧滑出） -->
-<div class="ky-backdrop" id="kd-backdrop" hidden></div>
-<aside class="ky-drawer" id="key-drawer" role="dialog" aria-modal="true" aria-label="密钥详情" hidden></aside>
+<!-- 密钥详情（居中 dialog；右缘滑出会盖住宿主管理页右上角的按钮区，故用弹窗） -->
+<dialog class="kd-dialog" id="key-dialog"></dialog>
 
 <!-- ── 用量 ─────────────────────────────────────────────────────── -->
 <section class="view" id="view-usage" role="tabpanel" aria-labelledby="tab-usage" hidden>
