@@ -11,3 +11,6 @@ abi-smoke.exe
 
 # 本地运行产生的数据目录
 data/
+
+# 本地编辑器/预览配置（.claude/launch.json 只服务本机 devserver 预览）
+.claude/

@@ -70,12 +70,12 @@
   </div>
 
   <nav class="tabs" id="tabs" role="tablist" aria-label="面板分区">
-    <button role="tab" class="tab" data-tab="overview">概览</button>
-    <button role="tab" class="tab" data-tab="keys">密钥<span class="tab-dot" data-badge="keys" hidden></span></button>
-    <button role="tab" class="tab" data-tab="usage">用量</button>
-    <button role="tab" class="tab" data-tab="pricing">价格</button>
-    <button role="tab" class="tab" data-tab="auth">认证额度</button>
-    <button role="tab" class="tab" data-tab="system">系统<span class="tab-dot alarm" data-badge="system" hidden></span></button>
+    <button role="tab" id="tab-overview" class="tab" data-tab="overview">概览</button>
+    <button role="tab" id="tab-keys" class="tab" data-tab="keys">密钥<span class="tab-dot" data-badge="keys" hidden></span></button>
+    <button role="tab" id="tab-usage" class="tab" data-tab="usage">用量</button>
+    <button role="tab" id="tab-pricing" class="tab" data-tab="pricing">价格</button>
+    <button role="tab" id="tab-auth" class="tab" data-tab="auth">认证额度</button>
+    <button role="tab" id="tab-system" class="tab" data-tab="system">系统<span class="tab-dot alarm" data-badge="system" hidden></span></button>
     <span class="tabs-meta mono" id="stamp"></span>
   </nav>
 </header>
@@ -94,22 +94,17 @@
       </div>
       <div class="panel-tools">
         <div class="legend" id="trend-legend"></div>
-        <select class="btn select" id="trend-metric" aria-label="趋势指标">
-          <option value="tokens">Token</option>
-          <option value="requests">请求</option>
-          <option value="cost">费用</option>
-        </select>
-        <select class="btn select" id="trend-grain" aria-label="聚合粒度">
-          <option value="minute">按分钟</option>
-          <option value="hour">按小时</option>
-          <option value="day" selected>按天</option>
-          <option value="week">按周</option>
-          <option value="month">按月</option>
-        </select>
+        <div class="seg" id="trend-view">
+          <button type="button" data-v="chart" class="on">图表</button>
+          <button type="button" data-v="table">表格</button>
+        </div>
+        <div class="sel" id="trend-metric" data-label="趋势指标"></div>
+        <div class="sel" id="trend-grain" data-label="聚合粒度"></div>
       </div>
     </div>
     <div class="panel-body chart-body">
       <div class="chart" id="trend-chart"></div>
+      <div class="chart-table" id="trend-table" hidden></div>
     </div>
   </article>
 
@@ -142,14 +137,8 @@
       <div><h2 class="panel-title">插件密钥</h2><p class="panel-sub" id="key-count">—</p></div>
       <div class="panel-tools">
         <input class="btn input" id="key-search" type="search" placeholder="搜索 kid 或标签" spellcheck="false">
-        <select class="btn select" id="key-caller" aria-label="按 caller 过滤"><option value="">全部 caller</option></select>
-        <select class="btn select" id="key-status" aria-label="按状态过滤">
-          <option value="">全部状态</option>
-          <option value="active">启用中</option>
-          <option value="disabled">已禁用</option>
-          <option value="revoked">已撤销</option>
-          <option value="expired">已过期</option>
-        </select>
+        <div class="sel" id="key-caller" data-label="按 caller 过滤"></div>
+        <div class="sel" id="key-status" data-label="按状态过滤"></div>
         <button type="button" class="btn primary" id="key-issue-btn">
           <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
           <span>签发密钥</span>
@@ -177,16 +166,7 @@
       <div class="panel-head">
         <div><h2 class="panel-title">维度聚合</h2><p class="panel-sub">同一时间范围内按所选维度拆分</p></div>
         <div class="panel-tools">
-          <select class="btn select" id="dim" aria-label="聚合维度">
-            <option value="model">模型</option>
-            <option value="provider">提供方</option>
-            <option value="source">来源</option>
-            <option value="auth_type">认证类型</option>
-            <option value="auth_label">认证账号</option>
-            <option value="result">结果</option>
-            <option value="key_id">密钥</option>
-            <option value="caller_id">caller</option>
-          </select>
+          <div class="sel" id="dim" data-label="聚合维度"></div>
         </div>
       </div>
       <div class="panel-body pad-0" id="dim-body"></div>
@@ -201,13 +181,10 @@
     <div class="panel-head">
       <div><h2 class="panel-title">请求明细</h2><p class="panel-sub" id="req-count">—</p></div>
       <div class="panel-tools">
-        <input class="btn input" id="req-model" placeholder="模型" spellcheck="false" list="req-model-options" aria-label="按模型过滤">
-        <datalist id="req-model-options"></datalist>
-        <input class="btn input" id="req-key" placeholder="密钥（标签或 kid）" spellcheck="false" list="req-key-options" aria-label="按密钥过滤">
-        <datalist id="req-key-options"></datalist>
-        <select class="btn select" id="req-result" aria-label="按结果过滤">
-          <option value="">全部结果</option><option value="ok">ok</option><option value="error">error</option>
-        </select>
+        <div class="combo" id="req-model" data-label="按模型过滤" data-placeholder="模型"></div>
+        <div class="combo" id="req-key" data-label="按密钥过滤" data-placeholder="密钥（标签或 kid）"></div>
+        <div class="sel" id="req-result" data-label="按结果过滤"></div>
+        <div class="sel" id="req-cols" data-label="显示列"></div>
         <button type="button" class="btn" id="req-export">
           <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5v11M7.5 10 12 14.5 16.5 10M4.5 20h15"/></svg>
           <span>导出 CSV</span>
@@ -216,14 +193,7 @@
     </div>
     <div class="table-wrap tall">
       <table class="data" id="req-table">
-        <thead><tr>
-          <th class="sort" data-sort="ts">时间</th><th>密钥</th>
-          <th class="sort" data-sort="model">模型</th><th>提供方</th><th>结果</th>
-          <th class="num">输入</th><th class="num">输出</th><th class="num">缓存读</th>
-          <th class="num sort" data-sort="tokens">总 Token</th>
-          <th class="num sort" data-sort="cost">费用</th>
-          <th class="num sort" data-sort="latency">首字</th><th class="num">总延迟</th><th class="num">TPS</th>
-        </tr></thead>
+        <thead><tr id="req-head"></tr></thead>
         <tbody id="req-rows"></tbody>
       </table>
     </div>

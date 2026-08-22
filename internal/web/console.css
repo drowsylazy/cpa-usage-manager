@@ -16,6 +16,17 @@
   --alarm:#b42318; --alarm-soft:rgba(180,35,24,.10);
   --track:#e2e8ee; --tick:rgba(255,255,255,.9);
   --focus:rgba(14,116,144,.32);
+  /* 图表系列色（仅供图表；与上面的语义色分离）。
+     四槽取自经校验的分类色板前四槽，顺序本身就是色盲安全机制：
+     浅色下相邻 CVD ΔE 9.1、常视觉 ΔE 22.9、明度带与彩度下限全部达标。
+     不要改成品牌语义色 —— --signal 彩度 0.094 低于 0.10 会发灰，
+     且四个语义色在深色下明度全部超出 0.48–0.67 带。
+
+     已知且已豁免：浅色下 --series-3 (2.82:1) 与 --series-4 (2.17:1) 低于 3:1。
+     这是「对比豁免」条款，成立的前提是同时提供替代读取途径 —— 本面板已提供
+     常在图例 + 表格孪生视图 + 键盘可达的逐桶读数。**不要为了拉高对比而重新取步**：
+     那会破坏上面已经跑通的相邻 CVD / 常视觉门槛。改任何一个值都要重跑校验器。 */
+  --series-1:#2a78d6; --series-2:#eb6834; --series-3:#1baf7a; --series-4:#eda100;
   --shadow:0 1px 0 rgba(17,26,36,.04),0 1px 2px rgba(17,26,36,.06);
   --shadow-pop:0 18px 40px rgba(17,26,36,.18);
   --ui:system-ui,-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC","Noto Sans SC",sans-serif;
@@ -34,6 +45,9 @@
   --alarm:#f87171; --alarm-soft:rgba(248,113,113,.14);
   --track:#1b2530; --tick:rgba(11,16,22,.85);
   --focus:rgba(34,211,238,.30);
+  /* 深色步进：同四个色相为深色底板重新取步（相邻 CVD ΔE 8.4、常视觉 19.8、
+     明度落在 0.48–0.67 带内、对比 ≥3:1）。不是浅色值的自动翻转。 */
+  --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70; --series-4:#c98500;
   --shadow:0 1px 0 rgba(0,0,0,.3);
   --shadow-pop:0 18px 44px rgba(0,0,0,.5);
 }
@@ -50,6 +64,7 @@
     --alarm:#f87171; --alarm-soft:rgba(248,113,113,.14);
     --track:#1b2530; --tick:rgba(11,16,22,.85);
     --focus:rgba(34,211,238,.30);
+    --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70; --series-4:#c98500;
     --shadow:0 1px 0 rgba(0,0,0,.3);
     --shadow-pop:0 18px 44px rgba(0,0,0,.5);
   }
@@ -145,13 +160,71 @@ h1,h2,h3,p{margin:0}
 .btn.small{min-height:28px;padding:0 9px;font-size:12px}
 .btn.block{width:100%;min-height:38px;margin-top:4px}
 .btn.icon-btn{width:34px;padding:0}
-.btn.select{padding:0 26px 0 10px;appearance:none;
-  background-image:linear-gradient(45deg,transparent 50%,var(--fg3) 50%),linear-gradient(135deg,var(--fg3) 50%,transparent 50%);
-  background-position:calc(100% - 14px) 15px,calc(100% - 9px) 15px;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+/* 弹窗表单内仍使用原生 <select>（在 <dialog> 里原生行为正常，且不涉及跨浏览器
+   一致性诉求）；它们由 .field select 统一取样式，无需额外外壳类。
+   面板工具区的筛选器一律走自建 listbox（.sel / .combo），见下。 */
 .btn.input{font-weight:400;cursor:text;box-shadow:none;min-width:130px;padding:0 10px}
 .btn.input::placeholder{color:var(--fg4)}
 .btn-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .ico{width:15px;height:15px;flex:none;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+
+/* ── 自建下拉（listbox / 多选 / 可输入组合框）──────────────────
+   原生 select 的弹出列表无法跨浏览器统一样式，datalist 在 Firefox 只显示 value
+   不显示 label（密钥筛选会只见 kid 不见标签）。这里用与 .pop 同一套视觉的自建弹层，
+   带完整键盘支持。弹层必须 position:fixed —— .panel{overflow:hidden} 会裁掉
+   面板内的绝对定位弹层（实测短面板下 260px 弹层被裁 120px）。 */
+.sel{position:relative;display:inline-flex}
+.sel-btn{gap:8px;padding-right:8px}
+.sel-btn>.sel-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sel-btn>.sel-caret{width:13px;height:13px;flex:none;margin-left:auto;fill:none;
+  stroke:var(--fg3);stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round;transition:transform .15s ease}
+.sel-btn[aria-expanded="true"]>.sel-caret{transform:rotate(180deg);stroke:var(--signal)}
+.sel-btn[data-active="true"]{border-color:var(--signal);color:var(--signal)}
+.sel-btn[data-active="true"]>.sel-caret{stroke:var(--signal)}
+/* 组合框：输入框 + 右侧展开钮共用一个边框 */
+.combo{position:relative;display:inline-flex;align-items:center;min-width:150px;
+  border:1px solid var(--line2);border-radius:var(--r-ctl);background:var(--bezel)}
+.combo:focus-within{border-color:var(--signal);box-shadow:0 0 0 2px var(--focus)}
+.combo>input{flex:1;min-width:0;min-height:32px;padding:0 4px 0 10px;border:0;border-radius:var(--r-ctl);
+  background:none;color:var(--fg);font:inherit;font-size:13px}
+.combo>input:focus{outline:none}
+.combo>input::placeholder{color:var(--fg4)}
+.combo>button{display:inline-flex;align-items:center;justify-content:center;width:26px;min-height:32px;
+  border:0;background:none;cursor:pointer;padding:0}
+.combo>button>svg{width:13px;height:13px;fill:none;stroke:var(--fg3);stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
+.combo[data-active="true"]{border-color:var(--signal)}
+
+.sel-pop{
+  position:fixed;z-index:70;min-width:180px;max-width:min(340px,calc(100vw - 24px));
+  max-height:min(340px,60vh);overflow:auto;padding:6px;
+  background:var(--raised);border:1px solid var(--line2);border-radius:11px;box-shadow:var(--shadow-pop);
+}
+.sel-pop .pop-head{padding:3px 6px 6px}
+.sel-opt{
+  display:flex;align-items:center;gap:8px;width:100%;
+  padding:7px 8px;border:0;border-radius:6px;background:none;color:var(--fg);
+  font:inherit;font-size:13px;text-align:left;cursor:pointer;
+}
+.sel-opt:hover,.sel-opt[data-cursor="true"]{background:var(--sunken)}
+.sel-opt[aria-selected="true"]{background:var(--signal-soft);color:var(--signal);font-weight:600}
+.sel-opt .so-main{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}
+.sel-opt .so-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sel-opt .so-sub{color:var(--fg4);font-family:var(--mono);font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sel-opt .so-tick{width:14px;height:14px;flex:none;fill:none;stroke:currentColor;stroke-width:2.2;
+  stroke-linecap:round;stroke-linejoin:round;opacity:0}
+.sel-opt[aria-selected="true"] .so-tick{opacity:1}
+/* 多选（列偏好）用方形勾选盒，与单选的对勾区分 */
+.sel-opt.multi .so-box{width:14px;height:14px;flex:none;border:1px solid var(--line3);border-radius:3px;
+  display:grid;place-items:center}
+.sel-opt.multi[aria-selected="true"] .so-box{background:var(--signal);border-color:var(--signal)}
+.sel-opt.multi .so-box>svg{width:10px;height:10px;fill:none;stroke:#fff;stroke-width:2.6;
+  stroke-linecap:round;stroke-linejoin:round;opacity:0}
+:root[data-theme="dark"] .sel-opt.multi .so-box>svg{stroke:#06222b}
+@media (prefers-color-scheme:dark){:root[data-theme="auto"] .sel-opt.multi .so-box>svg{stroke:#06222b}}
+.sel-opt.multi[aria-selected="true"] .so-box>svg{opacity:1}
+.sel-empty{padding:12px 8px;color:var(--fg4);font-size:12px;text-align:center}
+.sel-foot{margin-top:6px;padding-top:6px;border-top:1px solid var(--line);display:flex;gap:6px}
+.sel-foot .btn{flex:1}
 
 .field{display:grid;gap:4px}
 .field-label{color:var(--fg2);font-size:11.5px;font-weight:650;letter-spacing:.02em}
@@ -223,13 +296,7 @@ h1,h2,h3,p{margin:0}
 }
 .readout-top{display:flex;align-items:center;gap:8px;min-height:20px}
 .readout-label{color:var(--fg2);font-size:11.5px;font-weight:650;letter-spacing:.02em}
-.readout-switch{
-  margin-left:auto;padding:1px 7px;border:1px solid var(--line2);border-radius:var(--r-chip);
-  background:var(--sunken);color:var(--fg2);font:600 10.5px/1.5 var(--mono);cursor:pointer;
-}
-.readout-switch:hover{border-color:var(--signal);color:var(--signal)}
 .readout-value{font:700 clamp(21px,2vw,27px)/1.1 var(--mono);letter-spacing:-.035em;font-variant-numeric:tabular-nums}
-.readout-value .unit{font-size:.58em;font-weight:600;color:var(--fg3);margin-left:3px;letter-spacing:0}
 .readout-sub{color:var(--fg3);font-size:11.5px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .readout-sub b{font-family:var(--mono);font-weight:650;color:var(--fg2)}
 .readout.alarm .readout-value{color:var(--alarm)}
@@ -283,6 +350,9 @@ table.data .w-grow{min-width:180px}
 table.data .w-meter{min-width:130px}
 table.data .w-chev{width:34px}
 table.data .w-act{width:1%}
+/* 模型名可以任意长（openrouter/… 这类带渠道前缀的尤其长）。
+   不设上限时它会把整表推出容器，重新引出横向滚动；截断后完整值在 title 里。 */
+table.data td.cell-clip{max-width:340px;overflow:hidden;text-overflow:ellipsis}
 .cell-key{display:grid;gap:1px;line-height:1.3}
 .cell-key .kid{font-family:var(--mono);font-size:12.5px;font-weight:600}
 .cell-key .label{color:var(--fg3);font-size:11px;overflow:hidden;text-overflow:ellipsis;max-width:240px}
@@ -298,12 +368,20 @@ tr.detail>td{background:var(--sunken);padding:14px 16px;white-space:normal;borde
 .fact dd{margin:0;font-family:var(--mono);font-size:12.5px;word-break:break-all}
 
 /* 维度表内的占比条 */
-.bar-cell{display:grid;gap:4px;min-width:150px}
+/* min-width 必须为 0：占比卡在 375px 视口下位于 minmax(0,1fr) 轨道里，
+   任何正的 min-width 都会把 .bar-top/.bar-line 撑出容器再被 .panel{overflow:hidden} 裁掉
+   （实测溢出到 right:419 > 375）。收缩由 .bar-name 的 ellipsis 承担。 */
+.bar-cell{display:grid;gap:4px;min-width:0}
 /* 概览占比卡内多条目纵向堆叠时的间隔（维度表中每格只有一条，不受影响） */
 .bar-cell + .bar-cell{margin-top:14px}
-.bar-cell .bar-top{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
-.bar-cell .bar-name{font-family:var(--mono);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.bar-cell .bar-pct{color:var(--fg3);font-family:var(--mono);font-size:11px;flex:none}
+.bar-cell .bar-top{display:flex;align-items:baseline;justify-content:space-between;gap:10px;min-width:0}
+.bar-cell .bar-name{font-family:var(--mono);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+/* 右侧读数：占比在前、绝对值在后（与维度表的百分比口径一致，
+   避免同一视觉位置在两处表示不同含义） */
+.bar-cell .bar-pct{color:var(--fg3);font-family:var(--mono);font-size:11px;flex:none;
+  display:inline-flex;align-items:baseline;gap:6px}
+.bar-cell .bar-pct .bp-share{color:var(--fg2);font-weight:650;font-variant-numeric:tabular-nums}
+.bar-cell .bar-pct .bp-val{color:var(--fg4)}
 .bar-line{height:5px;border-radius:3px;background:var(--track);overflow:hidden}
 .bar-line>span{display:block;height:100%;border-radius:3px;background:var(--signal)}
 .bar-line.trace>span{background:var(--trace)}
@@ -324,9 +402,25 @@ tr.detail>td{background:var(--sunken);padding:14px 16px;white-space:normal;borde
 .search-item .si-price{color:var(--fg2);font-size:11.5px;flex:none}
 .search-item .btn{flex:none}
 
-.pager{display:flex;align-items:center;gap:10px;padding:10px 16px;border-top:1px solid var(--line);color:var(--fg3);font-size:12px}
+.pager{display:flex;align-items:center;gap:10px;padding:10px 16px;border-top:1px solid var(--line);color:var(--fg3);font-size:12px;flex-wrap:wrap}
 .pager .mono{color:var(--fg2)}
 .pager .grow{flex:1}
+/* 跳页输入：75 页时上/下一页两个钮不够用 */
+.pager .jump{display:inline-flex;align-items:center;gap:5px}
+.pager .jump input{width:56px;min-height:28px;padding:0 7px;border:1px solid var(--line2);border-radius:6px;
+  background:var(--bezel);color:var(--fg);font:inherit;font-size:12px;font-family:var(--mono);text-align:right}
+
+/* 请求表：三段计量与延迟对合并进一格，消除横向滚动 */
+.cell-toks{display:inline-flex;align-items:baseline;gap:6px;font-family:var(--mono);
+  font-variant-numeric:tabular-nums;font-size:12px;justify-content:flex-end;width:100%}
+.cell-toks .tk{color:var(--fg)}
+.cell-toks .tk.out{color:var(--fg2)}
+.cell-toks .tk.cr{color:var(--fg4)}
+.cell-toks .sep{color:var(--line3)}
+.cell-lat{display:inline-flex;align-items:baseline;gap:5px;font-family:var(--mono);
+  font-variant-numeric:tabular-nums;font-size:12px;justify-content:flex-end;width:100%}
+.cell-lat .arrow{color:var(--line3)}
+.cell-lat .ttft{color:var(--fg3)}
 
 /* ── 徽标 / 空态 / 骨架 ───────────────────────────────────────── */
 .pill{
@@ -344,29 +438,33 @@ tr.detail>td{background:var(--sunken);padding:14px 16px;white-space:normal;borde
 .empty{display:grid;gap:4px;justify-items:center;padding:34px 16px;text-align:center}
 .empty-title{color:var(--fg2);font-size:13px;font-weight:600}
 .empty-hint{color:var(--fg4);font-size:12px;max-width:44ch}
-.skeleton{display:grid;gap:8px;padding:6px 0}
-.skeleton>i{display:block;height:11px;border-radius:4px;background:var(--track);animation:pulse 1.4s ease-in-out infinite}
-.skeleton>i:nth-child(2){width:78%}.skeleton>i:nth-child(3){width:56%}
-@keyframes pulse{50%{opacity:.45}}
-.spin{animation:spin .9s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
 
 /* ── 图表 ─────────────────────────────────────────────────────── */
+/* 容器高度含 x 轴文字带，避免卡片内出现细条竖向滚动 */
 .chart{position:relative;width:100%;height:296px}
 .chart svg{display:block;width:100%;height:100%;overflow:visible}
 .chart .gridline{stroke:var(--line);stroke-width:1;shape-rendering:crispEdges}
 .chart .axis-text{fill:var(--fg4);font:10.5px/1 var(--mono)}
-.chart .bar-hover{fill:transparent}
+/* 悬停/聚焦热区：键盘与鼠标走同一条高亮路径，数值不再只能靠鼠标读取。
+   键盘聚焦时除了底色高亮还画一道描边 —— 只靠 12% 的填充在浅色下太弱。 */
+.chart .bar-hover{fill:transparent;outline:none}
 .chart .bar-hover.on{fill:var(--fg);opacity:.05}
+.chart .bar-hover:focus-visible{fill:var(--signal);fill-opacity:.14;opacity:1;
+  stroke:var(--signal);stroke-width:1.5;stroke-dasharray:3 2}
 .chart-tip{
   position:absolute;z-index:5;min-width:150px;max-width:280px;padding:8px 10px;pointer-events:none;
   background:var(--raised);border:1px solid var(--line2);border-radius:9px;box-shadow:var(--shadow-pop);
-  font-size:11.5px;transform:translate(-50%,0);
+  font-size:11.5px;transform:translate(-50%,-100%);
 }
+/* 上方空间不足时改为下挂（JS 加 .below） */
+.chart-tip.below{transform:translate(-50%,0)}
 .chart-tip .tip-head{font-family:var(--mono);font-size:11px;color:var(--fg3);margin-bottom:5px}
 .chart-tip .tip-row{display:flex;align-items:center;gap:7px;line-height:1.7}
 .chart-tip .tip-row span{flex:1;color:var(--fg2)}
 .chart-tip .tip-row b{font-family:var(--mono);font-weight:650;font-variant-numeric:tabular-nums}
+.chart-tip .tip-total{margin-top:4px;padding-top:4px;border-top:1px solid var(--line)}
+/* 趋势表格孪生视图：每个图表都有一份 WCAG 干净的表格等价物 */
+.chart-table{max-height:296px;overflow:auto}
 .swatch{width:8px;height:8px;border-radius:2px;flex:none}
 .legend{display:flex;align-items:center;gap:2px;flex-wrap:wrap}
 .legend-item{
@@ -447,5 +545,9 @@ tr.detail>td{background:var(--sunken);padding:14px 16px;white-space:normal;borde
   .panel-head{padding:12px 14px}
   .panel-body{padding:12px 14px}
   .panel-tools{width:100%}
-  .panel-tools .input,.panel-tools .select{flex:1;min-width:0}
+  .panel-tools .input{flex:1;min-width:0}
+  /* 自建下拉与组合框在窄屏内平分工具行 */
+  .panel-tools .sel,.panel-tools .combo{flex:1;min-width:0}
+  .panel-tools .sel .sel-btn{width:100%}
+  .chart{height:260px}
 }

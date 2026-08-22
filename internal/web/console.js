@@ -88,6 +88,277 @@ function toast(msg, kind) {
   setTimeout(kill, kind === 'err' ? 6000 : 3500);
 }
 
+// ---------- 下拉组件 ----------
+// 自建 listbox 替代原生 select / datalist：原生 select 的弹出列表无法跨浏览器统一样式，
+// datalist 在 Firefox 只显示 value 不显示 label（密钥筛选会只见 kid 不见标签）。
+//
+// 弹层必须挂 body 且 position:fixed —— .panel{overflow:hidden} 会裁掉面板内的绝对定位弹层。
+const CARET = '<svg class="sel-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>';
+const TICK = '<svg class="so-tick" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 13 4 4L19 7"/></svg>';
+const BOXTICK = '<span class="so-box"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 13 4 4L19 7"/></svg></span>';
+let openSel = null; // 当前展开的下拉，全局只允许一个
+
+function closeAnySel(focusBack) {
+  if (!openSel) return;
+  const s = openSel;
+  openSel = null;
+  s.pop.remove();
+  s.trigger.setAttribute('aria-expanded', 'false');
+  if (focusBack) s.trigger.focus();
+}
+document.addEventListener('click', e => {
+  if (openSel && !e.target.closest('.sel-pop') && !e.target.closest('.sel,.combo')) closeAnySel(false);
+});
+window.addEventListener('resize', () => closeAnySel(false));
+// 滚动时重定位（弹层是 fixed，不随容器滚动）
+window.addEventListener('scroll', () => { if (openSel) openSel.place(); }, true);
+
+// placePop 把弹层定位到触发器下方；下方空间不足时向上翻转。
+function placePop(pop, trigger) {
+  const r = trigger.getBoundingClientRect();
+  pop.style.visibility = 'hidden';
+  pop.style.left = '0px';
+  pop.style.top = '0px';
+  const ph = pop.offsetHeight, pw = pop.offsetWidth;
+  const below = window.innerHeight - r.bottom - 8;
+  const flip = below < ph && r.top > below;
+  pop.style.top = (flip ? Math.max(8, r.top - ph - 6) : r.bottom + 6) + 'px';
+  pop.style.left = Math.max(8, Math.min(window.innerWidth - pw - 8, r.left)) + 'px';
+  pop.style.minWidth = Math.max(r.width, 180) + 'px';
+  pop.style.visibility = '';
+}
+
+// Select 单选下拉。opts: [{value,label,sub}]；onChange(value) 在选择后调用。
+// 用法与原生 select 贴近：sel.value 读写当前值。
+function Select(mountId, opts, onChange, o = {}) {
+  const mount = $(mountId);
+  const label = mount.dataset.label || '';
+  let value = o.value !== undefined ? o.value : (opts[0] ? opts[0].value : '');
+  let items = opts.slice();
+
+  mount.innerHTML = '<button type="button" class="btn sel-btn" aria-haspopup="listbox" aria-expanded="false"'
+    + (label ? ' aria-label="' + esc(label) + '"' : '') + '><span class="sel-text"></span>' + CARET + '</button>';
+  const trigger = mount.querySelector('.sel-btn');
+  const cur = () => items.find(x => x.value === value);
+
+  function paint() {
+    const c = cur();
+    trigger.querySelector('.sel-text').textContent = c ? c.label : (o.placeholder || '请选择');
+    // 「全部…」这类空值不算激活，避免筛选器默认态就高亮
+    trigger.dataset.active = String(!!value);
+  }
+
+  function open() {
+    if (openSel && openSel.trigger === trigger) { closeAnySel(true); return; }
+    closeAnySel(false);
+    const pop = document.createElement('div');
+    pop.className = 'sel-pop';
+    pop.setAttribute('role', 'listbox');
+    if (label) pop.setAttribute('aria-label', label);
+    pop.innerHTML = (o.head ? '<div class="pop-head">' + esc(o.head) + '</div>' : '')
+      + items.map((x, i) => '<button type="button" class="sel-opt" role="option" data-i="' + i + '"'
+        + ' aria-selected="' + String(x.value === value) + '">'
+        + '<span class="so-main"><span class="so-name">' + esc(x.label) + '</span>'
+        + (x.sub ? '<span class="so-sub">' + esc(x.sub) + '</span>' : '') + '</span>' + TICK + '</button>').join('');
+    document.body.appendChild(pop);
+    trigger.setAttribute('aria-expanded', 'true');
+    const place = () => placePop(pop, trigger);
+    place();
+    openSel = { trigger, pop, place };
+
+    const optEls = [...pop.querySelectorAll('.sel-opt')];
+    let ci = Math.max(0, items.findIndex(x => x.value === value));
+    const cursor = i => {
+      ci = (i + optEls.length) % optEls.length;
+      optEls.forEach((el, k) => el.dataset.cursor = String(k === ci));
+      optEls[ci].scrollIntoView({ block: 'nearest' });
+    };
+    if (optEls.length) cursor(ci);
+    const pick = i => {
+      value = items[i].value;
+      paint();
+      closeAnySel(true);
+      if (onChange) onChange(value);
+    };
+    pop.addEventListener('click', e => {
+      const b = e.target.closest('.sel-opt');
+      if (b) pick(+b.dataset.i);
+    });
+    pop.addEventListener('mousemove', e => {
+      const b = e.target.closest('.sel-opt');
+      if (b) cursor(+b.dataset.i);
+    });
+    // 键盘处理挂在触发器的常驻监听上（见下），这里只登记当次的处理函数，
+    // 避免每次展开都往触发器上再加一个监听器。
+    trigger._selKey = e => {
+      if (e.key === 'Escape') { e.preventDefault(); closeAnySel(true); return; }
+      if (e.key === 'ArrowDown') { e.preventDefault(); cursor(ci + 1); return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); cursor(ci - 1); return; }
+      if (e.key === 'Home') { e.preventDefault(); cursor(0); return; }
+      if (e.key === 'End') { e.preventDefault(); cursor(optEls.length - 1); return; }
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); if (optEls.length) pick(ci); return; }
+      if (e.key.length === 1) { // 首字符跳转
+        const ch = e.key.toLowerCase();
+        const from = items.findIndex((x, k) => k > ci && x.label.toLowerCase().startsWith(ch));
+        const idx = from >= 0 ? from : items.findIndex(x => x.label.toLowerCase().startsWith(ch));
+        if (idx >= 0) cursor(idx);
+      }
+    };
+  }
+
+  trigger.addEventListener('click', open);
+  trigger.addEventListener('keydown', e => {
+    const isOpen = trigger.getAttribute('aria-expanded') === 'true';
+    if (isOpen && trigger._selKey) { trigger._selKey(e); return; }
+    if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+  });
+  paint();
+  return {
+    get value() { return value; },
+    set value(v) { value = v; paint(); },
+    setOptions(next) { items = next.slice(); paint(); },
+  };
+}
+
+// MultiSelect 多选下拉（列偏好）。onChange(Set) 在每次勾选后调用。
+function MultiSelect(mountId, opts, selected, onChange, o = {}) {
+  const mount = $(mountId);
+  const label = mount.dataset.label || '';
+  const sel = new Set(selected);
+  mount.innerHTML = '<button type="button" class="btn sel-btn" aria-haspopup="listbox" aria-expanded="false"'
+    + (label ? ' aria-label="' + esc(label) + '"' : '') + '>'
+    + (o.icon || '') + '<span class="sel-text"></span>' + CARET + '</button>';
+  const trigger = mount.querySelector('.sel-btn');
+  const paint = () => { trigger.querySelector('.sel-text').textContent = (o.text || '列') + ' ' + sel.size; };
+
+  function open() {
+    if (openSel && openSel.trigger === trigger) { closeAnySel(true); return; }
+    closeAnySel(false);
+    const pop = document.createElement('div');
+    pop.className = 'sel-pop';
+    pop.setAttribute('role', 'listbox');
+    pop.setAttribute('aria-multiselectable', 'true');
+    if (label) pop.setAttribute('aria-label', label);
+    const render = () => {
+      pop.innerHTML = (o.head ? '<div class="pop-head">' + esc(o.head) + '</div>' : '')
+        + opts.map((x, i) => '<button type="button" class="sel-opt multi" role="option" data-i="' + i + '"'
+          + ' aria-selected="' + String(sel.has(x.value)) + '"' + (x.fixed ? ' disabled' : '') + '>'
+          + BOXTICK + '<span class="so-main"><span class="so-name">' + esc(x.label) + '</span></span></button>').join('')
+        + '<div class="sel-foot"><button type="button" class="btn small" data-act="reset">恢复默认</button></div>';
+    };
+    render();
+    document.body.appendChild(pop);
+    trigger.setAttribute('aria-expanded', 'true');
+    const place = () => placePop(pop, trigger);
+    place();
+    openSel = { trigger, pop, place };
+    pop.addEventListener('click', e => {
+      if (e.target.closest('[data-act="reset"]')) {
+        sel.clear();
+        (o.defaults || []).forEach(v => sel.add(v));
+        render(); paint(); if (onChange) onChange(sel);
+        return;
+      }
+      const b = e.target.closest('.sel-opt');
+      if (!b || b.disabled) return;
+      const v = opts[+b.dataset.i].value;
+      if (sel.has(v)) { if (sel.size > 1) sel.delete(v); } else sel.add(v);
+      render(); paint();
+      if (onChange) onChange(sel);
+    });
+    trigger._selKey = e => { if (e.key === 'Escape') { e.preventDefault(); closeAnySel(true); } };
+  }
+  trigger.addEventListener('click', open);
+  trigger.addEventListener('keydown', e => {
+    if (trigger.getAttribute('aria-expanded') === 'true' && trigger._selKey) { trigger._selKey(e); return; }
+    if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+  });
+  paint();
+  return { get selected() { return sel; } };
+}
+
+// Combo 可输入组合框：保留手动输入，同时给出候选下拉（替代 datalist）。
+function Combo(mountId, onChange) {
+  const mount = $(mountId);
+  const label = mount.dataset.label || '';
+  let items = [];
+  mount.innerHTML = '<input type="text" spellcheck="false" placeholder="'
+    + esc(mount.dataset.placeholder || '') + '"' + (label ? ' aria-label="' + esc(label) + '"' : '')
+    + ' role="combobox" aria-expanded="false" aria-autocomplete="list" autocomplete="off">'
+    + '<button type="button" tabindex="-1" aria-label="展开候选"><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></button>';
+  const input = mount.querySelector('input');
+  const btn = mount.querySelector('button');
+
+  function open(filterText) {
+    closeAnySel(false);
+    const q = (filterText || '').trim().toLowerCase();
+    const list = q
+      ? items.filter(x => x.label.toLowerCase().includes(q) || (x.sub || '').toLowerCase().includes(q))
+      : items.slice();
+    const show = list.slice(0, 60);
+    const pop = document.createElement('div');
+    pop.className = 'sel-pop';
+    pop.setAttribute('role', 'listbox');
+    pop.innerHTML = show.length
+      ? show.map((x, i) => '<button type="button" class="sel-opt" role="option" data-i="' + i + '">'
+        + '<span class="so-main"><span class="so-name">' + esc(x.label) + '</span>'
+        + (x.sub ? '<span class="so-sub">' + esc(x.sub) + '</span>' : '') + '</span></button>').join('')
+      : '<div class="sel-empty">无匹配候选</div>';
+    document.body.appendChild(pop);
+    input.setAttribute('aria-expanded', 'true');
+    const place = () => placePop(pop, mount);
+    place();
+    openSel = { trigger: input, pop, place };
+    let ci = -1;
+    const optEls = [...pop.querySelectorAll('.sel-opt')];
+    const cursor = i => {
+      ci = (i + optEls.length) % optEls.length;
+      optEls.forEach((el, k) => el.dataset.cursor = String(k === ci));
+      optEls[ci].scrollIntoView({ block: 'nearest' });
+    };
+    const pick = i => {
+      // 值取 sub（kid）优先，没有则取 label：密钥筛选要提交 kid，模型筛选提交模型名
+      input.value = show[i].value;
+      closeAnySel(false);
+      input.focus();
+      mount.dataset.active = String(!!input.value);
+      if (onChange) onChange(input.value);
+    };
+    pop.addEventListener('click', e => {
+      const b = e.target.closest('.sel-opt');
+      if (b) pick(+b.dataset.i);
+    });
+    pop.addEventListener('mousemove', e => {
+      const b = e.target.closest('.sel-opt');
+      if (b) cursor(+b.dataset.i);
+    });
+    input._onKey = e => {
+      if (e.key === 'Escape') { e.preventDefault(); closeAnySel(false); return; }
+      if (e.key === 'ArrowDown') { e.preventDefault(); if (optEls.length) cursor(ci + 1); return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); if (optEls.length) cursor(ci - 1); return; }
+      if (e.key === 'Enter' && ci >= 0) { e.preventDefault(); pick(ci); }
+    };
+  }
+  input.addEventListener('keydown', e => {
+    if (openSel && openSel.trigger === input && input._onKey) { input._onKey(e); return; }
+    if (e.key === 'ArrowDown') { e.preventDefault(); open(input.value); }
+  });
+  input.addEventListener('blur', () => { input.setAttribute('aria-expanded', 'false'); });
+  btn.addEventListener('click', () => {
+    if (openSel && openSel.trigger === input) { closeAnySel(false); return; }
+    open('');
+    input.focus();
+  });
+  input.addEventListener('input', debounce(() => {
+    mount.dataset.active = String(!!input.value.trim());
+    if (onChange) onChange(input.value.trim());
+  }, 400));
+  return {
+    get value() { return input.value.trim(); },
+    setOptions(next) { items = next.slice(); },
+  };
+}
+
 // ---------- 会话与 API ----------
 let key = sessionStorage.getItem('cpa-management-key') || '';
 
@@ -358,7 +629,12 @@ const loaders = {};
 let activeTab = 'overview';
 function switchTab(name) {
   activeTab = name;
-  document.querySelectorAll('.tab').forEach(t => t.setAttribute('aria-selected', String(t.dataset.tab === name)));
+  // roving tabindex：选中项才进 Tab 序，其余用方向键在 tablist 内移动（ARIA tabs 模式）
+  document.querySelectorAll('.tab').forEach(t => {
+    const on = t.dataset.tab === name;
+    t.setAttribute('aria-selected', String(on));
+    t.tabIndex = on ? 0 : -1;
+  });
   document.querySelectorAll('.view').forEach(v => { v.hidden = v.id !== 'view-' + name; });
   reloadActive();
 }
@@ -367,12 +643,42 @@ function reloadActive() {
   if (fn) fn().catch(e => toast(e.message, 'err'));
 }
 document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
+$('tabs').addEventListener('keydown', e => {
+  const tabs = [...document.querySelectorAll('.tab')];
+  const i = tabs.findIndex(t => t.dataset.tab === activeTab);
+  if (i < 0) return;
+  let to = -1;
+  if (e.key === 'ArrowRight') to = (i + 1) % tabs.length;
+  else if (e.key === 'ArrowLeft') to = (i - 1 + tabs.length) % tabs.length;
+  else if (e.key === 'Home') to = 0;
+  else if (e.key === 'End') to = tabs.length - 1;
+  if (to < 0) return;
+  e.preventDefault();
+  switchTab(tabs[to].dataset.tab);
+  tabs[to].focus();
+});
+// Escape 统一关闭浮层：先关下拉，再关时间范围弹层（原先范围弹层无法用键盘关闭）
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (openSel) { closeAnySel(true); return; }
+  if (!$('range-pop').hidden) {
+    closeRangePop();
+    $('range-btn').focus();
+  }
+});
 $('refresh-btn').addEventListener('click', reloadActive);
 $('logout-btn').addEventListener('click', logout);
 function stamp() { $('stamp').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false }); }
 
 // ---------- 概览 ----------
-const trend = { points: [], off: new Set(), grainManual: false };
+const GRAINS = [
+  { value: 'minute', label: '按分钟' },
+  { value: 'hour', label: '按小时' },
+  { value: 'day', label: '按天' },
+  { value: 'week', label: '按周' },
+  { value: 'month', label: '按月' },
+];
+const trend = { points: [], off: new Set(), grainManual: false, view: 'chart' };
 
 // Token 口径：上游 total 缺失（0）时按计费四类合计兜底；
 // 缓存命中取「Claude 口径读写」与「OpenAI/Gemini 口径 cached」的较大者，避免双计。
@@ -393,12 +699,12 @@ function cacheReadOf(r) {
 }
 
 loaders.overview = async () => {
-  if (!trend.grainManual) $('trend-grain').value = autoGrain();
+  if (!trend.grainManual) trendGrainSel.value = autoGrain();
   const p = rangeParams();
   const [dimModel, dimKey, points, costs] = await Promise.all([
     api('/usage/dimension?' + new URLSearchParams({ dimension: 'model', limit: '200', ...p })),
     api('/usage/dimension?' + new URLSearchParams({ dimension: 'key_id', limit: '100', ...p })),
-    api('/trends?' + new URLSearchParams({ grain: $('trend-grain').value, ...p })),
+    api('/trends?' + new URLSearchParams({ grain: trendGrainSel.value, ...p })),
     api('/costs?' + new URLSearchParams(p)),
   ]);
   if (!S.fx) { S.fx = await api('/exchange-rate').catch(() => null); }
@@ -448,12 +754,16 @@ function renderReadouts(total, costs) {
 
 function barList(rows, max, nameText, nameHtml, valFn, valText, color) {
   if (!rows.length) return '<div class="empty"><p class="empty-title">暂无数据</p><p class="empty-hint">所选时间范围内没有请求记录</p></div>';
+  // 分母取全量之和，让「占比」是真实份额；条长仍按最大值归一，保证最长条填满。
+  const sum = rows.reduce((a, r) => a + Math.max(0, Number(valFn(r)) || 0), 0);
   return rows.map(r => {
     const v = Math.max(0, Number(valFn(r)) || 0);
     const pct = max > 0 ? (v / max * 100) : 0;
+    const share = sum > 0 ? (v / sum * 100) : 0;
     return '<div class="bar-cell" title="' + esc(nameText(r)) + '">'
       + '<div class="bar-top"><span class="bar-name">' + nameHtml(r) + '</span>'
-      + '<span class="bar-pct">' + valText(r) + '</span></div>'
+      + '<span class="bar-pct"><span class="bp-share">' + share.toFixed(share < 10 ? 1 : 0)
+      + '%</span><span class="bp-val">' + valText(r) + '</span></span></div>'
       + '<div class="bar-line' + (color === 'trace' ? ' trace' : '') + '">'
       + '<span style="width:' + pct.toFixed(1) + '%"></span></div></div>';
   }).join('');
@@ -614,23 +924,27 @@ function downsampleTrend(pts, maxN) {
 }
 
 function trendSeries() {
-  const metric = $('trend-metric').value;
+  const metric = trendMetricSel.value;
+  // 「成功/失败」是状态语义（good/bad），保留状态色；其余是身份语义，用图表专用系列色。
+  // 次级编码：失败恒在栈顶 + 段间 2px 间隙 + 图例常在，不依赖单一色相区分。
   if (metric === 'requests') return [
     { key: 'ok', label: '成功', color: cssVar('--live'), val: p => Math.max(0, p.requests - p.failures) },
     { key: 'fail', label: '失败', color: cssVar('--alarm'), val: p => p.failures },
   ];
   if (metric === 'cost') return [
-    { key: 'cost', label: '费用', color: cssVar('--signal'), val: p => p.cost_micro_usd, money: true },
+    { key: 'cost', label: '费用', color: cssVar('--series-1'), val: p => p.cost_micro_usd, money: true },
   ];
   return [
-    { key: 'input', label: '输入', color: cssVar('--signal'), tok: true, val: p => p.input_tokens },
-    { key: 'output', label: '输出', color: cssVar('--trace'), tok: true, val: p => p.output_tokens },
-    { key: 'cache-read', label: '缓存读', color: cssVar('--live'), tok: true, val: p => cacheReadOf(p) },
-    { key: 'cache-creation', label: '缓存写', color: cssVar('--warn'), tok: true, val: p => p.cache_creation_tokens || 0 },
+    { key: 'input', label: '输入', color: cssVar('--series-1'), tok: true, val: p => p.input_tokens },
+    { key: 'output', label: '输出', color: cssVar('--series-2'), tok: true, val: p => p.output_tokens },
+    { key: 'cache-read', label: '缓存读', color: cssVar('--series-3'), tok: true, val: p => cacheReadOf(p) },
+    { key: 'cache-creation', label: '缓存写', color: cssVar('--series-4'), tok: true, val: p => p.cache_creation_tokens || 0 },
   ];
 }
 function renderLegend() {
-  $('trend-legend').innerHTML = trendSeries().map(d =>
+  // 单系列不需要图例（标题已说明画的是什么），≥2 系列图例常在。
+  const defs = trendSeries();
+  $('trend-legend').innerHTML = defs.length < 2 ? '' : defs.map(d =>
     '<button type="button" class="legend-item" data-key="' + d.key + '" aria-pressed="'
     + String(!trend.off.has(d.key)) + '"><span class="swatch" style="background:' + d.color + '"></span>'
     + d.label + '</button>').join('');
@@ -645,20 +959,24 @@ $('trend-legend').addEventListener('click', e => {
 });
 
 function renderTrend() {
-  const grain = $('trend-grain').value;
+  const grain = trendGrainSel.value;
   const filled = fillTrendPoints(trend.points, grain);
   const pts = downsampleTrend(filled, 1200);
   const box = $('trend-chart');
   renderLegend();
-  $('trend-sub').textContent = '按' + $('trend-grain').selectedOptions[0].textContent.replace('按', '')
+  const grainText = (GRAINS.find(g => g.value === grain) || {}).label || '';
+  $('trend-sub').textContent = '按' + grainText.replace('按', '')
     + '堆叠 · ' + rangeLabel() + ' · ' + pts.length + ' 个桶'
     + (pts.length < filled.length ? '（过密已合并显示）' : '');
+  const defs = trendSeries().map(d => Object.assign(d, { on: !trend.off.has(d.key) }));
+  trend.view === 'table' ? renderTrendTable(pts, defs, grain) : $('trend-table').hidden = true;
+  if (trend.view === 'table') { box.hidden = true; return; }
+  box.hidden = false;
   if (!pts.length) {
     box.innerHTML = '<div class="empty" style="height:100%"><p class="empty-title">暂无趋势数据</p>'
       + '<p class="empty-hint">所选时间范围与粒度下没有聚合记录</p></div>';
     return;
   }
-  const defs = trendSeries().map(d => Object.assign(d, { on: !trend.off.has(d.key) }));
   // 用像素级 width/height 而非 preserveAspectRatio=none，避免坐标轴文字被拉伸。
   const W = Math.max(320, Math.floor(box.clientWidth || 800));
   const H = Math.max(240, Math.floor(box.clientHeight || 300));
@@ -669,7 +987,8 @@ function renderTrend() {
   const y = v => padT + ih - (v / ymax) * ih;
   const n = pts.length;
   const slot = iw / n;                 // 每个桶的槽宽
-  const barW = Math.max(2, Math.min(44, slot * 0.85));
+  // 柱宽上限 24px：槽内余量留白，不把槽填满。
+  const barW = Math.max(2, Math.min(24, slot * 0.7));
   const cx = i => padL + slot * i + slot / 2;
 
   let grid = '', labels = '';
@@ -693,26 +1012,49 @@ function renderTrend() {
       + esc(bucketTick(pts[i].bucket, grain)) + '</text>';
   }
 
-  // 堆叠柱：自下而上逐系列叠加；单点/稀疏数据也能完整成图。
+  // 堆叠柱：自下而上逐系列叠加。
+  // 段间留 2px 表面色间隙（用间隙分隔，不画描边）：间隙统一开在每段的**顶边**，
+  // 这样最底段仍然坐在基线上（柱体从单一基线生长，基线端方角）。
+  // 高度不足以让出间隙的薄段照原高绘制、不加间隙 —— 宁可少一条分隔，
+  // 也不能把数据段整段丢掉或抬高（精确值另有 tooltip 与表格视图承载）。
+  const GAP = 2, R = 4;
+  const on = defs.filter(d => d.on);
   let bars = '', running = new Array(n).fill(0);
-  for (const d of defs) {
-    if (!d.on) continue;
+  // 先定位每根柱子最上面的可见段，供圆角判定
+  const topSeg = new Array(n).fill(-1);
+  for (let i = 0; i < n; i++)
+    for (let k = 0; k < on.length; k++)
+      if (Math.max(0, on[k].val(pts[i])) > 0) topSeg[i] = k;
+  for (let k = 0; k < on.length; k++) {
+    const d = on[k];
     for (let i = 0; i < n; i++) {
       const v = Math.max(0, d.val(pts[i]));
       if (v <= 0) continue;
-      const top = running[i] + v;
-      const yTop = y(top), h = Math.max(1, y(running[i]) - yTop);
-      bars += '<rect x="' + (cx(i) - barW / 2).toFixed(1) + '" y="' + yTop.toFixed(1)
-        + '" width="' + barW.toFixed(1) + '" height="' + h.toFixed(1)
-        + '" fill="' + d.color + '" rx="1"/>';
-      running[i] = top;
+      const yBase = y(running[i]);
+      const yTop = y(running[i] + v);
+      running[i] += v;
+      const rawH = yBase - yTop;
+      if (rawH <= 0) continue;
+      const isTop = k === topSeg[i];
+      const gap = (!isTop && rawH > GAP + 1) ? GAP : 0;
+      // 非零段至少画 1px：亚像素高度等于画了个看不见的东西，
+      // 「有但极小」比「看不到」更诚实（精确值在 tooltip 与表格视图里）。
+      const h = Math.max(1, rawH - gap);
+      const yDraw = yTop + gap;
+      const x = cx(i) - barW / 2;
+      bars += isTop
+        ? '<path d="' + topRoundedBar(x, yDraw, barW, h, R) + '" fill="' + d.color + '"/>'
+        : '<rect x="' + x.toFixed(1) + '" y="' + yDraw.toFixed(1) + '" width="' + barW.toFixed(1)
+          + '" height="' + h.toFixed(1) + '" fill="' + d.color + '"/>';
     }
   }
-  // 悬停高亮条（置于柱体之下、网格之上）
+  // 悬停/聚焦热区（置于柱体之下、网格之上）。tabindex 让键盘也能读到数值。
   let hover = '';
   for (let i = 0; i < n; i++)
-    hover += '<rect class="bar-hover" data-i="' + i + '" x="' + (padL + slot * i).toFixed(1)
-      + '" y="' + padT + '" width="' + slot.toFixed(1) + '" height="' + ih + '"/>';
+    hover += '<rect class="bar-hover" tabindex="0" role="button" data-i="' + i + '"'
+      + ' aria-label="' + esc(bucketLabel(pts[i].bucket, grain) + '，合计 ' + fmtAxis(stacks[i])) + '"'
+      + ' x="' + (padL + slot * i).toFixed(1) + '" y="' + padT + '" width="' + slot.toFixed(1)
+      + '" height="' + ih + '"/>';
 
   box.innerHTML = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H
     + '" role="img" aria-label="用量趋势图">' + grid + hover + bars + labels + '</svg>'
@@ -726,30 +1068,99 @@ function renderTrend() {
     svg.querySelectorAll('.bar-hover').forEach(r =>
       r.classList.toggle('on', +r.dataset.i === i));
   }
-  svg.addEventListener('mousemove', ev => {
-    const rect = svg.getBoundingClientRect();
-    const sx = (ev.clientX - rect.left) * (W / rect.width);
-    let idx = Math.floor((sx - padL) / slot);
-    idx = Math.max(0, Math.min(n - 1, idx));
+  // showTip 鼠标与键盘共用：tooltip 上挂在柱顶，空间不足时下翻。
+  function showTip(idx) {
     setHot(idx);
     const p = pts[idx];
     let rows = defs.filter(d => d.on).map(d =>
       '<div class="tip-row"><span class="swatch" style="background:' + d.color + '"></span><span>' + d.label
       + '</span><b>' + (d.money ? fmtUSD(d.val(p)) : d.tok ? fmtTok(d.val(p)) : fmtInt(d.val(p))) + '</b></div>').join('');
-    rows += '<div class="tip-row"><span></span><span>合计</span><b>' + fmtAxis(stacks[idx]) + '</b></div>';
+    rows += '<div class="tip-row tip-total"><span></span><span>合计</span><b>' + fmtAxis(stacks[idx]) + '</b></div>';
     tip.innerHTML = '<div class="tip-head">' + esc(bucketLabel(p.bucket, grain)) + '</div>' + rows;
     tip.hidden = false;
-    const px = cx(idx) / W * rect.width;
-    tip.style.left = Math.max(90, Math.min(rect.width - 90, px)) + 'px';
-    tip.style.top = '10px';
+    const rect = svg.getBoundingClientRect();
+    const sx = cx(idx) / W * rect.width;
+    const topPx = y(stacks[idx]) / H * rect.height;
+    const wantAbove = topPx - tip.offsetHeight - 8 >= 0;
+    tip.classList.toggle('below', !wantAbove);
+    tip.style.left = Math.max(90, Math.min(rect.width - 90, sx)) + 'px';
+    tip.style.top = (wantAbove ? topPx - 8 : topPx + 8) + 'px';
+  }
+  function hideTip() { tip.hidden = true; setHot(-1); }
+  svg.addEventListener('mousemove', ev => {
+    const rect = svg.getBoundingClientRect();
+    const sx = (ev.clientX - rect.left) * (W / rect.width);
+    let idx = Math.floor((sx - padL) / slot);
+    showTip(Math.max(0, Math.min(n - 1, idx)));
   });
-  svg.addEventListener('mouseleave', () => {
-    tip.hidden = true;
-    setHot(-1);
+  svg.addEventListener('mouseleave', hideTip);
+  // 键盘：Tab 进入热区即出 tooltip，左右键在桶之间移动
+  svg.addEventListener('focusin', e => {
+    const r = e.target.closest('.bar-hover');
+    if (r) showTip(+r.dataset.i);
+  });
+  svg.addEventListener('focusout', e => {
+    if (!svg.contains(e.relatedTarget)) hideTip();
+  });
+  svg.addEventListener('keydown', e => {
+    const r = e.target.closest('.bar-hover');
+    if (!r) return;
+    const i = +r.dataset.i;
+    const to = e.key === 'ArrowRight' ? i + 1 : e.key === 'ArrowLeft' ? i - 1 : -1;
+    if (to < 0 || to >= n) return;
+    e.preventDefault();
+    svg.querySelector('.bar-hover[data-i="' + to + '"]').focus();
   });
 }
-$('trend-metric').addEventListener('change', renderTrend);
-$('trend-grain').addEventListener('change', () => { trend.grainManual = true; reloadActive(); });
+// topRoundedBar 顶端圆角、基线方角的柱体路径。
+function topRoundedBar(x, y, w, h, r) {
+  const R = Math.max(0, Math.min(r, w / 2, h));
+  return 'M' + x.toFixed(1) + ' ' + (y + h).toFixed(1)
+    + 'V' + (y + R).toFixed(1)
+    + 'a' + R.toFixed(1) + ' ' + R.toFixed(1) + ' 0 0 1 ' + R.toFixed(1) + ' -' + R.toFixed(1)
+    + 'h' + (w - 2 * R).toFixed(1)
+    + 'a' + R.toFixed(1) + ' ' + R.toFixed(1) + ' 0 0 1 ' + R.toFixed(1) + ' ' + R.toFixed(1)
+    + 'V' + (y + h).toFixed(1) + 'Z';
+}
+// renderTrendTable 图表的表格孪生视图：数值不再只能靠悬停读取。
+function renderTrendTable(pts, defs, grain) {
+  const host = $('trend-table');
+  host.hidden = false;
+  const on = defs.filter(d => d.on);
+  const fmtOf = d => v => d.money ? fmtUSD(v) : d.tok ? fmtTok(v) : fmtInt(v);
+  if (!pts.length) {
+    host.innerHTML = '<div class="empty"><p class="empty-title">暂无趋势数据</p>'
+      + '<p class="empty-hint">所选时间范围与粒度下没有聚合记录</p></div>';
+    return;
+  }
+  const rows = pts.slice().reverse();
+  host.innerHTML = '<table class="data"><thead><tr><th>时间桶</th>'
+    + on.map(d => '<th class="num">' + esc(d.label) + '</th>').join('')
+    + '<th class="num">合计</th></tr></thead><tbody>'
+    + rows.map(p => {
+      const total = on.reduce((a, d) => a + Math.max(0, d.val(p)), 0);
+      const f = on.length ? fmtOf(on[0]) : fmtInt;
+      return '<tr><td class="cell-mono">' + esc(bucketLabel(p.bucket, grain)) + '</td>'
+        + on.map(d => '<td class="num">' + fmtOf(d)(Math.max(0, d.val(p))) + '</td>').join('')
+        + '<td class="num"><b>' + f(total) + '</b></td></tr>';
+    }).join('')
+    + '</tbody></table>';
+}
+const trendMetricSel = new Select('trend-metric', [
+  { value: 'tokens', label: 'Token' },
+  { value: 'requests', label: '请求' },
+  { value: 'cost', label: '费用' },
+], () => { trend.off.clear(); renderTrend(); }, { value: 'tokens', head: '趋势指标' });
+const trendGrainSel = new Select('trend-grain', GRAINS,
+  () => { trend.grainManual = true; reloadActive(); }, { value: 'day', head: '聚合粒度' });
+// 图表 / 表格切换：表格孪生视图让数值不必依赖悬停
+$('trend-view').addEventListener('click', e => {
+  const b = e.target.closest('button[data-v]');
+  if (!b || b.dataset.v === trend.view) return;
+  trend.view = b.dataset.v;
+  $('trend-view').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+  renderTrend();
+});
 window.addEventListener('resize', debounce(() => { if (activeTab === 'overview') renderTrend(); }, 200));
 
 // ---------- 密钥 ----------
@@ -838,7 +1249,8 @@ function renderKeys() {
     const meta = STATUS_META[keyStatus(k)];
     const conc = k.max_concurrent_requests > 0 ? '≤ ' + k.max_concurrent_requests : '不限';
     return '<tr class="row" data-kid="' + esc(k.kid) + '" aria-expanded="false">'
-      + '<td><div class="cell-key"><span class="label">' + (k.label ? esc(k.label) : '<i>无标签</i>') + '</span>'
+      + '<td><div class="cell-key"><span class="label" title="' + esc(k.label || '') + '">'
+      + (k.label ? esc(k.label) : '<i>无标签</i>') + '</span>'
       + '<span class="kid">' + esc(k.kid) + '</span></div></td>'
       + '<td class="cell-mono">' + esc(k.caller_id) + '</td>'
       + '<td><span class="pill ' + meta.pill + '">' + meta.label + '</span></td>'
@@ -930,24 +1342,37 @@ $('key-search').addEventListener('input', debounce(() => {
   refreshKeys().catch(e => toast(e.message, 'err'));
 }, 350));
 $('key-search').addEventListener('keydown', e => { if (e.key === 'Enter') e.preventDefault(); });
-$('key-status').addEventListener('change', () => {
-  keysView.status = $('key-status').value;
+const keyStatusSel = new Select('key-status', [
+  { value: '', label: '全部状态' },
+  { value: 'active', label: '启用中' },
+  { value: 'disabled', label: '已禁用' },
+  { value: 'revoked', label: '已撤销' },
+  { value: 'expired', label: '已过期' },
+], v => {
+  keysView.status = v;
   keysView.page = 0;
   applyKeyFilter();
-});
-$('key-caller').addEventListener('change', () => {
-  keysView.caller = $('key-caller').value;
+}, { value: '', head: '按状态过滤' });
+const keyCallerSel = new Select('key-caller', [{ value: '', label: '全部 caller' }], v => {
+  keysView.caller = v;
   keysView.page = 0;
   refreshKeys().catch(e => toast(e.message, 'err'));
-});
+}, { value: '', head: '按 caller 过滤' });
+// callersCache 供签发弹窗重建 caller 下拉（原先克隆 select 的 innerHTML，改组件后必须走数据源）
+let callersCache = [];
 async function loadCallers() {
   try {
     const r = await api('/callers');
-    const items = r.items || [];
-    $('key-caller').innerHTML = '<option value="">全部 caller</option>'
-      + items.map(c => '<option value="' + esc(c.id) + '">' + esc(c.display_name || c.id)
-        + (c.enabled ? '' : '（停用）') + '</option>').join('');
+    callersCache = r.items || [];
+    keyCallerSel.setOptions([{ value: '', label: '全部 caller' }].concat(
+      callersCache.map(c => ({ value: c.id, label: (c.display_name || c.id) + (c.enabled ? '' : '（停用）') }))));
   } catch (e) { /* caller 下拉失败不阻塞 */ }
+}
+// callerOptionsHTML 给弹窗内的原生 <select> 用（弹窗表单保持原生控件）
+function callerOptionsHTML() {
+  return '<option value="">默认 caller</option>' + callersCache.map(c =>
+    '<option value="' + esc(c.id) + '">' + esc(c.display_name || c.id)
+    + (c.enabled ? '' : '（停用）') + '</option>').join('');
 }
 
 // 签发
@@ -958,7 +1383,7 @@ $('key-issue-btn').addEventListener('click', () => {
     body: '<div class="form-grid">'
       + fieldRow('标签', '<input id="f-label" placeholder="如：张三的测试 Key">')
       + fieldRow('principal', '<input id="f-principal" placeholder="可选，属主标识">')
-      + fieldRow('caller', '<select id="f-caller">' + $('key-caller').innerHTML + '</select>')
+      + fieldRow('caller', '<select id="f-caller">' + callerOptionsHTML() + '</select>')
       + fieldRow('额度口径', '<select id="f-scope"><option value="caller">归属 caller 共享</option><option value="key">独立计额</option></select>')
       + fieldRow('过期时间', '<input id="f-expires" type="datetime-local">')
       + fieldRow('最大并发', '<input id="f-conc" type="number" min="0" placeholder="0 为不限">')
@@ -1085,18 +1510,87 @@ function revealSheet(kid) {
 }
 
 // ---------- 用量 ----------
-const reqView = { page: 0, size: 20, sort: 'ts', order: 'desc', model: '', keyId: '', result: '' };
+const REQ_SIZES = [20, 50, 100];
+const reqView = {
+  page: 0, size: +(localStorage.getItem('req-size') || 20) || 20,
+  sort: 'ts', order: 'desc', model: '', keyId: '', result: '',
+};
 
-// fillReqSuggestions 填充模型/密钥筛选框的联想候选（datalist 原生下拉 + 手动输入）。
+// 请求明细列定义。
+// 默认列刻意收进视口宽度内：13 列独立排布时表格 1322px > 容器 1184px，
+// 叠加外层 max-height 的竖向滚动后一个卡片里两个方向都要拖。
+// 计量三列与延迟两列合并成复合单元格，其余低频列改为按需开启。
+//
+// sort 只填后端 ListRequests 白名单里真实存在的键（ts/cost/tokens/latency/model）：
+// 其余列不给排序 affordance，避免「看起来能点但点了没反应」。
+const REQ_COLS = [
+  { id: 'ts', label: '时间', sort: 'ts', fixed: true, cell: x => '<td class="cell-mono">' + fmtDT(x.ts, true) + '</td>' },
+  {
+    id: 'key', label: '密钥', cell: x => '<td class="cell-mono" title="' + esc(x.key_id || '') + '">'
+      + esc(keyLabelOf(x.key_id) || x.key_id || '-') + '</td>',
+  },
+  {
+    id: 'model', label: '模型', sort: 'model', cell: x => '<td class="cell-mono cell-clip" title="' + esc(x.model) + '">'
+      + esc(x.model || '-') + '</td>',
+  },
+  { id: 'provider', label: '提供方', off: true, cell: x => '<td class="cell-dim">' + esc(x.provider || '-') + '</td>' },
+  {
+    id: 'result', label: '结果', cell: x => '<td><span class="pill '
+      + (x.result === 'ok' ? 'live' : x.result === 'blocked' ? 'warn' : 'alarm') + '">' + esc(x.result) + '</span></td>',
+  },
+  {
+    id: 'toks', label: '输入 / 输出 / 缓存读', num: true,
+    cell: x => '<td class="num"><span class="cell-toks" title="输入 ' + esc(fmtTok(x.input_tokens))
+      + ' · 输出 ' + esc(fmtTok(x.output_tokens)) + ' · 缓存读 ' + esc(fmtTok(cacheReadOf(x))) + '">'
+      + '<span class="tk">' + fmtTok(x.input_tokens) + '</span><span class="sep">/</span>'
+      + '<span class="tk out">' + fmtTok(x.output_tokens) + '</span><span class="sep">/</span>'
+      + '<span class="tk cr">' + fmtTok(cacheReadOf(x)) + '</span></span></td>',
+  },
+  { id: 'tokens', label: '总 Token', sort: 'tokens', num: true, cell: x => '<td class="num">' + reqTokenCell(x) + '</td>' },
+  { id: 'cost', label: '费用', sort: 'cost', num: true, cell: x => '<td class="num">' + fmtUSD(x.cost_micro_usd) + '</td>' },
+  {
+    // 排序键指向 latency（总延迟）。旧版把「首字」表头标成 data-sort="latency"，
+    // 而 latency 在后端映射到 latency_ms，点「首字」实际按总延迟排 —— 表头与行为不一致。
+    id: 'lat', label: '延迟 首字→总', sort: 'latency', num: true,
+    cell: x => '<td class="num"><span class="cell-lat"><span class="ttft">' + fmtSec(x.ttft_ms)
+      + '</span><span class="arrow">→</span><span>' + fmtSec(x.latency_ms) + '</span></span></td>',
+  },
+  { id: 'tps', label: 'TPS', num: true, off: true, cell: x => '<td class="num">' + fmtTPS(x.tps_milli) + '</td>' },
+  { id: 'reasoning', label: '推理', num: true, off: true, cell: x => '<td class="num">' + fmtTok(x.reasoning_tokens) + '</td>' },
+  { id: 'tier', label: '档位', off: true, cell: x => '<td class="cell-dim">' + esc(x.tier || '-') + '</td>' },
+];
+const REQ_COLS_DEFAULT = REQ_COLS.filter(c => !c.off).map(c => c.id);
+function loadReqCols() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('req-cols') || 'null');
+    if (Array.isArray(saved) && saved.length) {
+      const valid = saved.filter(id => REQ_COLS.some(c => c.id === id));
+      if (valid.length) return new Set(valid.concat(REQ_COLS.filter(c => c.fixed).map(c => c.id)));
+    }
+  } catch (_) { /* 偏好损坏则回默认 */ }
+  return new Set(REQ_COLS_DEFAULT);
+}
+let reqCols = loadReqCols();
+const activeReqCols = () => REQ_COLS.filter(c => reqCols.has(c.id));
+// reqTokenCell 总 Token 单元格：上游未返回用量但已按预占扣费时给出显式标记。
+function reqTokenCell(x) {
+  const noUsage = !(+x.input_tokens || 0) && !(+x.output_tokens || 0)
+    && !(+x.cache_read_tokens || 0) && !(+x.cache_creation_tokens || 0);
+  return noUsage && (+x.cost_micro_usd || 0) > 0
+    ? '<span class="pill warn mono" title="上游未返回用量，费用按预占估算扣费">未捕获</span>'
+    : '<b>' + fmtTok(effTokens(x)) + '</b>';
+}
+
+// fillReqSuggestions 填充模型/密钥筛选框的联想候选（自建组合框，标签与 kid 同时可见）。
 function fillReqSuggestions() {
   api('/usage/dimension?' + new URLSearchParams({ dimension: 'model', limit: '200' }))
-    .then(r => {
-      $('req-model-options').innerHTML = (r.rows || [])
-        .filter(x => x.value).map(x => '<option value="' + esc(x.value) + '"></option>').join('');
-    })
+    .then(r => reqModelCombo.setOptions((r.rows || []).filter(x => x.value)
+      .map(x => ({ value: x.value, label: x.value }))))
     .catch(() => {});
-  $('req-key-options').innerHTML = keysView.cache.map(k =>
-    '<option value="' + esc(k.kid) + '">' + esc(k.label || '') + '</option>').join('');
+  // 值提交 kid，但标签同时显示 —— datalist 在 Firefox 只显示 value，标签会丢
+  reqKeyCombo.setOptions(keysView.cache.map(k => ({
+    value: k.kid, label: k.label || '(无标签)', sub: k.kid,
+  })));
 }
 
 loaders.usage = async () => {
@@ -1105,8 +1599,18 @@ loaders.usage = async () => {
   fillReqSuggestions();
   stamp();
 };
+const DIMS = [
+  { value: 'model', label: '模型' },
+  { value: 'provider', label: '提供方' },
+  { value: 'source', label: '来源' },
+  { value: 'auth_type', label: '认证类型' },
+  { value: 'auth_label', label: '认证账号' },
+  { value: 'result', label: '结果' },
+  { value: 'key_id', label: '密钥' },
+  { value: 'caller_id', label: 'caller' },
+];
 async function loadDim() {
-  const dim = $('dim').value;
+  const dim = dimSel.value;
   const r = await api('/usage/dimension?' + new URLSearchParams({ dimension: dim, ...rangeParams() }));
   // 费用相同时（如全部未计价）按请求数降序，保证视觉排序稳定。
   const rows = (r.rows || []).slice()
@@ -1119,11 +1623,11 @@ async function loadDim() {
   // 占比分母取全量最大值：行序按费用排，首行请求数未必最大，用它会算出 >100%。
   const maxReq = Math.max(1, ...rows.map(row => row.requests || 0));
   $('dim-body').innerHTML = '<div class="table-wrap"><table class="data"><thead><tr>'
-    + '<th class="w-grow">' + esc($('dim').selectedOptions[0].textContent) + '</th>'
+    + '<th class="w-grow">' + esc((DIMS.find(d => d.value === dim) || {}).label || dim) + '</th>'
     + '<th class="num">请求</th><th class="num">失败</th><th class="num">Token</th><th class="num">费用</th>'
     + '<th class="num">平均延迟</th><th class="num">TPS</th></tr></thead><tbody>'
     + rows.map(row => '<tr>'
-      + '<td><div class="bar-cell"><div class="bar-top"><span class="bar-name">'
+      + '<td><div class="bar-cell" title="' + esc(row.value || '(空)') + '"><div class="bar-top"><span class="bar-name">'
       + esc(row.value || '(空)') + '</span><span class="bar-pct">'
       + (row.requests / maxReq * 100).toFixed(0) + '%</span></div>'
       + '<div class="bar-line"><span style="width:' + (row.requests / maxReq * 100).toFixed(1) + '%"></span></div></div></td>'
@@ -1167,41 +1671,48 @@ async function loadRequests() {
   const r = await api('/requests?' + q);
   const items = r.items || [], total = r.total || 0;
   const pages = Math.max(1, Math.ceil(total / reqView.size));
+  const cols = activeReqCols();
   $('req-count').textContent = '共 ' + fmtInt(total) + ' 条 · 第 ' + (reqView.page + 1) + ' / ' + pages + ' 页';
-  $('req-rows').innerHTML = items.map(x => {
-    const noUsage = !(+x.input_tokens || 0) && !(+x.output_tokens || 0)
-      && !(+x.cache_read_tokens || 0) && !(+x.cache_creation_tokens || 0);
-    const uncaught = noUsage && (+x.cost_micro_usd || 0) > 0;
-    const tokenCell = uncaught
-      ? '<span class="pill warn mono" title="上游未返回用量，费用按预占估算扣费">未捕获</span>'
-      : '<b>' + fmtTok(effTokens(x)) + '</b>';
-    return '<tr class="row" data-id="' + esc(x.id) + '">'
-    + '<td class="cell-mono">' + fmtDT(x.ts, true) + '</td>'
-    + '<td class="cell-mono" title="' + esc(x.key_id || '') + '">' + esc(keyLabelOf(x.key_id) || x.key_id || '-') + '</td>'
-    + '<td class="cell-mono" title="' + esc(x.model) + '">' + esc(x.model || '-') + '</td>'
-    + '<td class="cell-dim">' + esc(x.provider || '-') + '</td>'
-    + '<td><span class="pill ' + (x.result === 'ok' ? 'live' : x.result === 'blocked' ? 'warn' : 'alarm') + '">'
-    + esc(x.result) + '</span></td>'
-    + '<td class="num">' + fmtTok(x.input_tokens) + '</td>'
-    + '<td class="num">' + fmtTok(x.output_tokens) + '</td>'
-    + '<td class="num">' + fmtTok(cacheReadOf(x)) + '</td>'
-    + '<td class="num">' + tokenCell + '</td>'
-    + '<td class="num">' + fmtUSD(x.cost_micro_usd) + '</td>'
-    + '<td class="num">' + fmtSec(x.ttft_ms) + '</td>'
-    + '<td class="num">' + fmtSec(x.latency_ms) + '</td>'
-    + '<td class="num">' + fmtTPS(x.tps_milli) + '</td></tr>';
-  }).join('')
-    || '<tr><td colspan="13"><div class="empty"><p class="empty-title">没有匹配的请求</p>'
+  // 表头随列偏好重建；只有后端支持的排序键才带 .sort
+  $('req-head').innerHTML = cols.map(c => '<th' + (c.num ? ' class="num' + (c.sort ? ' sort' : '') + '"'
+    : (c.sort ? ' class="sort"' : '')) + (c.sort ? ' data-sort="' + c.sort + '"' : '')
+    + (c.sort && reqView.sort === c.sort ? ' data-dir="' + reqView.order + '"' : '')
+    + '>' + esc(c.label) + '</th>').join('');
+  $('req-rows').innerHTML = items.map(x =>
+    '<tr class="row" data-id="' + esc(x.id) + '">' + cols.map(c => c.cell(x)).join('') + '</tr>').join('')
+    || '<tr><td colspan="' + cols.length + '"><div class="empty"><p class="empty-title">没有匹配的请求</p>'
     + '<p class="empty-hint">调整筛选条件或时间范围</p></div></td></tr>';
   $('req-rows').dataset.items = JSON.stringify(items);
-  $('req-pager').innerHTML = '<span class="grow"></span>'
+  // 分页：75 页时只有上/下一页不够，补每页条数与跳页
+  $('req-pager').innerHTML = '<span class="jump">每页'
+    + REQ_SIZES.map(s => '<button type="button" class="btn small" data-size="' + s + '"'
+      + (s === reqView.size ? ' disabled' : '') + '>' + s + '</button>').join('') + '</span>'
+    + '<span class="grow"></span>'
     + '<button type="button" class="btn small" id="req-prev"' + (reqView.page <= 0 ? ' disabled' : '') + '>上一页</button>'
-    + '<span class="mono">' + (reqView.page + 1) + ' / ' + pages + '</span>'
+    + '<span class="jump"><input type="number" id="req-jump" min="1" max="' + pages + '" value="' + (reqView.page + 1)
+    + '" aria-label="跳转到页码"><span class="mono">/ ' + pages + '</span></span>'
     + '<button type="button" class="btn small" id="req-next"'
     + ((reqView.page + 1) * reqView.size >= total ? ' disabled' : '') + '>下一页</button>';
-  const prev = $('req-prev'), next = $('req-next');
-  if (prev) prev.onclick = () => { reqView.page--; loadRequests().catch(e => toast(e.message, 'err')); };
-  if (next) next.onclick = () => { reqView.page++; loadRequests().catch(e => toast(e.message, 'err')); };
+  const go = () => loadRequests().catch(e => toast(e.message, 'err'));
+  const prev = $('req-prev'), next = $('req-next'), jump = $('req-jump');
+  if (prev) prev.onclick = () => { reqView.page--; go(); };
+  if (next) next.onclick = () => { reqView.page++; go(); };
+  $('req-pager').querySelectorAll('[data-size]').forEach(b => b.onclick = () => {
+    reqView.size = +b.dataset.size;
+    localStorage.setItem('req-size', String(reqView.size));
+    reqView.page = 0;
+    go();
+  });
+  if (jump) {
+    const apply = () => {
+      const p = Math.max(1, Math.min(pages, parseInt(jump.value, 10) || 1));
+      if (p - 1 === reqView.page) { jump.value = String(p); return; }
+      reqView.page = p - 1;
+      go();
+    };
+    jump.onchange = apply;
+    jump.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); apply(); } };
+  }
 }
 $('req-table').querySelector('thead').addEventListener('click', e => {
   const th = e.target.closest('th.sort');
@@ -1209,10 +1720,6 @@ $('req-table').querySelector('thead').addEventListener('click', e => {
   const keyName = th.dataset.sort;
   if (reqView.sort === keyName) reqView.order = reqView.order === 'desc' ? 'asc' : 'desc';
   else { reqView.sort = keyName; reqView.order = 'desc'; }
-  document.querySelectorAll('#req-table th.sort').forEach(el => {
-    if (el.dataset.sort === reqView.sort) el.dataset.dir = reqView.order;
-    else delete el.dataset.dir;
-  });
   reqView.page = 0;
   loadRequests().catch(err => toast(err.message, 'err'));
 });
@@ -1246,17 +1753,29 @@ $('req-rows').addEventListener('click', e => {
       + '</div>',
   });
 });
-const reqFilterChanged = debounce(() => {
-  reqView.model = $('req-model').value.trim();
-  reqView.keyId = $('req-key').value.trim();
-  reqView.result = $('req-result').value;
+const reqFilterChanged = () => {
+  reqView.model = reqModelCombo.value;
+  reqView.keyId = reqKeyCombo.value;
+  reqView.result = reqResultSel.value;
   reqView.page = 0;
   loadRequests().catch(e => toast(e.message, 'err'));
-}, 400);
-$('req-model').addEventListener('input', reqFilterChanged);
-$('req-key').addEventListener('input', reqFilterChanged);
-$('req-result').addEventListener('change', reqFilterChanged);
-$('dim').addEventListener('change', () => loadDim().catch(e => toast(e.message, 'err')));
+};
+const reqModelCombo = new Combo('req-model', reqFilterChanged);
+const reqKeyCombo = new Combo('req-key', reqFilterChanged);
+const reqResultSel = new Select('req-result', [
+  { value: '', label: '全部结果' },
+  { value: 'ok', label: '成功 ok' },
+  { value: 'error', label: '失败 error' },
+], reqFilterChanged, { value: '', head: '按结果过滤' });
+const dimSel = new Select('dim', DIMS, () => loadDim().catch(e => toast(e.message, 'err')),
+  { value: 'model', head: '聚合维度' });
+// 列偏好：默认列收进视口，低频列按需开启（偏好存 localStorage）
+new MultiSelect('req-cols', REQ_COLS.map(c => ({ value: c.id, label: c.label, fixed: c.fixed })),
+  reqCols, sel => {
+    reqCols = new Set(sel);
+    localStorage.setItem('req-cols', JSON.stringify([...sel]));
+    loadRequests().catch(e => toast(e.message, 'err'));
+  }, { text: '列', head: '显示列', defaults: REQ_COLS_DEFAULT });
 $('req-export').addEventListener('click', async () => {
   try {
     const r = await api('/export/csv', {
