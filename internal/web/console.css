@@ -323,8 +323,6 @@ h1,h2,h3,p{margin:0}
 .meter.slim .meter-readout{font-size:10.5px}
 /* 额度仪表容器。分组模式（金额组 / Token 组）下每组占一列，
    组内四个周期表盘纵向排列，同口径的读数因此能上下对齐比较。 */
-.meter-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}
-.meter-grid>.note{grid-column:1/-1}
 
 /* ── 表格 ─────────────────────────────────────────────────────── */
 .table-wrap{overflow:auto;max-height:none}
@@ -366,7 +364,7 @@ table.data td.cell-clip{max-width:340px;overflow:hidden;text-overflow:ellipsis}
 }
 .keys-toolbar .input{flex:1 1 200px;min-width:160px}
 .key-grid{
-  display:grid;grid-template-columns:repeat(auto-fill,minmax(285px,1fr));
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));
   gap:12px;padding:14px 16px;
 }
 @media (max-width:640px){
@@ -390,6 +388,8 @@ table.data td.cell-clip{max-width:340px;overflow:hidden;text-overflow:ellipsis}
 .kc-kid{font-size:11px;color:var(--fg3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .kc-meter-block{display:grid;gap:4px;min-width:0}
 .kc-meter-block .meter{min-width:0}
+.kc-meters{display:grid;grid-template-columns:1fr 1fr;gap:8px;min-width:0}
+@media (max-width:640px){.kc-meters{gap:6px}}
 .kc-meter-label{
   color:var(--fg4);font-size:10px;font-weight:700;
   letter-spacing:.06em;text-transform:uppercase;
@@ -570,12 +570,29 @@ table.data td.cell-clip{max-width:340px;overflow:hidden;text-overflow:ellipsis}
 .info:hover,.info:focus-visible{border-color:var(--signal);color:var(--signal)}
 table.data th .info{vertical-align:0}
 
-/* 详情里的额度仪表分组（金额一组、Token 一组） */
-.meter-group{display:grid;gap:10px;align-content:start}
-.meter-group-head{
-  color:var(--fg2);font-size:11px;font-weight:700;letter-spacing:.04em;
-  padding-bottom:2px;border-bottom:1px solid var(--line);
+/* dialog 配额清单：名称 + 单条进度 + 「余 X / 上限」三列对齐，
+   取代原先每档一条独立仪表的散乱布局 */
+.bal-wrap{display:grid;gap:14px}
+.bal-sec{display:grid;gap:7px}
+.bal-title{
+  color:var(--fg4);font-size:10px;font-weight:700;
+  letter-spacing:.06em;text-transform:uppercase;
 }
+.bal-row{
+  display:grid;grid-template-columns:52px minmax(0,1fr) auto;
+  gap:10px;align-items:center;font-size:12px;
+}
+.bal-name{color:var(--fg2)}
+.bal-bar{height:6px;border-radius:3px;background:var(--track);overflow:hidden}
+.bal-bar>span{display:block;height:100%;border-radius:3px;background:var(--signal)}
+.bal-row[data-state="warn"] .bal-bar>span{background:var(--warn)}
+.bal-row[data-state="alarm"] .bal-bar>span{background:var(--alarm)}
+.bal-val{
+  font-variant-numeric:tabular-nums;color:var(--fg2);
+  white-space:nowrap;font-size:11.5px;
+}
+.bal-row.bal-off{grid-template-columns:52px auto}
+.bal-off .bal-free{color:var(--fg4)}
 .secret{
   display:grid;gap:8px;padding:12px;border-radius:10px;
   background:var(--signal-soft);border:1px solid var(--signal);

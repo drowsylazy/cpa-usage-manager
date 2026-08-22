@@ -1291,48 +1291,25 @@ function meterHTML(spent, limit) {
     + '<div class="meter-readout"><span>' + pct.toFixed(0) + '%</span><b>'
     + fmtUSD(spent) + ' / ' + fmtUSD(limit) + '</b></div></div>';
 }
-function remainMeter(name, limit, remain) {
+// balRow dialog 配额清单的一行：名称 + 单条进度 + 「余 X / 上限」，对齐排布。
+// limit 未设显示不限；余量缺失显示 — 而非伪装成额度耗尽。
+function balRow(name, limit, remain, fmt) {
   if (!limit || limit <= 0) {
-    return '<div class="meter slim" data-state="idle">'
-      + '<div class="meter-track"><div class="meter-fill" style="width:0%"></div></div>'
-      + '<div class="meter-readout"><span>' + name + '</span><b>不限</b></div></div>';
-  }
-  // 设了上限但余量缺失，说明数据没取到（如字段名写错）。此时显示 "—" 而不是
-  // 静默按 0 处理 —— 后者会把「读不到数据」伪装成「额度已耗尽 100%」。
-  if (remain === null || remain === undefined) {
-    return '<div class="meter slim" data-state="idle">'
-      + '<div class="meter-track"><div class="meter-fill" style="width:0%"></div></div>'
-      + '<div class="meter-readout"><span>' + name + '</span><b title="余量数据缺失">—</b></div></div>';
-  }
-  const used = limit - Math.max(0, remain);
-  const pct = Math.min(100, Math.max(0, used / limit * 100));
-  const state = pct >= 95 ? 'alarm' : pct >= 80 ? 'warn' : '';
-  return '<div class="meter slim" data-state="' + state + '">'
-    + '<div class="meter-track"><div class="meter-fill" style="width:' + pct.toFixed(1) + '%"></div></div>'
-    + '<div class="meter-readout"><span>' + name + '</span><b>'
-    + '余 ' + fmtUSD(Math.max(0, remain)) + '</b></div></div>';
-}
-// remainTokMeter 与 remainMeter 同构，读数用 token 单位（K/M/B）而非金额。
-// limit 为 null/undefined 表示该档未设 token 限额。
-function remainTokMeter(name, limit, remain) {
-  const has = limit !== null && limit !== undefined && limit > 0;
-  if (!has) {
-    return '<div class="meter slim" data-state="idle">'
-      + '<div class="meter-track"><div class="meter-fill" style="width:0%"></div></div>'
-      + '<div class="meter-readout"><span>' + name + '</span><b>不限</b></div></div>';
+    return '<div class="bal-row bal-off"><span class="bal-name">' + name + '</span>'
+      + '<span class="bal-free">不限</span></div>';
   }
   if (remain === null || remain === undefined) {
-    return '<div class="meter slim" data-state="idle">'
-      + '<div class="meter-track"><div class="meter-fill" style="width:0%"></div></div>'
-      + '<div class="meter-readout"><span>' + name + '</span><b title="余量数据缺失">—</b></div></div>';
+    return '<div class="bal-row"><span class="bal-name">' + name + '</span>'
+      + '<span class="bal-bar"><span></span></span>'
+      + '<span class="bal-val" title="余量数据缺失">—</span></div>';
   }
-  const used = limit - Math.max(0, remain);
+  const used = Math.min(limit, Math.max(0, limit - remain));
   const pct = Math.min(100, Math.max(0, used / limit * 100));
   const state = pct >= 95 ? 'alarm' : pct >= 80 ? 'warn' : '';
-  return '<div class="meter slim" data-state="' + state + '">'
-    + '<div class="meter-track"><div class="meter-fill" style="width:' + pct.toFixed(1) + '%"></div></div>'
-    + '<div class="meter-readout"><span>' + name + '</span><b>'
-    + '余 ' + fmtTok(Math.max(0, remain)) + '</b></div></div>';
+  return '<div class="bal-row" data-state="' + state + '">'
+    + '<span class="bal-name">' + name + '</span>'
+    + '<span class="bal-bar"><span style="width:' + pct.toFixed(1) + '%"></span></span>'
+    + '<span class="bal-val mono">余 ' + fmt(Math.max(0, remain)) + ' / ' + fmt(limit) + '</span></div>';
 }
 // tokMeterHTML 密钥表的 token 额度列。
 // 优先展示总量档；只配了周期档时退回显示该档，避免整列空着看不出配了限额。
@@ -1374,11 +1351,13 @@ function renderKeys() {
     const conc = k.max_concurrent_requests > 0 ? '≤ ' + k.max_concurrent_requests : '不限';
     return '<button type="button" class="key-card" data-kid="' + esc(k.kid) + '" title="查看详情">'
       + '<span class="kc-top"><span class="pill ' + meta.pill + '">' + meta.label + '</span>'
-      + '<span class="kc-last">' + esc(rel(k.last_used_at)) + '</span></span>'
+      + '<span class="kc-last">最近使用: ' + esc(rel(k.last_used_at)) + '</span></span>'
       + '<span class="kc-label" title="' + esc(k.label || '') + '">' + (k.label ? esc(k.label) : '<i>无标签</i>') + '</span>'
       + '<span class="kc-kid mono">' + esc(k.kid) + '</span>'
+      + '<span class="kc-meters">'
       + '<span class="kc-meter-block"><span class="kc-meter-label">金额额度</span>' + meterHTML(k.spent_micro_usd, k.quota_micro_usd) + '</span>'
       + '<span class="kc-meter-block"><span class="kc-meter-label">Token 额度</span>' + tokMeterHTML(k) + '</span>'
+      + '</span>'
       + '<span class="kc-meta"><span class="mono">' + esc(k.caller_id) + '</span>'
       + '<span>已用 <b>' + fmtUSD(k.spent_micro_usd) + '</b></span>'
       + '<span>今日 <b>' + fmtUSD(todaySpent(k)) + '</b></span>'
@@ -1411,7 +1390,7 @@ function keyDetailSheet(k) {
       const conc = k.max_concurrent_requests > 0 ? '≤ ' + k.max_concurrent_requests : '不限';
       return '<div class="detail-head"><span class="pill ' + meta.pill + '">' + meta.label + '</span>'
         + '<span class="mono kid-line">' + esc(kid) + '</span>'
-        + '<span class="grow"></span><span class="note">最后使用 ' + esc(rel(k.last_used_at))
+        + '<span class="grow"></span><span class="note">最近使用: ' + esc(rel(k.last_used_at))
         + ' · 并发 ' + conc + '</span></div>'
         + '<div class="detail-facts">'
         + fact('caller', k.caller_id || '-')
@@ -1423,7 +1402,7 @@ function keyDetailSheet(k) {
         + fact('指纹', k.fingerprint || '-')
         + fact('可用模型', (k.allowed_models && k.allowed_models.length) ? k.allowed_models.join(', ') : '不限制')
         + '</div>'
-        + '<div class="meter-grid" id="kd-meters"><p class="note">余额核算中…</p></div>'
+        + '<div class="bal-wrap" id="kd-meters"><p class="note">余额核算中…</p></div>'
         + '<div class="btn-row">'
         + '<button type="button" class="btn small" data-act="edit">编辑</button>'
         + '<button type="button" class="btn small" data-act="rotate">轮换</button>'
@@ -1448,26 +1427,26 @@ function keyDetailSheet(k) {
     () => post('/keys/delete', { kid, actor: 'console' }).then(refreshKeys));
 
   api('/balance?key_id=' + encodeURIComponent(kid)).then(b => {
-    const meters = $('kd-meters');
-    if (!meters) return; // 用户已关闭弹窗
-    // 只有配了 token 限额的 Key 才显示 token 那组仪表，避免未用该功能的 Key
-    // 详情里多出四个「不限」的空表盘。
+    const wrap = $('kd-meters');
+    if (!wrap) return; // 用户已关闭弹窗
+    // 只有配了 token 限额的 Key 才显示 token 那组配额，避免未用该功能的 Key
+    // 详情里多出四行「不限」的空清单。
     const hasTok = [k.token_limit, k.daily_token_limit, k.weekly_token_limit, k.monthly_token_limit]
       .some(v => v !== null && v !== undefined);
     // 字段名必须与 service.Balance 的 JSON tag 一致。
-    meters.innerHTML =
-      '<div class="meter-group"><div class="meter-group-head">金额额度（USD）</div>'
-      + remainMeter('总额度', k.quota_micro_usd, b.total_remaining_micro_usd)
-      + remainMeter('今日', k.daily_micro_usd, b.daily_remaining_micro_usd)
-      + remainMeter('本周', k.weekly_micro_usd, b.weekly_remaining_micro_usd)
-      + remainMeter('本月', k.monthly_micro_usd, b.monthly_remaining_micro_usd)
+    wrap.innerHTML =
+      '<div class="bal-sec"><div class="bal-title">金额额度（USD）</div>'
+      + balRow('总额度', k.quota_micro_usd, b.total_remaining_micro_usd, fmtUSD)
+      + balRow('今日', k.daily_micro_usd, b.daily_remaining_micro_usd, fmtUSD)
+      + balRow('本周', k.weekly_micro_usd, b.weekly_remaining_micro_usd, fmtUSD)
+      + balRow('本月', k.monthly_micro_usd, b.monthly_remaining_micro_usd, fmtUSD)
       + '</div>'
       + (hasTok
-        ? '<div class="meter-group"><div class="meter-group-head">Token 限额</div>'
-          + remainTokMeter('总量', k.token_limit, b.total_remaining_tokens)
-          + remainTokMeter('今日', k.daily_token_limit, b.daily_remaining_tokens)
-          + remainTokMeter('本周', k.weekly_token_limit, b.weekly_remaining_tokens)
-          + remainTokMeter('本月', k.monthly_token_limit, b.monthly_remaining_tokens)
+        ? '<div class="bal-sec"><div class="bal-title">Token 限额</div>'
+          + balRow('总量', k.token_limit, b.total_remaining_tokens, fmtTok)
+          + balRow('今日', k.daily_token_limit, b.daily_remaining_tokens, fmtTok)
+          + balRow('本周', k.weekly_token_limit, b.weekly_remaining_tokens, fmtTok)
+          + balRow('本月', k.monthly_token_limit, b.monthly_remaining_tokens, fmtTok)
           + '</div>'
         : '')
       + '<p class="note">在途预占 ' + fmtUSD(b.held_micro_usd || 0)
