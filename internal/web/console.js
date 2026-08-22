@@ -1372,22 +1372,28 @@ function renderKeys() {
   $('key-rows').innerHTML = rows.map(k => {
     const meta = STATUS_META[keyStatus(k)];
     const conc = k.max_concurrent_requests > 0 ? '≤ ' + k.max_concurrent_requests : '不限';
-    return '<tr class="row" data-kid="' + esc(k.kid) + '" aria-expanded="false">'
-      + '<td><div class="cell-key"><span class="label" title="' + esc(k.label || '') + '">'
-      + (k.label ? esc(k.label) : '<i>无标签</i>') + '</span>'
-      + '<span class="kid">' + esc(k.kid) + '</span></div></td>'
-      + '<td class="cell-mono">' + esc(k.caller_id) + '</td>'
-      + '<td><span class="pill ' + meta.pill + '">' + meta.label + '</span></td>'
-      + '<td class="w-meter">' + meterHTML(k.spent_micro_usd, k.quota_micro_usd) + '</td>'
-      + '<td class="w-meter">' + tokMeterHTML(k) + '</td>'
-      + '<td class="num">' + fmtUSD(k.spent_micro_usd) + '</td>'
-      + '<td class="num">' + fmtUSD(todaySpent(k)) + '</td>'
-      + '<td class="num">' + conc + '</td>'
-      + '<td class="cell-dim">' + esc(rel(k.last_used_at)) + '</td>'
-      + '<td class="w-chev"><svg class="chev" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg></td></tr>';
+    return '<div class="key-card" data-kid="' + esc(k.kid) + '" aria-expanded="false" tabindex="0">'
+      + '<div class="kc-head">'
+      + '<span class="pill ' + meta.pill + '">' + meta.label + '</span>'
+      + '<span class="kc-label" title="' + esc(k.label || '') + '">' + (k.label ? esc(k.label) : '<i>无标签</i>') + '</span>'
+      + '<span class="kc-last" title="最后使用">' + esc(rel(k.last_used_at)) + '</span>'
+      + '<svg class="chev" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg>'
+      + '</div>'
+      + '<div class="kc-meta">'
+      + '<span class="kc-kid mono">' + esc(k.kid) + '</span>'
+      + '<span class="kc-sep">·</span><span>' + esc(k.caller_id) + '</span>'
+      + '<span class="kc-sep">·</span><span>已用 <b class="mono">' + fmtUSD(k.spent_micro_usd) + '</b></span>'
+      + '<span class="kc-sep">·</span><span>今日 <b class="mono">' + fmtUSD(todaySpent(k)) + '</b></span>'
+      + '<span class="kc-sep">·</span><span>并发 <b class="mono">' + conc + '</b></span>'
+      + '</div>'
+      + '<div class="kc-meters">'
+      + '<div class="kc-meter"><span class="kc-meter-label">金额额度</span>' + meterHTML(k.spent_micro_usd, k.quota_micro_usd) + '</div>'
+      + '<div class="kc-meter"><span class="kc-meter-label">Token 额度</span>' + tokMeterHTML(k) + '</div>'
+      + '</div>'
+      + '</div>';
   }).join('')
-    || '<tr><td colspan="10"><div class="empty"><p class="empty-title">没有匹配的密钥</p>'
-    + '<p class="empty-hint">调整筛选条件，或点击右上角「签发密钥」</p></div></td></tr>';
+    || '<div class="empty"><p class="empty-title">没有匹配的密钥</p>'
+    + '<p class="empty-hint">调整筛选条件，或点击右上角「签发密钥」</p></div>';
 
   const pages = Math.max(1, Math.ceil(list.length / keysView.size));
   $('key-pager').innerHTML = '<span class="mono">第 ' + (keysView.page + 1) + ' / ' + pages + ' 页</span>'
@@ -1400,24 +1406,32 @@ function renderKeys() {
   if (next) next.onclick = () => { keysView.page++; renderKeys(); };
 }
 
+$('key-rows').addEventListener('keydown', e => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const card = e.target.closest('.key-card');
+  if (!card || e.target !== card) return;
+  e.preventDefault();
+  card.click();
+});
+
 $('key-rows').addEventListener('click', async e => {
-  const tr = e.target.closest('tr.row');
-  if (!tr) return;
-  const open = tr.getAttribute('aria-expanded') === 'true';
-  const detail = tr.nextElementSibling;
-  if (detail && detail.classList.contains('detail')) {
-    tr.setAttribute('aria-expanded', 'false');
+  const card = e.target.closest('.key-card');
+  if (!card) return;
+  const open = card.getAttribute('aria-expanded') === 'true';
+  const detail = card.nextElementSibling;
+  if (detail && detail.classList.contains('key-detail')) {
+    card.setAttribute('aria-expanded', 'false');
     detail.remove();
     if (open) return;
   }
-  tr.setAttribute('aria-expanded', 'true');
-  const kid = tr.dataset.kid;
+  card.setAttribute('aria-expanded', 'true');
+  const kid = card.dataset.kid;
   const k = keysView.cache.find(x => x.kid === kid);
   if (!k) return;
   const st = keyStatus(k);
-  const dtr = document.createElement('tr');
-  dtr.className = 'detail';
-  dtr.innerHTML = '<td colspan="10"><div class="detail-grid"><div class="detail-facts">'
+  const box = document.createElement('div');
+  box.className = 'key-detail';
+  box.innerHTML = '<div class="detail-grid"><div class="detail-facts">'
     + fact('指纹', k.fingerprint || '-')
     + fact('principal', k.principal || '-')
     + fact('额度口径', k.caller_scope === 'key' ? '独立计额' : '归属 caller')
@@ -1433,23 +1447,23 @@ $('key-rows').addEventListener('click', async e => {
     + '<button type="button" class="btn small" data-act="reveal">查看明文</button>'
     + (st !== 'revoked' ? '<button type="button" class="btn small danger" data-act="revoke">撤销</button>' : '')
     + '<button type="button" class="btn small danger" data-act="delete">删除</button>'
-    + '</div></div></td>';
-  tr.after(dtr);
-  dtr.querySelector('[data-act="edit"]').onclick = () => editKeySheet(k);
-  dtr.querySelector('[data-act="rotate"]').onclick = () => rotateSheet(kid);
-  dtr.querySelector('[data-act="reveal"]').onclick = () => revealSheet(kid);
-  const rv = dtr.querySelector('[data-act="revoke"]');
+    + '</div></div>';
+  card.after(box);
+  box.querySelector('[data-act="edit"]').onclick = () => editKeySheet(k);
+  box.querySelector('[data-act="rotate"]').onclick = () => rotateSheet(kid);
+  box.querySelector('[data-act="reveal"]').onclick = () => revealSheet(kid);
+  const rv = box.querySelector('[data-act="revoke"]');
   if (rv) rv.onclick = () => confirmSheet('撤销密钥 ' + kid,
     '撤销不可逆，该 Key 将立即无法通过鉴权。历史用量保留。',
     () => post('/keys/revoke', { kid, actor: 'console' }).then(refreshKeys));
-  dtr.querySelector('[data-act="delete"]').onclick = () => confirmSheet('删除密钥 ' + kid,
+  box.querySelector('[data-act="delete"]').onclick = () => confirmSheet('删除密钥 ' + kid,
     '永久删除该 Key（历史用量保留）。操作不可逆。',
     () => post('/keys/delete', { kid, actor: 'console' }).then(refreshKeys));
 
   try {
     const b = await api('/balance?key_id=' + encodeURIComponent(kid));
-    const box = $('kd-meters');
-    if (!box) return;
+    const meters = $('kd-meters');
+    if (!meters) return;
     // 只有配了 token 限额的 Key 才显示 token 那组仪表，避免未用该功能的 Key
     // 详情里多出四个「不限」的空表盘。
     const hasTok = [k.token_limit, k.daily_token_limit, k.weekly_token_limit, k.monthly_token_limit]
@@ -1458,7 +1472,7 @@ $('key-rows').addEventListener('click', async e => {
     // 既有缺陷：此处原读 b.total / b.daily / b.held，而接口返回的是
     // total_remaining_micro_usd 等，全部 undefined → 金额表盘长期显示
     // 「余 $0 / 100% alarm」（与同一行表格里的真实占用比矛盾）。
-    box.innerHTML =
+    meters.innerHTML =
       '<div class="meter-group"><div class="meter-group-head">金额额度（USD）</div>'
       + remainMeter('总额度', k.quota_micro_usd, b.total_remaining_micro_usd)
       + remainMeter('今日', k.daily_micro_usd, b.daily_remaining_micro_usd)
