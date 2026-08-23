@@ -274,6 +274,28 @@
     </article>
   </div>
 
+  <article class="panel">
+    <div class="panel-head"><div><h2 class="panel-title">通知与报告</h2><p class="panel-sub">额度越线、密钥过期、系统错误与定期报告，经 shoutrrr 推送到多个渠道（Telegram / Discord / 飞书 / ntfy / generic webhook 等）</p></div></div>
+    <div class="panel-body stack">
+      <div class="nt-sep">通知设置与端点</div>
+      <div class="btn-row">
+        <label class="check-row"><input type="checkbox" id="nt-enabled"> 额度告警</label>
+        <label class="check-row"><input type="checkbox" id="nt-errors"> 错误上报</label>
+        <label class="check-row">告警阈值 <input type="number" id="nt-warn" min="1" max="95" step="1" value="20"> %</label>
+        <button type="button" class="btn primary" id="nt-save-btn">保存设置</button>
+        <button type="button" class="btn" id="nt-add-btn">新增端点</button>
+      </div>
+      <div class="nt-list" id="nt-list"></div>
+      <p class="note">URL 写法见 shoutrrr 文档，如 <span class="mono">lark://open.larksuite.com/&lt;token&gt;</span>、<span class="mono">telegram://&lt;token&gt;@bot</span>、<span class="mono">generic://host/path</span>。额度告警按状态翻转边沿触发：每档只报一次，余量回升后自动重新武装；错误上报（发送失败、存储降级）同来源每小时最多一条。</p>
+      <div class="nt-sep">定期报告</div>
+      <div class="btn-row">
+        <button type="button" class="btn primary" id="rp-add-btn">新增报告</button>
+      </div>
+      <div class="nt-list" id="rp-list"></div>
+      <p class="note">报告覆盖「上一个已完成周期」：日报=昨天，周报=上个自然周（周一起），月报=上个自然月；内容板块与 Top N 在表单里自由组合。停机跨过触发点时补发最近一期。</p>
+    </div>
+  </article>
+
   <article class="panel danger-zone">
       <div class="panel-head"><div><h2 class="panel-title">重置统计</h2><p class="panel-sub">清空逐请求明细、分钟聚合、已终结预占与密钥计数器；密钥与计价规则保留</p></div></div>
     <div class="panel-body">
@@ -301,6 +323,10 @@
     <div class="sheet-body" id="sheet-body"></div>
     <div class="sheet-foot">
       <p class="sheet-note" id="sheet-note"></p>
+      <button type="button" class="btn ghost" id="sheet-copy" hidden title="复制此信息">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 9h10v12H9zM5 15V3h10"/></svg>
+        <span>复制</span>
+      </button>
       <button type="button" class="btn" id="sheet-cancel">取消</button>
       <button type="button" class="btn primary" id="sheet-ok">确定</button>
     </div>

@@ -8,7 +8,7 @@ import (
 
 // SchemaVersion 是本代码期望的数据库 schema 版本。
 // 打开库时若发现库版本更高，说明是被更新版插件写过的库，拒绝降级使用。
-const SchemaVersion = 2
+const SchemaVersion = 4
 
 // migration 是一次版本化迁移。
 type migration struct {
@@ -271,8 +271,56 @@ var migrations = []migration{
 			// costForRule 只用 输入/输出/缓存读/缓存写 四档：推理 token 由
 			// Billable() 并入输出按输出价计，cached 并入缓存读按缓存读价计。
 			// price_reasoning / price_cached 填了永远不生效，留着会误导配置者。
-			`ALTER TABLE pricing_rules DROP COLUMN price_reasoning`,
+				`ALTER TABLE pricing_rules DROP COLUMN price_reasoning`,
 			`ALTER TABLE pricing_rules DROP COLUMN price_cached`,
+		},
+	},
+	{
+		version: 3,
+		name:    "notify_endpoints",
+		stmts: []string{
+			// ---- 告警通知端点（shoutrrr URL）----
+			// url_enc 是 AES-GCM 加密后的 shoutrrr URL：里面通常带 bot token /
+			// webhook secret，与 key 明文同密级，不能落明文。发送结果直接记在行上，
+			// 供面板展示最近一次成功/失败。
+			`CREATE TABLE notify_endpoints (
+				id           INTEGER PRIMARY KEY AUTOINCREMENT,
+				label        TEXT    NOT NULL DEFAULT '',
+				url_enc      BLOB    NOT NULL,
+				enabled      INTEGER NOT NULL DEFAULT 1,
+				last_sent_at INTEGER,
+				last_ok_at   INTEGER,
+				last_error   TEXT    NOT NULL DEFAULT '',
+				created_at   INTEGER NOT NULL,
+				updated_at   INTEGER NOT NULL
+			)`,
+		},
+	},
+	{
+		version: 4,
+		name:    "report_configs",
+		stmts: []string{
+			// ---- 定期报告配置（日/周/月报）----
+			// 内容板块与 Top N 存 sections_json，目标端点存 endpoint_ids_json
+			// （引用 notify_endpoints.id）。last_period 记录已发送的报告周期
+			// （如 2026-02-04 / 2026-W06 / 2026-01），防止重启后重发。
+			`CREATE TABLE report_configs (
+				id                INTEGER PRIMARY KEY AUTOINCREMENT,
+				name              TEXT    NOT NULL DEFAULT '',
+				enabled           INTEGER NOT NULL DEFAULT 1,
+				frequency         TEXT    NOT NULL DEFAULT 'daily' CHECK (frequency IN ('daily','weekly','monthly')),
+				time_of_day       TEXT    NOT NULL DEFAULT '09:00',
+				weekday           INTEGER NOT NULL DEFAULT 1,
+				monthday          INTEGER NOT NULL DEFAULT 1,
+				tz_offset_min     INTEGER NOT NULL DEFAULT 0,
+				sections_json     TEXT    NOT NULL DEFAULT '{}',
+				endpoint_ids_json TEXT    NOT NULL DEFAULT '[]',
+				last_period       TEXT    NOT NULL DEFAULT '',
+				last_sent_at      INTEGER,
+				last_error        TEXT    NOT NULL DEFAULT '',
+				created_at        INTEGER NOT NULL,
+				updated_at        INTEGER NOT NULL
+			)`,
 		},
 	},
 }

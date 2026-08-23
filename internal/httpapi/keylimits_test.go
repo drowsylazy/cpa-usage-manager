@@ -210,6 +210,45 @@ func TestKeyUpdateRejectsNegativeAndGarbageLimits(t *testing.T) {
 	}
 }
 
+func TestKeyUpdateMaxConcurrentAcceptsNumericForms(t *testing.T) {
+	a := newTestAPI(t)
+	// v0.3.10 回归：并发字段漏改了裸数字口径（strconv.Atoi(jsonStr(v)) 对
+	// JSON 数字恒报「必须是整数」），编辑表单任何值都过不去。
+	kid := issueTestKey(t, a,
+		`{"label":"mc1","caller_id":"default","max_concurrent_requests":3,"actor":"t"}`)
+
+	for _, tc := range []struct {
+		name, body string
+		want       int
+	}{
+		{"裸数字", `{"kid":"` + kid + `","max_concurrent_requests":10,"actor":"t"}`, 10},
+		{"字符串数字", `{"kid":"` + kid + `","max_concurrent_requests":"1","actor":"t"}`, 1},
+	} {
+		w := do(t, a, "POST", base+"/keys/update", tc.body)
+		if w.Code != 200 {
+			t.Errorf("%s 应被接受，得到 code=%d body=%s", tc.name, w.Code, w.Body.String())
+			continue
+		}
+		var k store.PluginKey
+		decodeJSON(t, w, &k)
+		if k.MaxConcurrentRequests != tc.want {
+			t.Errorf("%s：应为 %d，得到 %d", tc.name, tc.want, k.MaxConcurrentRequests)
+		}
+	}
+
+	// null 表示清空 → 归零（0 = 并发不限）。
+	w := do(t, a, "POST", base+"/keys/update",
+		`{"kid":"`+kid+`","max_concurrent_requests":null,"actor":"t"}`)
+	if w.Code != 200 {
+		t.Fatalf("null 应被接受，得到 code=%d body=%s", w.Code, w.Body.String())
+	}
+	var k store.PluginKey
+	decodeJSON(t, w, &k)
+	if k.MaxConcurrentRequests != 0 {
+		t.Errorf("null 应归零，得到 %d", k.MaxConcurrentRequests)
+	}
+}
+
 func TestBalanceExposesTokenRemaining(t *testing.T) {
 	a := newTestAPI(t)
 	// 两族互斥：金额字段名与 token 字段名分 Key 钉契约。

@@ -573,6 +573,7 @@ function openSheet(o) {
   $('sheet-title').textContent = o.title;
   $('sheet-body').innerHTML = o.body || '';
   $('sheet-note').textContent = o.note || '';
+  $('sheet-copy').hidden = !$('sheet-note').textContent;
   const ok = $('sheet-ok');
   const cancel = $('sheet-cancel');
   ok.textContent = o.okText || '确定';
@@ -602,6 +603,11 @@ $('sheet-x').addEventListener('click', () => animateCloseSheet());
 $('sheet-cancel').addEventListener('click', () => animateCloseSheet());
 sheet.addEventListener('cancel', e => { e.preventDefault(); animateCloseSheet(); });
 $('sheet-form').addEventListener('submit', e => { e.preventDefault(); $('sheet-ok').click(); });
+$('sheet-copy').addEventListener('click', () => {
+  const text = $('sheet-note').textContent;
+  if (!text) return;
+  copyText(text).then(() => toast('已复制', 'ok')).catch(e => toast(e.message, 'err'));
+});
 $('sheet-ok').addEventListener('click', async () => {
   if (!sheetOk) { animateCloseSheet(); return; }
   const btn = $('sheet-ok');
@@ -612,6 +618,9 @@ $('sheet-ok').addEventListener('click', async () => {
     animateCloseSheet();
   } catch (e) {
     toast(e.message, 'err');
+    // 报错同时落到底部信息栏并亮出复制按钮，方便用户拷贝完整报错。
+    $('sheet-note').textContent = e.message;
+    $('sheet-copy').hidden = false;
     btn.disabled = false;
   }
 });
@@ -2375,6 +2384,8 @@ loaders.system = async () => {
   $('db-note').textContent = s.writable
     ? '备份为单文件 SQLite 快照；恢复前服务端会做一致性检查。'
     : '当前实例处于只读模式（可能存在跨进程写者），备份可用，恢复不可用。';
+  await loadNotify();
+  await loadReports();
   updateBadges();
   stamp();
 };
@@ -2464,6 +2475,273 @@ $('reset-btn').addEventListener('click', () => {
       loaders.system().catch(() => {});
     },
   });
+});
+
+// ---------- 通知（shoutrrr 多端点） ----------
+let notifyCache = { settings: null, endpoints: [] };
+async function loadNotify() {
+  const r = await api('/notify');
+  notifyCache = { settings: r.settings || null, endpoints: r.endpoints || [] };
+  renderNotify();
+}
+function renderNotify() {
+  const st = notifyCache.settings || {};
+  $('nt-enabled').checked = !!st.enabled;
+  $('nt-errors').checked = !!st.error_alerts;
+  $('nt-warn').value = st.warn_pct ?? 20;
+  const eps = notifyCache.endpoints;
+  if (!eps.length) {
+    $('nt-list').innerHTML = '<p class="note">尚未配置通知端点。</p>';
+    return;
+  }
+  $('nt-list').innerHTML = eps.map(e => {
+    const scheme = (String(e.url).split('://')[0] || '?').toLowerCase();
+    const status = e.last_error
+      ? '<span class="nt-err">✗ ' + esc(e.last_error) + '</span>'
+      : e.last_ok_at
+        ? '<span class="nt-ok">✓ 上次发送成功 · ' + esc(fmtDT(e.last_ok_at)) + '</span>'
+        : '<span class="nt-dim">从未发送</span>';
+    return '<div class="nt-item' + (e.enabled ? '' : ' off') + '">'
+      + '<span class="nt-scheme">' + esc(scheme) + '</span>'
+      + '<div class="nt-main">'
+      + '<div class="nt-head"><b>' + esc(e.label || '未命名端点') + '</b>'
+      + (e.enabled ? '' : ' <span class="pill">停用</span>') + '</div>'
+      + '<div class="nt-url mono" title="' + esc(e.url) + '">' + esc(e.url) + '</div>'
+      + '<div class="nt-status">' + status + '</div>'
+      + '</div>'
+      + '<div class="btn-row">'
+      + '<button type="button" class="btn" data-nt-test="' + e.id + '">测试</button>'
+      + '<button type="button" class="btn" data-nt-edit="' + e.id + '">编辑</button>'
+      + '<button type="button" class="btn danger" data-nt-del="' + e.id + '">删除</button>'
+      + '</div></div>';
+  }).join('');
+}
+function openEndpointSheet(ep) {
+  openSheet({
+    title: ep ? '编辑通知端点' : '新增通知端点',
+    okText: ep ? '保存' : '添加',
+    body:
+      fieldRow('标签', '<input id="f-nt-label" placeholder="如：飞书值班群" value="' + esc(ep ? ep.label : '') + '">')
+      + fieldRow('shoutrrr URL',
+        '<textarea id="f-nt-url" rows="3" spellcheck="false" autocomplete="off" '
+        + 'placeholder="telegram://… / discord://… / lark://… / generic://…"'
+        + '>' + esc(ep ? ep.url : '') + '</textarea>')
+      + '<label class="check-row"><input type="checkbox" id="f-nt-enabled"'
+      + (!ep || ep.enabled ? ' checked' : '') + '> 启用该端点</label>',
+    note: 'URL 里通常带 bot token / webhook secret，仅存本机数据库并加密；完整服务列表见 shoutrrr 文档。',
+    onOk: async () => {
+      await post('/notify/endpoint/save', {
+        id: ep ? ep.id : 0,
+        label: $('f-nt-label').value.trim(),
+        url: $('f-nt-url').value.trim(),
+        enabled: $('f-nt-enabled').checked,
+        actor: 'console',
+      });
+      toast(ep ? '端点已更新' : '端点已添加', 'ok');
+      await loadNotify();
+    },
+  });
+}
+$('nt-add-btn').addEventListener('click', () => openEndpointSheet(null));
+$('nt-save-btn').addEventListener('click', async () => {
+  const warn = Math.round(Number($('nt-warn').value));
+  try {
+    const r = await post('/notify/settings', {
+      enabled: $('nt-enabled').checked,
+      error_alerts: $('nt-errors').checked,
+      warn_pct: Number.isFinite(warn) && warn > 0 ? warn : 20,
+      actor: 'console',
+    });
+    notifyCache.settings = r;
+    toast('通知设置已保存', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+});
+$('nt-list').addEventListener('click', ev => {
+  const t = ev.target.closest('button[data-nt-test],button[data-nt-edit],button[data-nt-del]');
+  if (!t) return;
+  const id = Number(t.dataset.ntTest || t.dataset.ntEdit || t.dataset.ntDel);
+  const ep = (notifyCache.endpoints || []).find(x => x.id === id);
+  if (!ep) return;
+  if (t.dataset.ntTest !== undefined) {
+    (async () => {
+      try {
+        await post('/notify/endpoint/test', { id, actor: 'console' });
+        toast('测试消息已发送，请到对应渠道查收', 'ok');
+        renderNotify();
+      } catch (e) { toast(e.message, 'err'); renderNotify(); }
+    })();
+  } else if (t.dataset.ntEdit !== undefined) {
+    openEndpointSheet(ep);
+  } else {
+    openSheet({
+      title: '删除通知端点', danger: true, okText: '删除',
+      body: '<p>删除端点「<b>' + esc(ep.label || ep.url) + '</b>」？该操作不可撤销。</p>',
+      onOk: async () => {
+        await post('/notify/endpoint/delete', { id, actor: 'console' });
+        toast('端点已删除', 'ok');
+        await loadNotify();
+      },
+    });
+  }
+});
+
+// ---------- 定期报告（日/周/月报） ----------
+let reportsCache = [];
+async function loadReports() {
+  const r = await api('/reports');
+  reportsCache = r.items || [];
+  renderReports();
+}
+function renderReports() {
+  const el = $('rp-list');
+  if (!reportsCache.length) {
+    el.innerHTML = '<p class="note">尚未配置定期报告。</p>';
+    return;
+  }
+  const freqName = { daily: '日报', weekly: '周报', monthly: '月报' };
+  const epName = id => {
+    const e = (notifyCache.endpoints || []).find(x => x.id === id);
+    return e ? (e.label || e.url) : '#' + id;
+  };
+  el.innerHTML = reportsCache.map(c => {
+    let sched = '每天 ' + c.time_of_day;
+    if (c.frequency === 'weekly') sched = '每周' + '一二三四五六日'[c.weekday - 1] + ' ' + c.time_of_day;
+    if (c.frequency === 'monthly') sched = '每月 ' + c.monthday + ' 日 ' + c.time_of_day;
+    const tz = c.tz_offset_min ? ' · UTC' + (c.tz_offset_min > 0 ? '+' : '') + Math.round(c.tz_offset_min / 60 * 10) / 10 : ' · UTC';
+    const eps = (c.endpoint_ids || []).map(epName).join('、') || '无端点';
+    const status = c.last_error
+      ? '<span class="nt-err">✗ ' + esc(c.last_error) + '</span>'
+      : c.last_sent_at
+        ? '<span class="nt-ok">✓ 上次发送 · ' + esc(fmtDT(c.last_sent_at)) + '</span>'
+        : '<span class="nt-dim">从未发送</span>';
+    return '<div class="nt-item' + (c.enabled ? '' : ' off') + '">'
+      + '<span class="nt-scheme">' + esc(freqName[c.frequency] || c.frequency) + '</span>'
+      + '<div class="nt-main">'
+      + '<div class="nt-head"><b>' + esc(c.name || '未命名报告') + '</b>' + (c.enabled ? '' : ' <span class="pill">停用</span>') + '</div>'
+      + '<div class="nt-status">' + esc(sched + tz) + ' → ' + esc(eps) + '</div>'
+      + '<div class="nt-status">' + status + '</div>'
+      + '</div>'
+      + '<div class="btn-row">'
+      + '<button type="button" class="btn" data-rp-test="' + c.id + '">测试</button>'
+      + '<button type="button" class="btn" data-rp-edit="' + c.id + '">编辑</button>'
+      + '<button type="button" class="btn danger" data-rp-del="' + c.id + '">删除</button>'
+      + '</div></div>';
+  }).join('');
+}
+const RP_METRICS = [['cost', '费用'], ['tokens', 'Token'], ['requests', '请求数']];
+function rpMetricSel(id, cur) {
+  return '<select id="' + id + '" class="rp-select">'
+    + RP_METRICS.map(m => '<option value="' + m[0] + '"' + (cur === m[0] ? ' selected' : '') + '>' + m[1] + '</option>').join('')
+    + '</select>';
+}
+function openReportSheet(c) {
+  const eps = notifyCache.endpoints || [];
+  if (!eps.length) { toast('请先在「通知」面板配置至少一个端点', 'err'); return; }
+  const s = (c && c.sections) || {};
+  const bm = s.by_model || { on: !c, top: 5, metric: 'cost' };
+  const bk = s.by_key || { on: false, top: 5, metric: 'cost' };
+  const bc = s.by_caller || { on: false, top: 5, metric: 'cost' };
+  const ids = (c && c.endpoint_ids) || [];
+  const epChecks = eps.map(e =>
+    '<label class="check-row"><input type="checkbox" class="rp-ep" value="' + e.id + '"'
+    + (ids.includes(e.id) ? ' checked' : '') + '> ' + esc(e.label || e.url) + '</label>').join('');
+  const topBlock = (key, label, t) =>
+    '<div class="rp-top-row">'
+    + '<label class="check-row"><input type="checkbox" id="rp-' + key + '-on"' + (t.on ? ' checked' : '') + '> ' + label + ' Top</label>'
+    + '<input type="number" id="rp-' + key + '-top" min="1" max="20" value="' + (t.top || 5) + '">'
+    + rpMetricSel('rp-' + key + '-metric', t.metric || 'cost')
+    + '</div>';
+  openSheet({
+    title: c ? '编辑报告 · ' + (c.name || '') : '新增定期报告',
+    okText: c ? '保存' : '添加',
+    body:
+      fieldRow('名称', '<input id="rp-name" placeholder="如：每日用量日报" value="' + esc(c ? c.name : '') + '">')
+      + '<div class="form-grid">'
+      + fieldRow('频率', '<select id="rp-freq" class="rp-select">'
+        + [['daily', '日报'], ['weekly', '周报'], ['monthly', '月报']].map(f =>
+          '<option value="' + f[0] + '"' + ((c ? c.frequency : 'daily') === f[0] ? ' selected' : '') + '>' + f[1] + '</option>').join('') + '</select>')
+      + fieldRow('发送时刻', '<input id="rp-time" type="time" value="' + esc(c ? c.time_of_day : '09:00') + '">')
+      + '<span id="rp-weekday-row">' + fieldRow('每周几（周报）', '<select id="rp-weekday" class="rp-select">'
+        + ['周一', '周二', '周三', '周四', '周五', '周六', '周日'].map((d, i) =>
+          '<option value="' + (i + 1) + '"' + ((c ? c.weekday : 1) === i + 1 ? ' selected' : '') + '>' + d + '</option>').join('') + '</select>')
+      + '</span>'
+      + '<span id="rp-monthday-row">' + fieldRow('每月几号（月报）', '<input type="number" id="rp-monthday" min="1" max="28" value="' + (c ? c.monthday : 1) + '">') + '</span>'
+      + fieldRow('时区偏移（分钟，北京 +480）', '<input type="number" id="rp-tz" min="-840" max="840" step="15" value="' + (c ? c.tz_offset_min : 0) + '">')
+      + '</div>'
+      + '<div class="form-sep">内容板块</div>'
+      + '<div class="rp-secs">'
+      + '<label class="check-row"><input type="checkbox" id="rp-summary"' + (s.summary || !c ? ' checked' : '') + '> 汇总行（请求 / 费用 / Token / 成功率 / 缓存命中）</label>'
+      + '<label class="check-row"><input type="checkbox" id="rp-failures"' + (s.failures ? ' checked' : '') + '> 失败请求明细</label>'
+      + topBlock('by_model', '模型', bm)
+      + topBlock('by_key', '密钥', bk)
+      + topBlock('by_caller', '归属', bc)
+      + '</div>'
+      + '<div class="form-sep">发送端点</div>'
+      + '<div class="rp-eps">' + epChecks + '</div>'
+      + '<label class="check-row"><input type="checkbox" id="rp-enabled"' + (!c || c.enabled ? ' checked' : '') + '> 启用该报告</label>',
+    note: '报告覆盖上一个已完成周期；测试按钮按同一周期立即生成发送，不影响计划。',
+    onOk: async () => {
+      const endpointIDs = [...document.querySelectorAll('.rp-ep:checked')].map(x => Number(x.value));
+      if (!endpointIDs.length) throw new Error('至少选择一个发送端点');
+      await post('/reports/save', {
+        id: c ? c.id : 0,
+        name: $('rp-name').value.trim(),
+        enabled: $('rp-enabled').checked,
+        frequency: $('rp-freq').value,
+        time_of_day: $('rp-time').value || '09:00',
+        weekday: Number($('rp-weekday').value),
+        monthday: Number($('rp-monthday').value),
+        tz_offset_min: Number($('rp-tz').value) || 0,
+        sections: {
+          summary: $('rp-summary').checked,
+          failures: $('rp-failures').checked,
+          by_model: { on: $('rp-by_model-on').checked, top: Number($('rp-by_model-top').value) || 5, metric: $('rp-by_model-metric').value },
+          by_key: { on: $('rp-by_key-on').checked, top: Number($('rp-by_key-top').value) || 5, metric: $('rp-by_key-metric').value },
+          by_caller: { on: $('rp-by_caller-on').checked, top: Number($('rp-by_caller-top').value) || 5, metric: $('rp-by_caller-metric').value },
+        },
+        endpoint_ids: endpointIDs,
+        actor: 'console',
+      });
+      toast(c ? '报告已更新' : '报告已添加', 'ok');
+      await loadReports();
+    },
+  });
+  const freqSel = $('rp-freq');
+  const syncFreq = () => {
+    $('rp-weekday-row').hidden = freqSel.value !== 'weekly';
+    $('rp-monthday-row').hidden = freqSel.value !== 'monthly';
+  };
+  freqSel.addEventListener('change', syncFreq);
+  syncFreq();
+}
+$('rp-add-btn').addEventListener('click', () => openReportSheet(null));
+$('rp-list').addEventListener('click', ev => {
+  const t = ev.target.closest('button[data-rp-test],button[data-rp-edit],button[data-rp-del]');
+  if (!t) return;
+  const id = Number(t.dataset.rpTest || t.dataset.rpEdit || t.dataset.rpDel);
+  const cfg = (reportsCache || []).find(x => x.id === id);
+  if (!cfg) return;
+  if (t.dataset.rpTest !== undefined) {
+    (async () => {
+      try {
+        await post('/reports/test', { id, actor: 'console' });
+        toast('测试报告已发送，请到对应渠道查收', 'ok');
+        renderReports();
+      } catch (e) { toast(e.message, 'err'); renderReports(); }
+    })();
+  } else if (t.dataset.rpEdit !== undefined) {
+    openReportSheet(cfg);
+  } else {
+    openSheet({
+      title: '删除定期报告', danger: true, okText: '删除',
+      body: '<p>删除报告「<b>' + esc(cfg.name || cfg.frequency) + '</b>」？该操作不可撤销。</p>',
+      onOk: async () => {
+        await post('/reports/delete', { id, actor: 'console' });
+        toast('报告已删除', 'ok');
+        await loadReports();
+      },
+    });
+  }
 });
 
 // ---------- 徽标 ----------

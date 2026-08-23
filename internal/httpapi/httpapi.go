@@ -79,6 +79,17 @@ func (a *API) register() {
 	a.route("/preferences", a.preferences)
 	a.route("/exchange-rate", a.exchangeRate)
 
+	a.route("/notify", a.notify)
+	a.route("/notify/settings", a.notifySettings)
+	a.route("/notify/endpoint/save", a.notifyEndpointSave)
+	a.route("/notify/endpoint/delete", a.notifyEndpointDelete)
+	a.route("/notify/endpoint/test", a.notifyEndpointTest)
+
+	a.route("/reports", a.reports)
+	a.route("/reports/save", a.reportSave)
+	a.route("/reports/delete", a.reportDelete)
+	a.route("/reports/test", a.reportTest)
+
 	a.route("/export/csv", a.exportCSV)
 	a.route("/export/png", a.exportPNG)
 	a.route("/backup", a.backup)
@@ -411,12 +422,20 @@ func buildKeyUpdate(raw map[string]json.RawMessage) (store.KeyUpdate, error) {
 			*c.dst = &p
 		}
 	}
-	if v, ok := raw["max_concurrent_requests"]; ok && string(v) != "null" {
-		n, e := strconv.Atoi(jsonStr(v))
-		if e != nil {
-			return u, fmt.Errorf("max_concurrent_requests 必须是整数")
+	// max_concurrent_requests：裸数字/字符串数字均接受；显式 null = 清空（归零，
+	// 并发口径里 0 即不限），与限额族的「null 清空」语义对齐。
+	if v, ok := raw["max_concurrent_requests"]; ok {
+		if string(v) == "null" {
+			n := 0
+			u.MaxConcurrentRequests = &n
+		} else {
+			n64, e := jsonInt64(v)
+			if e != nil {
+				return u, fmt.Errorf("max_concurrent_requests 必须是整数")
+			}
+			n := int(n64)
+			u.MaxConcurrentRequests = &n
 		}
-		u.MaxConcurrentRequests = &n
 	}
 	if v, ok := raw["allowed_models"]; ok {
 		u.AllowedModels = &[]string{}

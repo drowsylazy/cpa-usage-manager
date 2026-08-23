@@ -61,6 +61,8 @@ var runtimeState struct {
 	svc *service.Service
 	api *httpapi.API
 	cfg config.Config
+	// notifyStop 关停告警扫描 goroutine；reconfigure/shutdown 时关闭。
+	notifyStop chan struct{}
 }
 
 type imageHold struct {
@@ -378,10 +380,15 @@ func cliproxyPluginFree(p unsafe.Pointer, _ C.size_t) {
 func cliproxyPluginShutdown() {
 	runtimeState.Lock()
 	st := runtimeState.st
+	notifyStop := runtimeState.notifyStop
 	runtimeState.st = nil
 	runtimeState.svc = nil
 	runtimeState.api = nil
+	runtimeState.notifyStop = nil
 	runtimeState.Unlock()
+	if notifyStop != nil {
+		close(notifyStop)
+	}
 	if st != nil {
 		_ = st.Close()
 	}
@@ -581,6 +588,21 @@ func configure(inline string) error {
 		return err
 	}
 	svc := service.New(st, cfg, ps)
+	// 租约被接管（多进程部署中出现第二个写者）时本实例降级只读，
+	// 经通知端点上报；回调在心跳协程里触发，须立即返回，故异步发送。
+	st.SetLeaseLostHandler(func() {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			svc.NotifyErrorEvent(ctx, "storage", "数据库租约被其他进程接管，本实例已降级为只读模式。")
+		}()
+	})
+	if runtimeState.notifyStop != nil {
+		close(runtimeState.notifyStop)
+	}
+	notifyStop := make(chan struct{})
+	runtimeState.notifyStop = notifyStop
+	go notifySweepLoop(svc, notifyStop)
 	runtimeState.st = st
 	runtimeState.svc = svc
 	runtimeState.api = httpapi.New(svc, st, os.Getenv("CPA_USAGE_MANAGER_MANAGEMENT_KEY"))
@@ -677,6 +699,15 @@ func managementRegistration() rpcManagementRegistration {
 		{Method: "POST", Path: base + "/preferences", Description: "面板偏好保存"},
 		{Method: "GET", Path: base + "/exchange-rate", Description: "汇率读取"},
 		{Method: "POST", Path: base + "/exchange-rate", Description: "刷新汇率"},
+		{Method: "GET", Path: base + "/notify", Description: "通知设置与端点列表"},
+		{Method: "POST", Path: base + "/notify/settings", Description: "保存通知设置"},
+		{Method: "POST", Path: base + "/notify/endpoint/save", Description: "新增/更新通知端点"},
+		{Method: "POST", Path: base + "/notify/endpoint/delete", Description: "删除通知端点"},
+		{Method: "POST", Path: base + "/notify/endpoint/test", Description: "发送通知测试消息"},
+		{Method: "GET", Path: base + "/reports", Description: "定期报告配置列表"},
+		{Method: "POST", Path: base + "/reports/save", Description: "新增/更新定期报告"},
+		{Method: "POST", Path: base + "/reports/delete", Description: "删除定期报告"},
+		{Method: "POST", Path: base + "/reports/test", Description: "立即发送测试报告"},
 		{Method: "POST", Path: base + "/export/csv", Description: "CSV 导出"},
 		{Method: "POST", Path: base + "/export/png", Description: "PNG 导出"},
 		{Method: "GET", Path: base + "/backup", Description: "数据库备份"},
@@ -1174,6 +1205,24 @@ func requestBodyWithStreamUsage(body []byte, sourceFormat, outputFormat string) 
 		return body
 	}
 	return updated
+}
+
+// notifySweepLoop 每分钟做一次周期扫描：告警（额度越线/密钥过期 → shoutrrr
+// 端点）与定期报告（日/周/月报到期发送）。两者内部各自以租约持有者身份执行。
+func notifySweepLoop(svc *service.Service, stop <-chan struct{}) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			_, _ = svc.RunNotifySweep(ctx)
+			_, _ = svc.RunReportsSweep(ctx)
+			cancel()
+		}
+	}
 }
 
 func startReservationHeartbeat(svc *service.Service, reservationID string) func() {
