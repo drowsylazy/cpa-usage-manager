@@ -286,7 +286,8 @@ h1,h2,h3,p{margin:0}
 .split{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);gap:14px}
 .split.even{grid-template-columns:1fr 1fr}
 .split.triple{grid-template-columns:repeat(3,minmax(0,1fr))}
-@media (max-width:1020px){.split,.split.even,.split.triple{grid-template-columns:minmax(0,1fr)}}
+.split.wide{grid-template-columns:minmax(0,1fr) minmax(0,.8fr)}
+@media (max-width:1020px){.split,.split.even,.split.triple,.split.wide{grid-template-columns:minmax(0,1fr)}}
 
 /* ── 固定 5 行版式：表格区高度恒定（不足留白），换页栏常驻不跳 ── */
 .table-wrap.fixed5{min-height:calc(38px + 5 * 52px)}
@@ -303,7 +304,6 @@ h1,h2,h3,p{margin:0}
   transition:opacity .18s ease,stroke-width .18s ease;
   cursor:pointer;outline:none;
 }
-.route-arrow{color:var(--fg3);font-weight:400;margin:0 2px}
 .donut-seg:hover,.donut-seg:focus-visible{stroke-width:19}
 .donut-seg.dim{opacity:.28}
 .donut-center{

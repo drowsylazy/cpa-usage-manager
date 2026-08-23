@@ -298,26 +298,27 @@ func (s *Service) Balance(ctx context.Context, kid string, now time.Time) (Balan
 	return out, nil
 }
 
-// RouteRow 是一条「请求模型 → 上游实际模型」的路由聚合行。
-// UpstreamModel 为空表示直连（别名与上游真名一致或未知）。
+// RouteRow 是一条「上游实际模型 × 提供商」的路由聚合行。
+// UpstreamModel 回退为请求别名（直连，或老数据没有上游真名时）。
 type RouteRow struct {
-	Model         string      `json:"model"`
-	UpstreamModel string      `json:"upstream_model"`
-	Requests      int64       `json:"requests"`
-	Failures      int64       `json:"failures"`
-	TotalTokens   int64       `json:"total_tokens"`
-	CostMicroUSD  money.Micro `json:"cost_micro_usd"`
+	UpstreamModel string   `json:"upstream_model"`
+	Provider      string   `json:"provider"`
+	Requests      int64    `json:"requests"`
+	TotalTokens   int64    `json:"total_tokens"`
+	Models        []string `json:"models"` // 该上游组合涉及的本地别名，供前端按别名筛选
 }
 
-// RouteReport 按请求模型 × 上游实际模型聚合，用于暴露上游二次路由：
-// 同一别名被路由到多个真名、或渠道返回了意料之外的模型时一目了然。
+// RouteReport 按上游实际模型 × 提供商聚合，用于暴露上游二次路由：
+// 同一别名被拆到多个真名、或渠道返回了意料之外的模型时一目了然；
+// Models 收集涉及的本地别名，前端据此做别名筛选。
 func (s *Service) RouteReport(ctx context.Context, f UsageFilter) ([]RouteRow, error) {
 	clause, args := requestFilter(f)
-	query := `SELECT model, upstream_model,
-			COUNT(*), COALESCE(SUM(CASE WHEN result <> 'ok' THEN 1 ELSE 0 END),0),
-			COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_micro_usd),0)
+	query := `SELECT COALESCE(NULLIF(upstream_model,''), model), COALESCE(provider,''),
+			COUNT(*), COALESCE(SUM(total_tokens),0),
+			COALESCE(GROUP_CONCAT(DISTINCT model),'')
 		FROM requests` + clause + `
-		GROUP BY model, upstream_model ORDER BY 3 DESC LIMIT 500`
+		GROUP BY COALESCE(NULLIF(upstream_model,''), model), COALESCE(provider,'')
+		ORDER BY 3 DESC LIMIT 500`
 	var out []RouteRow
 	err := s.st.Read(ctx, func(q store.Querier) error {
 		rows, err := q.QueryContext(ctx, query, args...)
@@ -327,11 +328,15 @@ func (s *Service) RouteReport(ctx context.Context, f UsageFilter) ([]RouteRow, e
 		defer rows.Close()
 		for rows.Next() {
 			var r RouteRow
-			var cost int64
-			if err := rows.Scan(&r.Model, &r.UpstreamModel, &r.Requests, &r.Failures, &r.TotalTokens, &cost); err != nil {
+			var models string
+			if err := rows.Scan(&r.UpstreamModel, &r.Provider, &r.Requests, &r.TotalTokens, &models); err != nil {
 				return err
 			}
-			r.CostMicroUSD = money.Micro(cost)
+			for _, m := range strings.Split(models, ",") {
+				if m = strings.TrimSpace(m); m != "" {
+					r.Models = append(r.Models, m)
+				}
+			}
 			out = append(out, r)
 		}
 		return rows.Err()

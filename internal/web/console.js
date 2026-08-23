@@ -1987,42 +1987,44 @@ loaders.usage = async () => {
   fillReqSuggestions();
   stamp();
 };
-let routeRows = [], routePage = 0;
+let routeRows = [], routePage = 0, routeModel = '';
 const ROUTE_PAGE_SIZE = 5;
+const routeModelSel = new Select('route-model', [{ value: '', label: '全部别名' }],
+  v => { routeModel = v; routePage = 0; renderRoutes(); }, { value: '', head: '按别名筛选' });
 async function loadRoutes() {
   const r = await api('/routes?' + new URLSearchParams(rangeParams()));
   routeRows = r.items || [];
+  const names = [...new Set(routeRows.flatMap(r => r.models || []))].sort((a, b) => a.localeCompare(b));
+  if (routeModel && !names.includes(routeModel)) { routeModel = ''; routeModelSel.value = ''; }
+  routeModelSel.setOptions([{ value: '', label: '全部别名' }].concat(names.map(n => ({ value: n, label: n }))));
   routePage = 0;
   renderRoutes();
 }
 function renderRoutes() {
-  const rowsAll = routeRows;
+  const rowsAll = routeRows.filter(r => !routeModel || (r.models || []).includes(routeModel));
   const total = rowsAll.reduce((a, r) => a + (Number(r.requests) || 0), 0);
   const maxReq = Math.max(1, ...rowsAll.map(r => Number(r.requests) || 0));
   const shareOf = r => total > 0 ? (Number(r.requests) || 0) / total * 100 : 0;
   const pages = Math.max(1, Math.ceil(rowsAll.length / ROUTE_PAGE_SIZE));
   if (routePage >= pages) routePage = pages - 1;
   const rows = rowsAll.slice(routePage * ROUTE_PAGE_SIZE, (routePage + 1) * ROUTE_PAGE_SIZE);
-  // 首列与维度聚合同构：名称行 + 占比 + 条形；非直连时名称后跟「→ 上游真名」。
+  // 首列与维度聚合同构：名称行 + 占比 + 条形；行按上游真名 × 提供商聚合，不展示本地别名。
   $('route-body').innerHTML = '<div class="table-wrap fixed5"><table class="data"><thead><tr>'
-    + '<th class="w-grow">模型 → 上游</th>'
-    + '<th class="num">请求</th><th class="num">失败</th><th class="num">Token</th><th class="num">费用</th></tr></thead><tbody>'
+    + '<th class="w-grow">上游模型</th>'
+    + '<th>提供商</th><th class="num">请求</th><th class="num">Token</th></tr></thead><tbody>'
     + rows.map(rw => {
-      const up = rw.upstream_model || '';
-      const direct = !up || up === rw.model;
-      const name = '<span class="bar-name">' + esc(rw.model || '(空)')
-        + (direct ? '' : ' <span class="route-arrow">→</span> <span class="mono">' + esc(up) + '</span>')
-        + '</span>';
+      const up = rw.upstream_model || '(未知)';
+      const prov = rw.provider || '';
+      const name = '<span class="bar-name">' + esc(up) + '</span>';
       return '<tr>'
-      + '<td><div class="bar-cell" title="' + esc(rw.model + (direct ? '' : ' → ' + up)) + '">'
+      + '<td><div class="bar-cell" title="' + esc(up + (prov ? ' · ' + prov : '')) + '">'
         + '<div class="bar-top">' + name + '<span class="bar-pct">'
         + (shareOf(rw) < 10 ? shareOf(rw).toFixed(1) : shareOf(rw).toFixed(0)) + '%</span></div>'
         + '<div class="bar-line"><span style="width:'
         + ((Number(rw.requests) || 0) / maxReq * 100).toFixed(1) + '%"></span></div></div></td>'
+      + '<td>' + (prov ? esc(prov) : '—') + '</td>'
       + '<td class="num">' + fmtInt(rw.requests) + '</td>'
-      + '<td class="num">' + (rw.failures ? '<span class="pill alarm mono">' + fmtInt(rw.failures) + '</span>' : '0') + '</td>'
-      + '<td class="num">' + fmtTok(rw.total_tokens) + '</td>'
-      + '<td class="num">' + fmtUSD(rw.cost_micro_usd) + '</td></tr>';
+      + '<td class="num">' + fmtTok(rw.total_tokens) + '</td></tr>';
     }).join('')
     + '</tbody></table></div>'
     + '<div class="pager" id="route-pager"><span class="mono">第 ' + (routePage + 1) + ' / ' + pages + ' 页 · 共 '

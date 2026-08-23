@@ -165,7 +165,7 @@
 
 <!-- ── 用量 ─────────────────────────────────────────────────────── -->
 <section class="view" id="view-usage" role="tabpanel" aria-labelledby="tab-usage" hidden>
-  <div class="split even">
+  <div class="split wide">
     <article class="panel">
       <div class="panel-head">
         <div><h2 class="panel-title">维度聚合</h2><p class="panel-sub">同一时间范围内按所选维度拆分</p></div>
@@ -178,8 +178,11 @@
 
     <article class="panel">
       <div class="panel-head">
-        <div><h2 class="panel-title">上游路由</h2><p class="panel-sub">别名与上游实际模型的映射；多行或意外模型名即二次路由</p></div>
-        <div class="panel-tools"><span class="note" id="route-count"></span></div>
+        <div><h2 class="panel-title">上游路由</h2><p class="panel-sub">按上游实际模型与提供商聚合；选别名可只看其路由</p></div>
+        <div class="panel-tools">
+          <div class="sel" id="route-model" data-label="按别名筛选"></div>
+          <span class="note" id="route-count"></span>
+        </div>
       </div>
       <div class="panel-body pad-0" id="route-body"></div>
     </article>

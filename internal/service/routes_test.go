@@ -30,21 +30,21 @@ func TestRouteReport(t *testing.T) {
 	if len(rows) != 3 {
 		t.Fatalf("应聚合为 3 条映射（直连+直连+二次路由），得到 %d：%+v", len(rows), rows)
 	}
-	find := func(model, up string) *RouteRow {
+	find := func(up string) *RouteRow {
 		for i := range rows {
-			if rows[i].Model == model && rows[i].UpstreamModel == up {
+			if rows[i].UpstreamModel == up {
 				return &rows[i]
 			}
 		}
 		return nil
 	}
-	routed := find("gpt-5", "openrouter/gpt-5")
-	if routed == nil || routed.Requests != 1 || routed.Failures != 1 {
+	routed := find("openrouter/gpt-5")
+	if routed == nil || routed.Requests != 1 || len(routed.Models) != 1 || routed.Models[0] != "gpt-5" {
 		t.Fatalf("二次路由行异常: %+v", routed)
 	}
-	direct := find("claude-4", "")
-	if direct == nil || direct.Requests != 1 {
-		t.Fatalf("直连行异常: %+v", direct)
+	direct := find("claude-4")
+	if direct == nil || direct.Requests != 1 || direct.TotalTokens != 100 {
+		t.Fatalf("直连行应回退为别名本身: %+v", direct)
 	}
 	// 时间过滤生效：把窗口收窄到未来，应无数据。
 	future, err := s.RouteReport(ctx, UsageFilter{From: time.Now().UTC().Add(time.Hour)})

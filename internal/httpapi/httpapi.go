@@ -676,7 +676,7 @@ func (a *API) costs(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, v, 200)
 }
 
-// routes 上游路由分布：请求别名 × 上游实际模型的聚合。
+// routes 上游路由分布：上游实际模型 × 提供商的聚合（Models 带涉及的本地别名）。
 func (a *API) routes(w http.ResponseWriter, r *http.Request) {
 	noStore(w)
 	v, e := a.svc.RouteReport(r.Context(), parseFilter(r))
