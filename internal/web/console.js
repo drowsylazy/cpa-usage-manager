@@ -782,6 +782,7 @@ loaders.overview = async () => {
   renderReadouts(dimModel.total || {}, costs);
   renderModels(ovCache.models);
   renderKeySpend(ovCache.keys);
+  renderCostCoverage(costs);
   renderTrend();
   stamp();
 };
@@ -820,30 +821,6 @@ function renderReadouts(total, costs) {
         ? ' · 含上游缓存口径' : ''));
 }
 
-function barList(rows, max, nameText, nameHtml, valFn, valText, color, denom) {
-  if (!rows.length) return '<div class="empty"><p class="empty-title">暂无数据</p><p class="empty-hint">所选时间范围内没有请求记录</p></div>';
-  // 占比分母必须是**全量**合计，不能用 rows 之和：rows 已被 slice 成前 N 项，
-  // 用它做分母会把尾部的量摊到头部，份额被系统性夸大（且头部之和恒为 100%）。
-  // 调用方传入截断前的 denom；缺省时退回行内之和。
-  //
-  // 注：概览两卡的数据源分别带 limit=200（模型）/100（密钥），维度多于该上限时
-  // denom 是「前 200/100 项之和」而非绝对全量，占比会有极小偏高 —— 这两个上限
-  // 远高于实际维度基数，且副标题会显示「共 N 项」，可据此判断是否触顶。
-  const sum = denom !== undefined && denom > 0
-    ? denom
-    : rows.reduce((a, r) => a + Math.max(0, Number(valFn(r)) || 0), 0);
-  return rows.map(r => {
-    const v = Math.max(0, Number(valFn(r)) || 0);
-    const pct = max > 0 ? (v / max * 100) : 0;
-    const share = sum > 0 ? (v / sum * 100) : 0;
-    return '<div class="bar-cell" title="' + esc(nameText(r)) + '">'
-      + '<div class="bar-top"><span class="bar-name">' + nameHtml(r) + '</span>'
-      + '<span class="bar-pct"><span class="bp-share">' + share.toFixed(share < 10 ? 1 : 0)
-      + '%</span><span class="bp-val">' + valText(r) + '</span></span></div>'
-      + '<div class="bar-line' + (color === 'trace' ? ' trace' : '') + '">'
-      + '<span style="width:' + pct.toFixed(1) + '%"></span></div></div>';
-  }).join('');
-}
 // ---------- 概览占比卡：指标切换（费用 / Token / 请求） ----------
 const ovCache = { models: [], keys: [] };
 const ovMetric = {
@@ -875,31 +852,120 @@ function bindMetricSeg(id, key, apply) {
 bindMetricSeg('ov-models-metric', 'models', () => renderModels(ovCache.models));
 bindMetricSeg('ov-keys-metric', 'keys', () => renderKeySpend(ovCache.keys));
 
+// ---------- 概览圆环图 ----------
+// DONUT_COLORS 是环分段配色（Tableau 定性色板，深浅主题均可辨）；第 6 段起并入「其他」。
+const DONUT_COLORS = ['#4e79a7', '#f28e2b', '#59a14f', '#e15759', '#b07aa1'];
+const DONUT_OTHER = '#9aa5b1';
+function donutEntries(rows, metric) {
+  const sorted = rows.filter(r => metricVal(r, metric) > 0)
+    .sort((a, b) => metricVal(b, metric) - metricVal(a, metric));
+  const top = sorted.slice(0, 5).map((r, i) => ({
+    label: r.value || '(空)', color: DONUT_COLORS[i],
+    value: metricVal(r, metric), cost: r.cost_micro_usd, requests: r.requests,
+  }));
+  const rest = sorted.slice(5);
+  if (rest.length) {
+    top.push({
+      label: '其他（' + rest.length + ' 项）', color: DONUT_OTHER,
+      value: rest.reduce((a, r) => a + metricVal(r, metric), 0),
+      cost: rest.reduce((a, r) => a + (Number(r.cost_micro_usd) || 0), 0),
+      requests: rest.reduce((a, r) => a + (Number(r.requests) || 0), 0),
+    });
+  }
+  return { items: top, total: sorted.reduce((a, r) => a + metricVal(r, metric), 0), count: sorted.length };
+}
+// drawDonut 渲染单圆环（默认前 5 + 其他合并段）。
+//
+// 入场动画是**顺时针单前沿扫描**：每段的过渡时长与其弧长占比成正比、延迟为
+// 前序段时长之和，衔接处速度一致 —— 视觉上只有一个前沿从顶部顺时针推进，
+// 走到哪里哪段显色，而不是各段各自冒出来。
+const DONUT_ANIM_MS = 550;
+function drawDonut(mountId, entries, fmt) {
+  const mount = $(mountId);
+  const total = entries.total;
+  if (!total || !entries.items.length) {
+    mount.innerHTML = '<div class="empty"><p class="empty-title">暂无数据</p>'
+      + '<p class="empty-hint">所选时间范围内没有可统计的记录</p></div>';
+    return;
+  }
+  const R = 42, C = 2 * Math.PI * R;
+  let offset = 0;
+  const segs = entries.items.map((it, i) => {
+    const frac = it.value / total;
+    const seg = '<circle class="donut-seg" data-i="' + i + '" cx="60" cy="60" r="' + R + '" fill="none"'
+      + ' stroke="' + it.color + '" stroke-width="17" stroke-linecap="butt"'
+      + ' style="stroke-dasharray:0 ' + (C + 10).toFixed(2) + ';stroke-dashoffset:' + (-offset).toFixed(2) + '"'
+      + ' tabindex="0"><title>' + esc(it.label + ' · ' + metricText(it.value, fmt.metric)
+        + ' · ' + (frac * 100).toFixed(1) + '%') + '</title></circle>';
+    offset += frac * C;
+    return seg;
+  }).join('');
+  const legend = entries.items.map((it, i) => {
+    const pct = it.value / total * 100;
+    return '<button type="button" class="donut-legend-item" data-i="' + i + '">'
+      + '<span class="swatch" style="background:' + it.color + '"></span>'
+      + '<span class="dl-name" title="' + esc(it.label) + '">' + esc(it.label) + '</span>'
+      + '<span class="dl-pct mono">' + (pct < 10 ? pct.toFixed(1) : pct.toFixed(0)) + '%</span></button>';
+  }).join('');
+  mount.innerHTML = '<div class="donut-flex">'
+    + '<div class="donut-ring"><svg viewBox="0 0 120 120" role="img">' + segs + '</svg>'
+    + '<div class="donut-center"><div class="donut-center-main"></div><div class="donut-center-sub"></div></div></div>'
+    + '<div class="donut-legend">' + legend + '</div></div>';
+
+  const centerMain = mount.querySelector('.donut-center-main');
+  const centerSub = mount.querySelector('.donut-center-sub');
+  const showTotal = () => {
+    centerMain.textContent = metricText(total, fmt.metric);
+    centerSub.textContent = fmt.center;
+  };
+  showTotal();
+  const circles = [...mount.querySelectorAll('.donut-seg')];
+  // 入场：rAF 两帧后（首帧已绘制空弧）按弧长比例分配时长、以前序累计作延迟，
+  // linear 缓动保证段间前沿速度一致；结束后移除内联过渡，交还 hover 效果。
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    let acc = 0;
+    entries.items.forEach((it, i) => {
+      const frac = it.value / total;
+      const len = Math.max(frac * C - 1.5, frac > 0 ? 0.6 : 0); // 1.5 单位留缝
+      const c = circles[i];
+      c.style.transition = 'stroke-dasharray ' + Math.max(frac * DONUT_ANIM_MS, 30).toFixed(0)
+        + 'ms linear ' + (acc * DONUT_ANIM_MS).toFixed(0) + 'ms';
+      c.style.strokeDasharray = len.toFixed(2) + ' ' + (C - len + 10).toFixed(2);
+      acc += frac;
+    });
+    setTimeout(() => circles.forEach(c => { c.style.transition = ''; }), DONUT_ANIM_MS + 120);
+  }));
+  const highlight = i => {
+    circles.forEach((c, j) => c.classList.toggle('dim', i >= 0 && j !== i));
+    if (i >= 0) {
+      const it = entries.items[i];
+      centerMain.textContent = metricText(it.value, fmt.metric);
+      centerSub.textContent = it.label;
+    } else showTotal();
+  };
+  const bindHl = (el, i) => {
+    el.addEventListener('mouseenter', () => highlight(i));
+    el.addEventListener('mouseleave', () => highlight(-1));
+    el.addEventListener('focus', () => highlight(i));
+    el.addEventListener('blur', () => highlight(-1));
+  };
+  circles.forEach((c, i) => bindHl(c, i));
+  mount.querySelectorAll('.donut-legend-item').forEach(el => bindHl(el, Number(el.dataset.i)));
+}
 function renderModels(rows) {
   const m = ovMetric.models;
-  const top = rows.slice().sort((a, b) => metricVal(b, m) - metricVal(a, m)).slice(0, 10);
-  const max = top.length ? metricVal(top[0], m) : 0;
-  // 分母取全量（未截断）合计，占比才是真实份额
-  const denom = rows.reduce((a, r) => a + Math.max(0, metricVal(r, m)), 0);
-  $('ov-models-sub').textContent = METRIC_SUBS[m]
-    + (rows.length > top.length ? '，取前 10（共 ' + rows.length + ' 项）' : '，共 ' + rows.length + ' 项');
-  $('ov-models').innerHTML = barList(top, max,
-    r => r.value || '(空)', r => esc(r.value || '(空)'),
-    r => metricVal(r, m), r => metricText(metricVal(r, m), m), null, denom);
+  const e = donutEntries(rows, m);
+  $('ov-models-sub').textContent = METRIC_SUBS[m] + ' · 前 5 + 其他，共 ' + e.count + ' 项';
+  drawDonut('ov-models', e, { metric: m, center: rows.length + ' 个模型' });
 }
 function renderKeySpend(rows) {
   const m = ovMetric.keys;
-  const withKey = rows.filter(r => r.value);
-  const top = withKey.slice().sort((a, b) => metricVal(b, m) - metricVal(a, m)).slice(0, 8);
-  const max = top.length ? metricVal(top[0], m) : 0;
-  const denom = withKey.reduce((a, r) => a + Math.max(0, metricVal(r, m)), 0);
-  $('ov-keys-sub').textContent = METRIC_SUBS[m]
-    + (withKey.length > top.length ? '，取前 8（共 ' + withKey.length + ' 枚）' : '，共 ' + withKey.length + ' 枚');
-  $('ov-keys').innerHTML = barList(top, max,
-    r => (keyLabelOf(r.value) || '(无标签)') + ' · ' + r.value,
-    r => '<span class="bar-name-main">' + esc(keyLabelOf(r.value) || '(无标签)') + '</span>'
-      + '<span class="bar-kid mono">' + esc(r.value) + '</span>',
-    r => metricVal(r, m), r => metricText(metricVal(r, m), m), 'trace', denom);
+  const withKey = rows.filter(r => r.value).map(r => Object.assign({}, r, {
+    value: keyLabelOf(r.value) || '(无标签)',
+  }));
+  const e = donutEntries(withKey, m);
+  $('ov-keys-sub').textContent = METRIC_SUBS[m] + ' · 前 5 + 其他，共 ' + e.count + ' 枚';
+  drawDonut('ov-keys', e, { metric: m, center: withKey.length + ' 枚密钥' });
 }
 
 // ---------- 趋势图（内联 SVG 堆叠面积）----------
@@ -1069,8 +1135,12 @@ function renderTrend() {
   const y = v => padT + ih - (v / ymax) * ih;
   const n = pts.length;
   const slot = iw / n;                 // 每个桶的槽宽
-  // 柱宽上限 24px：槽内余量留白，不把槽填满。
-  const barW = Math.max(2, Math.min(24, slot * 0.7));
+  // 细粒度（分钟/小时）桶多，柱宽上限 24px 即可；天/周/月桶少槽宽大，
+  // 改为「槽宽减去固定间隙」，避免柱子孤零零缩在槽中央、两侧大片留白。
+  const coarse = grain === 'day' || grain === 'week' || grain === 'month';
+  const barW = coarse
+    ? Math.max(2, Math.min(96, slot - Math.min(12, slot * 0.18)))
+    : Math.max(2, Math.min(24, slot * 0.7));
   const cx = i => padL + slot * i + slot / 2;
 
   let grid = '', labels = '';
@@ -1912,44 +1982,58 @@ function fillReqSuggestions() {
 }
 
 loaders.usage = async () => {
-  await Promise.all([loadDim(), loadCosts(), loadRoutes().catch(e => { $('route-body').innerHTML = '<div class="empty"><p class="empty-hint">' + esc(e.message) + '</p></div>'; })]);
+  await Promise.all([loadDim(), loadRoutes().catch(e => { $('route-body').innerHTML = '<div class="empty"><p class="empty-hint">' + esc(e.message) + '</p></div>'; })]);
   await loadRequests();
   fillReqSuggestions();
   stamp();
 };
+let routeRows = [], routePage = 0;
+const ROUTE_PAGE_SIZE = 5;
+async function loadRoutes() {
+  const r = await api('/routes?' + new URLSearchParams(rangeParams()));
+  routeRows = r.items || [];
+  routePage = 0;
+  renderRoutes();
+}
 function renderRoutes() {
   const rowsAll = routeRows;
-  $('route-count').textContent = rowsAll.length
-    ? fmtInt(rowsAll.reduce((a, r) => a + (Number(r.requests) || 0), 0)) + ' 次请求 · ' + rowsAll.length + ' 条映射' : '';
-  if (!rowsAll.length) {
-    $('route-body').innerHTML = '<div class="empty"><p class="empty-title">暂无数据</p>'
-      + '<p class="empty-hint">所选时间范围内没有请求记录</p></div>';
-    return;
-  }
   const total = rowsAll.reduce((a, r) => a + (Number(r.requests) || 0), 0);
+  const maxReq = Math.max(1, ...rowsAll.map(r => Number(r.requests) || 0));
   const shareOf = r => total > 0 ? (Number(r.requests) || 0) / total * 100 : 0;
-  $('route-body').innerHTML = '<div class="table-wrap"><table class="data"><thead><tr>'
-    + '<th class="w-grow">请求模型</th><th>上游实际模型</th>'
+  const pages = Math.max(1, Math.ceil(rowsAll.length / ROUTE_PAGE_SIZE));
+  if (routePage >= pages) routePage = pages - 1;
+  const rows = rowsAll.slice(routePage * ROUTE_PAGE_SIZE, (routePage + 1) * ROUTE_PAGE_SIZE);
+  // 首列与维度聚合同构：名称行 + 占比 + 条形；非直连时名称后跟「→ 上游真名」。
+  $('route-body').innerHTML = '<div class="table-wrap fixed5"><table class="data"><thead><tr>'
+    + '<th class="w-grow">模型 → 上游</th>'
     + '<th class="num">请求</th><th class="num">失败</th><th class="num">Token</th><th class="num">费用</th></tr></thead><tbody>'
-    + rowsAll.map(rw => {
+    + rows.map(rw => {
       const up = rw.upstream_model || '';
       const direct = !up || up === rw.model;
+      const name = '<span class="bar-name">' + esc(rw.model || '(空)')
+        + (direct ? '' : ' <span class="route-arrow">→</span> <span class="mono">' + esc(up) + '</span>')
+        + '</span>';
       return '<tr>'
-      + '<td title="' + esc(rw.model) + '">' + esc(rw.model || '(空)') + '</td>'
-      + '<td>' + (direct ? '<span class="nt-dim">直连</span>' : '<span class="mono" title="' + esc(up) + '">' + esc(up) + '</span>')
-      + '</td>'
-      + '<td class="num">' + fmtInt(rw.requests) + ' <span class="bar-pct">' + shareOf(rw).toFixed(1) + '%</span></td>'
+      + '<td><div class="bar-cell" title="' + esc(rw.model + (direct ? '' : ' → ' + up)) + '">'
+        + '<div class="bar-top">' + name + '<span class="bar-pct">'
+        + (shareOf(rw) < 10 ? shareOf(rw).toFixed(1) : shareOf(rw).toFixed(0)) + '%</span></div>'
+        + '<div class="bar-line"><span style="width:'
+        + ((Number(rw.requests) || 0) / maxReq * 100).toFixed(1) + '%"></span></div></div></td>'
+      + '<td class="num">' + fmtInt(rw.requests) + '</td>'
       + '<td class="num">' + (rw.failures ? '<span class="pill alarm mono">' + fmtInt(rw.failures) + '</span>' : '0') + '</td>'
       + '<td class="num">' + fmtTok(rw.total_tokens) + '</td>'
       + '<td class="num">' + fmtUSD(rw.cost_micro_usd) + '</td></tr>';
     }).join('')
-    + '</tbody></table></div>';
-}
-let routeRows = [];
-async function loadRoutes() {
-  const r = await api('/routes?' + new URLSearchParams(rangeParams()));
-  routeRows = r.items || [];
-  renderRoutes();
+    + '</tbody></table></div>'
+    + '<div class="pager" id="route-pager"><span class="mono">第 ' + (routePage + 1) + ' / ' + pages + ' 页 · 共 '
+      + fmtInt(rowsAll.length) + ' 条映射</span><span class="grow"></span>'
+      + '<button type="button" class="btn small" id="route-prev"' + (routePage <= 0 ? ' disabled' : '') + '>上一页</button>'
+      + '<button type="button" class="btn small" id="route-next"'
+      + ((routePage + 1) * ROUTE_PAGE_SIZE >= rowsAll.length ? ' disabled' : '') + '>下一页</button></div>';
+  $('route-count').textContent = fmtInt(total) + ' 次请求 · ' + fmtInt(rowsAll.length) + ' 条映射';
+  const prev = $('route-prev'), next = $('route-next');
+  if (prev) prev.onclick = () => { routePage--; renderRoutes(); };
+  if (next) next.onclick = () => { routePage++; renderRoutes(); };
 }
 const DIMS = [
   { value: 'model', label: '模型' },
@@ -1962,7 +2046,7 @@ const DIMS = [
   { value: 'caller_id', label: 'caller' },
 ];
 let dimRows = [], dimPage = 0;
-const DIM_PAGE_SIZE = 15;
+const DIM_PAGE_SIZE = 5;
 async function loadDim() {
   const dim = dimSel.value;
   const r = await api('/usage/dimension?' + new URLSearchParams({ dimension: dim, ...rangeParams() }));
@@ -1974,11 +2058,6 @@ async function loadDim() {
 }
 function renderDim() {
   const rowsAll = dimRows;
-  if (!rowsAll.length) {
-    $('dim-body').innerHTML = '<div class="empty"><p class="empty-title">暂无数据</p>'
-      + '<p class="empty-hint">所选时间范围内没有请求记录</p></div>';
-    return;
-  }
   // 占比 = 本行请求数 / 所有分组请求数之和，各行之和为 100%（四舍五入误差除外）。
   //
   // 曾用「最大行请求数」作分母（v0.3.0 为修 >100% 而引入），那算的是「相对最大值的
@@ -2006,8 +2085,9 @@ function renderDim() {
     return v || '(空)';
   };
   const pages = Math.max(1, Math.ceil(rowsAll.length / DIM_PAGE_SIZE));
+  if (dimPage >= pages) dimPage = pages - 1;
   const rows = rowsAll.slice(dimPage * DIM_PAGE_SIZE, (dimPage + 1) * DIM_PAGE_SIZE);
-  $('dim-body').innerHTML = '<div class="table-wrap"><table class="data"><thead><tr>'
+  $('dim-body').innerHTML = '<div class="table-wrap fixed5"><table class="data"><thead><tr>'
     + '<th class="w-grow">' + esc((DIMS.find(d => d.value === dimSel.value) || {}).label || dimSel.value) + '</th>'
     + '<th class="num">请求</th><th class="num">失败</th><th class="num">Token</th><th class="num">费用</th>'
     + '<th class="num">缓存</th>'
@@ -2030,13 +2110,11 @@ function renderDim() {
       + '<td class="num">' + fmtTPS(row.tps_avg_milli) + '</td></tr>';
     }).join('')
     + '</tbody></table></div>'
-    + (pages > 1
-      ? '<div class="pager" id="dim-pager"><span class="mono">第 ' + (dimPage + 1) + ' / ' + pages + ' 页 · 共 '
-        + fmtInt(rowsAll.length) + ' 项</span><span class="grow"></span>'
-        + '<button type="button" class="btn small" id="dim-prev"' + (dimPage <= 0 ? ' disabled' : '') + '>上一页</button>'
-        + '<button type="button" class="btn small" id="dim-next"'
-        + ((dimPage + 1) * DIM_PAGE_SIZE >= rowsAll.length ? ' disabled' : '') + '>下一页</button></div>'
-      : '');
+    + '<div class="pager" id="dim-pager"><span class="mono">第 ' + (dimPage + 1) + ' / ' + pages + ' 页 · 共 '
+      + fmtInt(rowsAll.length) + ' 项</span><span class="grow"></span>'
+      + '<button type="button" class="btn small" id="dim-prev"' + (dimPage <= 0 ? ' disabled' : '') + '>上一页</button>'
+      + '<button type="button" class="btn small" id="dim-next"'
+      + ((dimPage + 1) * DIM_PAGE_SIZE >= rowsAll.length ? ' disabled' : '') + '>下一页</button></div>';
   const prev = $('dim-prev'), next = $('dim-next');
   if (prev) prev.onclick = () => { dimPage--; renderDim(); };
   if (next) next.onclick = () => { dimPage++; renderDim(); };
@@ -2047,13 +2125,13 @@ const maxPlausibleTPS = 3000;
 const fmtTPS = milli => milli > 0 && milli / 1000 <= maxPlausibleTPS ? (milli / 1000).toFixed(1) : '-';
 
 function kv(name, value) { return '<div class="kv-row"><dt>' + name + '</dt><dd>' + value + '</dd></div>'; }
-async function loadCosts() {
-  const costs = await api('/costs?' + new URLSearchParams(rangeParams()));
+// renderCostCoverage 渲染概览第三卡（计价覆盖）；costs 由 overview loader 统一拉取。
+function renderCostCoverage(costs) {
   const cover = costs.requests ? Math.round(costs.priced_requests / costs.requests * 100) : 0;
   const rate = S.fx;
   const cny = rate && costs.cost_micro_usd
     ? '¥' + fmtUSD(Math.round(costs.cost_micro_usd * rate.usd_to_cny_micro / 1e6)).slice(1) : '-';
-  $('cost-body').innerHTML = '<div class="kv">'
+  $('ov-cost-body').innerHTML = '<div class="kv">'
     + kv('请求总数', fmtInt(costs.requests))
     + kv('已计价请求', fmtInt(costs.priced_requests))
     + kv('价格覆盖率', '<span class="pill ' + (cover >= 90 ? 'live' : cover >= 60 ? 'warn' : 'alarm') + ' mono">' + cover + '%</span>')
@@ -2199,13 +2277,20 @@ $('req-export').addEventListener('click', async () => {
 
 // ---------- 价格 ----------
 const pricingCache = { items: [] };
+let pricingPage = 0;
+const PRICING_PAGE_SIZE = 10;
 loaders.pricing = async () => {
   const [r, fx] = await Promise.all([api('/pricing'), api('/exchange-rate')]);
   S.fx = fx;
   $('fx-info').textContent = fx && fx.usd_to_cny_micro
     ? 'USD→CNY ' + (fx.usd_to_cny_micro / 1e6).toFixed(4) + ' · ' + fx.source + (fx.fallback ? '（兜底）' : '') : '';
-  const items = (r.items || []).slice().sort((a, b) => b.priority - a.priority || a.id - b.id);
-  pricingCache.items = items;
+  pricingCache.items = (r.items || []).slice().sort((a, b) => b.priority - a.priority || a.id - b.id);
+  pricingPage = 0;
+  renderPricing();
+  stamp();
+};
+function renderPricing() {
+  const items = pricingCache.items;
   // 表头带 ⓘ 说明：「缓存读/缓存写」这类术语中文里不自明，悬浮给出上游口径解释
   $('pricing-head').innerHTML =
     '<th class="num">' + labelWithTip('优先级', TIPS.priority) + '</th>'
@@ -2216,7 +2301,9 @@ loaders.pricing = async () => {
     + '<th class="num">' + labelWithTip('缓存读', TIPS.cacheRead) + '</th>'
     + '<th class="num">' + labelWithTip('缓存写', TIPS.cacheWrite) + '</th>'
     + '<th>来源</th><th class="w-act"></th>';
-  $('pricing-rows').innerHTML = items.map(p => '<tr>'
+  const pages = Math.max(1, Math.ceil(items.length / PRICING_PAGE_SIZE));
+  const rows = items.slice(pricingPage * PRICING_PAGE_SIZE, (pricingPage + 1) * PRICING_PAGE_SIZE);
+  $('pricing-rows').innerHTML = rows.map(p => '<tr>'
     + '<td class="num cell-mono">' + p.priority + '</td>'
     + '<td><span class="pill signal mono">' + esc(p.match_kind) + '</span></td>'
     + '<td class="cell-mono w-grow" title="' + esc(p.pattern) + '">' + esc(p.pattern) + '</td>'
@@ -2230,8 +2317,16 @@ loaders.pricing = async () => {
     + '<button type="button" class="btn small danger" data-id="' + p.id + '">删除</button></td></tr>').join('')
     || '<tr><td colspan="10"><div class="empty"><p class="empty-title">还没有计价规则</p>'
     + '<p class="empty-hint">新增规则，或在上方搜索 models.dev 后按条添加</p></div></td></tr>';
-  stamp();
-};
+  $('pricing-pager').innerHTML = pages > 1
+    ? '<span class="mono">第 ' + (pricingPage + 1) + ' / ' + pages + ' 页 · 共 ' + fmtInt(items.length) + ' 条</span><span class="grow"></span>'
+      + '<button type="button" class="btn small" id="pricing-prev"' + (pricingPage <= 0 ? ' disabled' : '') + '>上一页</button>'
+      + '<button type="button" class="btn small" id="pricing-next"'
+      + ((pricingPage + 1) * PRICING_PAGE_SIZE >= items.length ? ' disabled' : '') + '>下一页</button>'
+    : '';
+  const prev = $('pricing-prev'), next = $('pricing-next');
+  if (prev) prev.onclick = () => { pricingPage--; renderPricing(); };
+  if (next) next.onclick = () => { pricingPage++; renderPricing(); };
+}
 $('pricing-rows').addEventListener('click', e => {
   const del = e.target.closest('button[data-id]');
   if (!del) return;
