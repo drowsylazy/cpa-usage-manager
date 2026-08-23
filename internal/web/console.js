@@ -582,23 +582,34 @@ function openSheet(o) {
   // 就是两个按钮做同一件事，只留主按钮。
   cancel.hidden = !o.onOk;
   sheetOk = o.onOk || null;
+  sheet.classList.remove('closing');
   sheet.showModal();
   if (!o.noFocus) {
     const first = $('sheet-body').querySelector('input,select,textarea');
     if (first) first.focus();
   }
 }
-$('sheet-x').addEventListener('click', () => sheet.close());
-$('sheet-cancel').addEventListener('click', () => sheet.close());
+function animateCloseSheet() {
+  if (!sheet.open || sheet.classList.contains('closing')) return;
+  sheet.classList.add('closing');
+  setTimeout(() => {
+    if (!sheet.classList.contains('closing')) return; // 动画期间被重新打开
+    sheet.classList.remove('closing');
+    sheet.close();
+  }, 150);
+}
+$('sheet-x').addEventListener('click', () => animateCloseSheet());
+$('sheet-cancel').addEventListener('click', () => animateCloseSheet());
+sheet.addEventListener('cancel', e => { e.preventDefault(); animateCloseSheet(); });
 $('sheet-form').addEventListener('submit', e => { e.preventDefault(); $('sheet-ok').click(); });
 $('sheet-ok').addEventListener('click', async () => {
-  if (!sheetOk) { sheet.close(); return; }
+  if (!sheetOk) { animateCloseSheet(); return; }
   const btn = $('sheet-ok');
   btn.disabled = true;
   try {
     const stay = await sheetOk();
     if (stay === false) return; // onOk 已接管界面（如展示明文），保持打开
-    sheet.close();
+    animateCloseSheet();
   } catch (e) {
     toast(e.message, 'err');
     btn.disabled = false;
@@ -1291,24 +1302,26 @@ function cycleKeysNow(d = new Date()) {
 function todaySpent(k) {
   return k.daily_cycle_key === cycleKeysNow().daily ? k.daily_spent_micro_usd : 0;
 }
-// balRow 配额清单的一行：名称+「余 X / 上限」一行、细进度条一行，窄栏（对半分块）下不挤。
-// limit 未设显示不限；余量缺失显示 — 而非伪装成额度耗尽。
+// balRow 配额清单的一行：名称 | 进度条 | 余 X / 上限，单行三列。
+// 「不限」/数据缺失行也渲染空轨道：骨架→数据替换时行高不变、进度条不突兀消失。
 function balRow(name, limit, remain, fmt) {
   if (!limit || limit <= 0) {
     return '<div class="bal-row bal-off"><span class="bal-name">' + name + '</span>'
+      + '<span class="bal-bar"></span>'
       + '<span class="bal-free">不限</span></div>';
   }
   if (remain === null || remain === undefined) {
-    return '<div class="bal-row"><div class="bal-line"><span class="bal-name">' + name + '</span>'
-      + '<span class="bal-val" title="余量数据缺失">—</span></div></div>';
+    return '<div class="bal-row"><span class="bal-name">' + name + '</span>'
+      + '<span class="bal-bar"></span>'
+      + '<span class="bal-val" title="余量数据缺失">—</span></div>';
   }
   const used = Math.min(limit, Math.max(0, limit - remain));
   const pct = Math.min(100, Math.max(0, used / limit * 100));
   const state = pct >= 95 ? 'alarm' : pct >= 80 ? 'warn' : '';
   return '<div class="bal-row" data-state="' + state + '">'
-    + '<div class="bal-line"><span class="bal-name">' + name + '</span>'
-    + '<span class="bal-val mono">余 ' + fmt(Math.max(0, remain)) + ' / ' + fmt(limit) + '</span></div>'
-    + '<span class="bal-bar"><span style="width:' + pct.toFixed(1) + '%"></span></span></div>';
+    + '<span class="bal-name">' + name + '</span>'
+    + '<span class="bal-bar"><span style="width:' + pct.toFixed(1) + '%"></span></span>'
+    + '<span class="bal-val mono">余 ' + fmt(Math.max(0, remain)) + ' / ' + fmt(limit) + '</span></div>';
 }
 function renderKeys() {
   const list = keysView.filtered;
@@ -1397,9 +1410,9 @@ function keyCardHTML(k) {
 // balanceSeq 守卫：快速连续打开时，晚返回的旧余额不得覆盖当前内容。
 // balSkeletonRow 余额加载占位行：与 balRow 结构一致，数据到达原位替换不跳动。
 function balSkeletonRow(name) {
-  return '<div class="bal-row"><div class="bal-line"><span class="bal-name">' + name + '</span>'
-    + '<span class="bal-val">—</span></div>'
-    + '<span class="bal-bar"><span class="skel"></span></span></div>';
+  return '<div class="bal-row"><span class="bal-name">' + name + '</span>'
+    + '<span class="bal-bar"><span class="skel"></span></span>'
+    + '<span class="bal-val">—</span></div>';
 }
 function renderKeyDialog(k) {
   const kid = k.kid;
@@ -1415,12 +1428,12 @@ function renderKeyDialog(k) {
     '<header class="kd-head">'
     + '<h3>' + (k.label ? esc(k.label) : '<i>无标签</i>') + '</h3>'
     + '<span class="pill ' + meta.pill + '">' + meta.label + '</span>'
+    + '<button type="button" class="ky-kid mono" data-copy="' + esc(kid) + '" title="点击复制完整 kid：' + esc(kid) + '">'
+    + '<span>' + esc(kidShort(kid)) + '</span>' + COPY_SVG + '</button>'
     + '<button type="button" class="kd-close" aria-label="关闭详情">'
     + '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>'
     + '</button></header>'
     + '<div class="kd-body">'
-    + '<button type="button" class="ky-kid wide mono" data-copy="' + esc(kid) + '" title="点击复制完整 kid：' + esc(kid) + '">'
-    + '<span>' + esc(kid) + '</span>' + COPY_SVG + '</button>'
     + '<div class="detail-facts">'
     + fact('principal', k.principal || '-')
     + fact('额度口径', k.caller_scope === 'key' ? '独立计额' : '归属 caller')
