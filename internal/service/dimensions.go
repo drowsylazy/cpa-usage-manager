@@ -199,13 +199,19 @@ func finalizeTotal(total *DimensionRow) {
 	total.CacheHitRateBP = cacheHitRateBP(*total)
 }
 
-// cacheHitRateBP 计算缓存命中率（万分比）：缓存读取 / (输入 + 缓存读取)。
+// cacheHitRateBP 计算缓存命中率（万分比），与面板展示同口径：
+// 命中 = max(缓存读+缓存写, cached)（兼容 Claude/OpenAI 两种上游口径），
+// 分母 = 输入 + 缓存读 + 缓存写。
 func cacheHitRateBP(r DimensionRow) int64 {
-	denom := r.InputTokens + r.CacheReadTokens
+	denom := r.InputTokens + r.CacheReadTokens + r.CacheCreationTokens
 	if denom <= 0 {
 		return 0
 	}
-	return r.CacheReadTokens * 10000 / denom
+	hit := r.CacheReadTokens + r.CacheCreationTokens
+	if r.CachedTokens > hit {
+		hit = r.CachedTokens
+	}
+	return hit * 10000 / denom
 }
 
 func divOrZero(sum, count int64) int64 {

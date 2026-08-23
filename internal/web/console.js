@@ -1912,11 +1912,45 @@ function fillReqSuggestions() {
 }
 
 loaders.usage = async () => {
-  await Promise.all([loadDim(), loadCosts()]);
+  await Promise.all([loadDim(), loadCosts(), loadRoutes().catch(e => { $('route-body').innerHTML = '<div class="empty"><p class="empty-hint">' + esc(e.message) + '</p></div>'; })]);
   await loadRequests();
   fillReqSuggestions();
   stamp();
 };
+function renderRoutes() {
+  const rowsAll = routeRows;
+  $('route-count').textContent = rowsAll.length
+    ? fmtInt(rowsAll.reduce((a, r) => a + (Number(r.requests) || 0), 0)) + ' 次请求 · ' + rowsAll.length + ' 条映射' : '';
+  if (!rowsAll.length) {
+    $('route-body').innerHTML = '<div class="empty"><p class="empty-title">暂无数据</p>'
+      + '<p class="empty-hint">所选时间范围内没有请求记录</p></div>';
+    return;
+  }
+  const total = rowsAll.reduce((a, r) => a + (Number(r.requests) || 0), 0);
+  const shareOf = r => total > 0 ? (Number(r.requests) || 0) / total * 100 : 0;
+  $('route-body').innerHTML = '<div class="table-wrap"><table class="data"><thead><tr>'
+    + '<th class="w-grow">请求模型</th><th>上游实际模型</th>'
+    + '<th class="num">请求</th><th class="num">失败</th><th class="num">Token</th><th class="num">费用</th></tr></thead><tbody>'
+    + rowsAll.map(rw => {
+      const up = rw.upstream_model || '';
+      const direct = !up || up === rw.model;
+      return '<tr>'
+      + '<td title="' + esc(rw.model) + '">' + esc(rw.model || '(空)') + '</td>'
+      + '<td>' + (direct ? '<span class="nt-dim">直连</span>' : '<span class="mono" title="' + esc(up) + '">' + esc(up) + '</span>')
+      + '</td>'
+      + '<td class="num">' + fmtInt(rw.requests) + ' <span class="bar-pct">' + shareOf(rw).toFixed(1) + '%</span></td>'
+      + '<td class="num">' + (rw.failures ? '<span class="pill alarm mono">' + fmtInt(rw.failures) + '</span>' : '0') + '</td>'
+      + '<td class="num">' + fmtTok(rw.total_tokens) + '</td>'
+      + '<td class="num">' + fmtUSD(rw.cost_micro_usd) + '</td></tr>';
+    }).join('')
+    + '</tbody></table></div>';
+}
+let routeRows = [];
+async function loadRoutes() {
+  const r = await api('/routes?' + new URLSearchParams(rangeParams()));
+  routeRows = r.items || [];
+  renderRoutes();
+}
 const DIMS = [
   { value: 'model', label: '模型' },
   { value: 'provider', label: '提供方' },
@@ -1927,13 +1961,20 @@ const DIMS = [
   { value: 'key_id', label: '密钥' },
   { value: 'caller_id', label: 'caller' },
 ];
+let dimRows = [], dimPage = 0;
+const DIM_PAGE_SIZE = 15;
 async function loadDim() {
   const dim = dimSel.value;
   const r = await api('/usage/dimension?' + new URLSearchParams({ dimension: dim, ...rangeParams() }));
   // 费用相同时（如全部未计价）按请求数降序，保证视觉排序稳定。
-  const rows = (r.rows || []).slice()
+  dimRows = (r.rows || []).slice()
     .sort((a, b) => b.cost_micro_usd - a.cost_micro_usd || (b.requests || 0) - (a.requests || 0));
-  if (!rows.length) {
+  dimPage = 0;
+  renderDim();
+}
+function renderDim() {
+  const rowsAll = dimRows;
+  if (!rowsAll.length) {
     $('dim-body').innerHTML = '<div class="empty"><p class="empty-title">暂无数据</p>'
       + '<p class="empty-hint">所选时间范围内没有请求记录</p></div>';
     return;
@@ -1944,34 +1985,36 @@ async function loadDim() {
   // 比例」而不是占比：最大行恒显示 100%，且各行相加远超 100%（result 维度下
   // ok 100% + error 8% = 108%，provider 维度累计 263%），与列名和常识都不符。
   //
-  // 分母用行内之和而非 r.total.requests —— 服务端的 total 是**只对返回行**累加的
-  // （accumulate 在扫描循环里调用），带 limit 时它等于返回行之和、不是全量总数，
-  // 因此两者在这里等价；本函数不传 limit，拿到的就是全部分组。
-  // 条长仍按最大值归一，保证最长条填满、短条之间仍可比。
-  const denom = rows.reduce((a, row) => a + (Number(row.requests) || 0), 0);
-  const maxReq = Math.max(1, ...rows.map(row => Number(row.requests) || 0));
+  // 分母用全量行之和而非服务端 total —— 服务端的 total 是**只对返回行**累加的，
+  // 带分页后每页只渲染一部分，占比与条长必须按全量数据归一才稳定。
+  const denom = rowsAll.reduce((a, row) => a + (Number(row.requests) || 0), 0);
+  const maxReq = Math.max(1, ...rowsAll.map(row => Number(row.requests) || 0));
   const shareOf = row => denom > 0 ? (Number(row.requests) || 0) / denom * 100 : 0;
   // 密钥维度的分组值是 kid，显示标签更可读（与请求表/概览/详情弹窗同口径），
   // kid 保留在 title 里。其余维度分组值本身就是可读文本。
   const nameOf = row => {
     const v = row.value || '';
-    if (dim === 'key_id' && v) return keyLabelOf(v) || v;
+    if (dimSel.value === 'key_id' && v) return keyLabelOf(v) || v;
     return v || '(空)';
   };
   const titleOf = row => {
     const v = row.value || '';
-    if (dim === 'key_id' && v) {
+    if (dimSel.value === 'key_id' && v) {
       const label = keyLabelOf(v);
       return label ? label + ' · ' + v : v;
     }
     return v || '(空)';
   };
+  const pages = Math.max(1, Math.ceil(rowsAll.length / DIM_PAGE_SIZE));
+  const rows = rowsAll.slice(dimPage * DIM_PAGE_SIZE, (dimPage + 1) * DIM_PAGE_SIZE);
   $('dim-body').innerHTML = '<div class="table-wrap"><table class="data"><thead><tr>'
-    + '<th class="w-grow">' + esc((DIMS.find(d => d.value === dim) || {}).label || dim) + '</th>'
+    + '<th class="w-grow">' + esc((DIMS.find(d => d.value === dimSel.value) || {}).label || dimSel.value) + '</th>'
     + '<th class="num">请求</th><th class="num">失败</th><th class="num">Token</th><th class="num">费用</th>'
+    + '<th class="num">缓存</th>'
     + '<th class="num">平均延迟</th><th class="num">TPS</th></tr></thead><tbody>'
     + rows.map(row => {
       const share = shareOf(row);
+      const hit = cacheHitRate(row);
       return '<tr>'
       + '<td><div class="bar-cell" title="' + esc(titleOf(row)) + '"><div class="bar-top"><span class="bar-name">'
       + esc(nameOf(row)) + '</span><span class="bar-pct">'
@@ -1982,10 +2025,21 @@ async function loadDim() {
       + '<td class="num">' + (row.failures ? '<span class="pill alarm mono">' + fmtInt(row.failures) + '</span>' : '0') + '</td>'
       + '<td class="num">' + fmtTok(effTokens(row)) + '</td>'
       + '<td class="num">' + fmtUSD(row.cost_micro_usd) + '</td>'
+      + '<td class="num">' + (hit >= 0 ? hit.toFixed(1) + '%' : '—') + '</td>'
       + '<td class="num">' + fmtSec(row.latency_avg_ms) + '</td>'
       + '<td class="num">' + fmtTPS(row.tps_avg_milli) + '</td></tr>';
     }).join('')
-    + '</tbody></table></div>';
+    + '</tbody></table></div>'
+    + (pages > 1
+      ? '<div class="pager" id="dim-pager"><span class="mono">第 ' + (dimPage + 1) + ' / ' + pages + ' 页 · 共 '
+        + fmtInt(rowsAll.length) + ' 项</span><span class="grow"></span>'
+        + '<button type="button" class="btn small" id="dim-prev"' + (dimPage <= 0 ? ' disabled' : '') + '>上一页</button>'
+        + '<button type="button" class="btn small" id="dim-next"'
+        + ((dimPage + 1) * DIM_PAGE_SIZE >= rowsAll.length ? ' disabled' : '') + '>下一页</button></div>'
+      : '');
+  const prev = $('dim-prev'), next = $('dim-next');
+  if (prev) prev.onclick = () => { dimPage--; renderDim(); };
+  if (next) next.onclick = () => { dimPage++; renderDim(); };
 }
 // fmtTPS 展示 TPS：超过 3000 token/s 视为宿主缓冲整转产生的坏测量
 // （与后端落库上限同口径），v0.3.0 之前入库的历史脏行在展示层一并隐藏。

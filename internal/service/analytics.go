@@ -101,7 +101,7 @@ func (s *Service) ListRequests(ctx context.Context, f UsageFilter, limit, offset
 	}); err != nil {
 		return RequestPage{}, err
 	}
-	query := `SELECT id,ts,key_id,caller_id,model,provider,source,auth_id,auth_label,auth_type,tier,result,input_tokens,output_tokens,reasoning_tokens,cached_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,latency_ms,ttft_ms,generation_ms,tps_milli,thinking_intensity,cost_micro_usd,priced,reservation_id FROM requests` + clause + ` ORDER BY ` + column + ` ` + direction + `, id DESC LIMIT ? OFFSET ?`
+	query := `SELECT id,ts,key_id,caller_id,model,provider,source,upstream_model,auth_id,auth_label,auth_type,tier,result,input_tokens,output_tokens,reasoning_tokens,cached_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,latency_ms,ttft_ms,generation_ms,tps_milli,thinking_intensity,cost_micro_usd,priced,reservation_id FROM requests` + clause + ` ORDER BY ` + column + ` ` + direction + `, id DESC LIMIT ? OFFSET ?`
 	args = append(args, limit, max(0, offset))
 	var items []store.Request
 	err := s.st.Read(ctx, func(q store.Querier) error {
@@ -114,7 +114,7 @@ func (s *Service) ListRequests(ctx context.Context, f UsageFilter, limit, offset
 			var r store.Request
 			var ts, cost int64
 			var priced int
-			if err := rows.Scan(&r.ID, &ts, &r.KeyID, &r.CallerID, &r.Model, &r.Provider, &r.Source, &r.AuthID, &r.AuthLabel, &r.AuthType, &r.Tier, &r.Result, &r.InputTokens, &r.OutputTokens, &r.ReasoningTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens, &r.TotalTokens, &r.LatencyMS, &r.TTFTMS, &r.GenerationMS, &r.TPSMilli, &r.ThinkingIntensity, &cost, &priced, &r.ReservationID); err != nil {
+			if err := rows.Scan(&r.ID, &ts, &r.KeyID, &r.CallerID, &r.Model, &r.Provider, &r.Source, &r.UpstreamModel, &r.AuthID, &r.AuthLabel, &r.AuthType, &r.Tier, &r.Result, &r.InputTokens, &r.OutputTokens, &r.ReasoningTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens, &r.TotalTokens, &r.LatencyMS, &r.TTFTMS, &r.GenerationMS, &r.TPSMilli, &r.ThinkingIntensity, &cost, &priced, &r.ReservationID); err != nil {
 				return err
 			}
 			r.TS = time.UnixMilli(ts).UTC()
@@ -295,5 +295,49 @@ func (s *Service) Balance(ctx context.Context, kid string, now time.Time) (Balan
 	out.DailyTokens = remainTok(k.DailyTokenLimit, cycleTok(k.DailyCycleKey, cy.Daily, k.DailyTokensUsed)+heldTokens)
 	out.WeeklyTokens = remainTok(k.WeeklyTokenLimit, cycleTok(k.WeeklyCycleKey, cy.Weekly, k.WeeklyTokensUsed)+heldTokens)
 	out.MonthlyTokens = remainTok(k.MonthlyTokenLimit, cycleTok(k.MonthlyCycleKey, cy.Monthly, k.MonthlyTokensUsed)+heldTokens)
+	return out, nil
+}
+
+// RouteRow 是一条「请求模型 → 上游实际模型」的路由聚合行。
+// UpstreamModel 为空表示直连（别名与上游真名一致或未知）。
+type RouteRow struct {
+	Model         string      `json:"model"`
+	UpstreamModel string      `json:"upstream_model"`
+	Requests      int64       `json:"requests"`
+	Failures      int64       `json:"failures"`
+	TotalTokens   int64       `json:"total_tokens"`
+	CostMicroUSD  money.Micro `json:"cost_micro_usd"`
+}
+
+// RouteReport 按请求模型 × 上游实际模型聚合，用于暴露上游二次路由：
+// 同一别名被路由到多个真名、或渠道返回了意料之外的模型时一目了然。
+func (s *Service) RouteReport(ctx context.Context, f UsageFilter) ([]RouteRow, error) {
+	clause, args := requestFilter(f)
+	query := `SELECT model, upstream_model,
+			COUNT(*), COALESCE(SUM(CASE WHEN result <> 'ok' THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_micro_usd),0)
+		FROM requests` + clause + `
+		GROUP BY model, upstream_model ORDER BY 3 DESC LIMIT 500`
+	var out []RouteRow
+	err := s.st.Read(ctx, func(q store.Querier) error {
+		rows, err := q.QueryContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r RouteRow
+			var cost int64
+			if err := rows.Scan(&r.Model, &r.UpstreamModel, &r.Requests, &r.Failures, &r.TotalTokens, &cost); err != nil {
+				return err
+			}
+			r.CostMicroUSD = money.Micro(cost)
+			out = append(out, r)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("聚合上游路由失败: %w", err)
+	}
 	return out, nil
 }

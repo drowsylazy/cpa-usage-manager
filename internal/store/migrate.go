@@ -8,7 +8,7 @@ import (
 
 // SchemaVersion 是本代码期望的数据库 schema 版本。
 // 打开库时若发现库版本更高，说明是被更新版插件写过的库，拒绝降级使用。
-const SchemaVersion = 4
+const SchemaVersion = 5
 
 // migration 是一次版本化迁移。
 type migration struct {
@@ -321,6 +321,16 @@ var migrations = []migration{
 				created_at        INTEGER NOT NULL,
 				updated_at        INTEGER NOT NULL
 			)`,
+		},
+	},
+	{
+		version: 5,
+		name:    "request_upstream_model",
+		stmts: []string{
+			// ---- 上游二次路由 ----
+			// model 列统一存宿主别名（用户配置名）；upstream_model 记录
+			// 上游实际声明的模型名，仅在两者不同时填写（空 = 直连）。
+			`ALTER TABLE requests ADD COLUMN upstream_model TEXT NOT NULL DEFAULT ''`,
 		},
 	},
 }

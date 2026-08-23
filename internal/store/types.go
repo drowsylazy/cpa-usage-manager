@@ -280,6 +280,10 @@ type Request struct {
 	Provider string    `json:"provider"`
 	Source   string    `json:"source"`
 
+	// UpstreamModel 是上游实际声明的模型名（二次路由后的真名），
+	// 仅在与 Model 不同时填写；空串表示直连或未知。
+	UpstreamModel string `json:"upstream_model,omitempty"`
+
 	// 认证字段已做凭据清洗，不含任何上游 Key 明文。
 	AuthID    string `json:"auth_id"`
 	AuthLabel string `json:"auth_label"`

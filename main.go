@@ -693,6 +693,7 @@ func managementRegistration() rpcManagementRegistration {
 		{Method: "GET", Path: base + "/trends", Description: "趋势"},
 		{Method: "GET", Path: base + "/costs", Description: "费用覆盖"},
 		{Method: "GET", Path: base + "/balance", Description: "Key 余额"},
+		{Method: "GET", Path: base + "/routes", Description: "上游路由分布"},
 		{Method: "GET", Path: base + "/audit", Description: "审计事件"},
 		{Method: "GET", Path: base + "/auth-quotas", Description: "OAuth 额度快照"},
 		{Method: "GET", Path: base + "/preferences", Description: "面板偏好读取"},
@@ -895,7 +896,7 @@ func execute(body []byte) ([]byte, error) {
 	// 非流式响应体几乎总带 usage，这里只做非阻塞探测：宿主记账发生在
 	// 本次调用返回之后，同步等待只会白等一个超时。缺失的明细由认领在
 	// 宽限期内按请求 ID 回填。
-	settleReservation(svc, reservation, req, request, startedAt, time.Time{}, completedAt, status, parsed, claim)
+	settleReservation(svc, reservation, req, request, startedAt, time.Time{}, completedAt, status, parsed, usageparse.SniffModel(hostBody), claim)
 	return okEnvelope(rpcExecutorResponse{Payload: hostBody, Headers: headers})
 }
 
@@ -983,7 +984,7 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 	}
 	if stream.StatusCode >= 400 {
 		_ = closeHostModelStream(stream.StreamID)
-		settleReservation(svc, reservation, req, request, startedAt, time.Time{}, time.Now(), stream.StatusCode, usageparse.Usage{}, claim)
+		settleReservation(svc, reservation, req, request, startedAt, time.Time{}, time.Now(), stream.StatusCode, usageparse.Usage{}, "", claim)
 		return fmt.Errorf("host model status %d", stream.StatusCode)
 	}
 	if strings.TrimSpace(stream.StreamID) == "" {
@@ -1000,20 +1001,20 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 		if errRead != nil {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 502, parsed, claim)
+			settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), claim)
 			return errRead
 		}
 		var chunk rpcHostModelStreamReadResponse
 		if err := json.Unmarshal(chunkRaw, &chunk); err != nil {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 502, parsed, claim)
+			settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), claim)
 			return err
 		}
 		if chunk.Error != "" {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 502, parsed, claim)
+			settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), claim)
 			return fmt.Errorf("%s", chunk.Error)
 		}
 		if len(chunk.Payload) > 0 {
@@ -1026,7 +1027,7 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 			if err := emitPluginStreamChunk(pluginStreamID, chunk.Payload); err != nil {
 				completedAt = time.Now()
 				parsed, _ := acc.Result()
-				settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 499, parsed, claim)
+				settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 499, parsed, acc.Model(), claim)
 				return err
 			}
 		}
@@ -1044,16 +1045,21 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 		if rec, ok := claim.wait(svc.Config().Quota.Settlement.HostUsageWait.Std()); ok {
 			parsed = usageFromRecord(rec)
 			r := buildRequest(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 200)
+			r.UpstreamModel = acc.Model()
 			applyHostUsageToRequest(r, rec)
 			return finishSettle(svc, reservation, r, parsed, claim)
 		}
 	}
-	return finishSettle(svc, reservation, buildRequest(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 200), parsed, claim)
+	r := buildRequest(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 200)
+	r.UpstreamModel = acc.Model()
+	return finishSettle(svc, reservation, r, parsed, claim)
 }
 
 // settleReservation 解析 usage 结算预占并写请求记录；结算失败时释放预占兜底。
-func settleReservation(svc *service.Service, reservation store.Reservation, req rpcExecutorRequest, body []byte, startedAt, firstChunkAt, completedAt time.Time, status int, usage usageparse.Usage, claim *usageClaim) {
+// upstreamModel 是执行器从上游响应里嗅探到的真实模型名（可为空）。
+func settleReservation(svc *service.Service, reservation store.Reservation, req rpcExecutorRequest, body []byte, startedAt, firstChunkAt, completedAt time.Time, status int, usage usageparse.Usage, upstreamModel string, claim *usageClaim) {
 	r := buildRequest(svc, reservation, req, body, startedAt, firstChunkAt, completedAt, status)
+	r.UpstreamModel = upstreamModel
 	// 认领已在结算前收到宿主口径（少见但可能）：结算前补齐展示字段，
 	// 使请求行与它的分钟聚合维度一致。
 	if rec, ok := claim.wait(0); ok {
@@ -1620,6 +1626,12 @@ func applyHostUsageToRequest(r *store.Request, rec rpcUsageRecord) {
 	if r.Provider == "" {
 		r.Provider = strings.TrimSpace(rec.Provider)
 	}
+	if r.UpstreamModel == "" {
+		// 宿主上报的 Model 是上游实际路由名；与别名不同即发生了二次路由。
+		if m := strings.TrimSpace(rec.Model); m != "" && m != r.Model {
+			r.UpstreamModel = m
+		}
+	}
 	if r.AuthID == "" {
 		r.AuthID = strings.TrimSpace(rec.AuthID)
 	}
@@ -1729,6 +1741,17 @@ func usageFromRecord(u rpcUsageRecord) usageparse.Usage {
 	}
 }
 
+// upstreamOf 判定二次路由：别名与上游实际模型名都非空且不同时，返回实际名；
+// 否则返回空串（直连）。
+func upstreamOf(alias, model string) string {
+	alias = strings.TrimSpace(alias)
+	model = strings.TrimSpace(model)
+	if alias != "" && model != "" && alias != model {
+		return model
+	}
+	return ""
+}
+
 // modelCandidates 归并宿主上报的模型名候选：别名、原始模型、去渠道前缀的裸名。
 // 执行器落库常用「渠道/模型」别名，而 usage.handle 上报原始模型，判重需按候选集匹配。
 func modelCandidates(model, alias string) []string {
@@ -1761,6 +1784,7 @@ func usageRecordToRequest(st *store.Store, u rpcUsageRecord) store.Request {
 		// （如 OpenRouter 把 openrouter/ox-alpha 回报为 stealth/ox-alpha），
 		// 直接落库会与执行器路径记录的别名割裂成两个维度值。
 		Model:               service.FirstNonEmpty(u.Alias, u.Model),
+		UpstreamModel:       upstreamOf(u.Alias, u.Model),
 		Provider:            u.Provider,
 		Source:              store.RedactSource(u.Source),
 		AuthID:              u.AuthID,

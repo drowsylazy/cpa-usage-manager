@@ -449,13 +449,30 @@ func SSEPayloads(body []byte) [][]byte {
 type Accumulator struct {
 	usage Usage
 	found bool
+	// model 是响应载荷里上游声明的模型名（二次路由后可能与请求别名不同）。
+	model string
 }
 
 // Feed 喂入一个事件载荷（JSON 对象）。非 JSON 或无 usage 的载荷被忽略。
 func (a *Accumulator) Feed(payload []byte) {
+	a.sniffModel(payload)
 	if u, ok := ParseJSON(payload); ok {
 		a.usage.merge(u)
 		a.found = true
+	}
+}
+
+// sniffModel 抓取载荷顶层的 "model" 字段；拿到一次后不再重复解析，
+// 流式场景下每个 chunk 都带同名字段，首块即可命中。
+func (a *Accumulator) sniffModel(payload []byte) {
+	if a.model != "" || len(payload) == 0 || payload[0] != '{' {
+		return
+	}
+	var probe struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(payload, &probe) == nil && strings.TrimSpace(probe.Model) != "" {
+		a.model = strings.TrimSpace(probe.Model)
 	}
 }
 
@@ -473,6 +490,7 @@ func (a *Accumulator) FeedSSE(chunk []byte) {
 // 帧边界被拆分。这里先按整段解析（JSON 或 SSE），失败再逐行重试，
 // 覆盖多个裸 JSON 对象拼接在同一段载荷里的情况。merge 取较大值，重复喂入无害。
 func (a *Accumulator) FeedChunk(payload []byte) {
+	a.sniffModel(payload)
 	if u, ok := Parse(payload); ok {
 		a.usage.merge(u)
 		a.found = true
@@ -484,6 +502,16 @@ func (a *Accumulator) FeedChunk(payload []byte) {
 			a.found = true
 		}
 	}
+}
+
+// Model 返回响应载荷里上游声明的模型名；未出现过则为空串。
+func (a *Accumulator) Model() string { return a.model }
+
+// SniffModel 提取单个载荷顶层 "model" 字段（非流式响应体的一次性用法）。
+func SniffModel(payload []byte) string {
+	a := &Accumulator{}
+	a.sniffModel(payload)
+	return a.model
 }
 
 // Result 返回累积结果；ok=false 表示整个流都没有用量信息。

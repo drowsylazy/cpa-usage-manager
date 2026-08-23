@@ -371,13 +371,13 @@ func writeCSV(cw *csv.Writer, header []string, n int, row func(i int) []string) 
 	return nil
 }
 
-var requestCSVHeader = []string{"id", "ts", "key_id", "caller_id", "model", "provider", "source",
+var requestCSVHeader = []string{"id", "ts", "key_id", "caller_id", "model", "upstream_model", "provider", "source",
 	"auth_label", "auth_type", "tier", "result", "input_tokens", "output_tokens", "reasoning_tokens",
 	"cached_tokens", "cache_read_tokens", "cache_creation_tokens", "total_tokens",
 	"latency_ms", "ttft_ms", "tps", "thinking_intensity", "cost_usd", "priced"}
 
 func requestCSVRow(r store.Request) []string {
-	return []string{r.ID, r.TS.Format(time.RFC3339), r.KeyID, r.CallerID, r.Model, r.Provider, r.Source,
+	return []string{r.ID, r.TS.Format(time.RFC3339), r.KeyID, r.CallerID, r.Model, r.UpstreamModel, r.Provider, r.Source,
 		r.AuthLabel, r.AuthType, r.Tier, r.Result,
 		itoa(r.InputTokens), itoa(r.OutputTokens), itoa(r.ReasoningTokens), itoa(r.CachedTokens),
 		itoa(r.CacheReadTokens), itoa(r.CacheCreationTokens), itoa(r.TotalTokens),

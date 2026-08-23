@@ -46,15 +46,15 @@ func insertRequestTx(ctx context.Context, tx *sql.Tx, r Request) error {
 	}
 	res, err := tx.ExecContext(ctx,
 		`INSERT INTO requests (
-			id, ts, key_id, caller_id, model, provider, source,
+			id, ts, key_id, caller_id, model, provider, source, upstream_model,
 			auth_id, auth_label, auth_type, tier, result,
 			input_tokens, output_tokens, reasoning_tokens, cached_tokens,
 			cache_read_tokens, cache_creation_tokens, total_tokens,
 			latency_ms, ttft_ms, generation_ms, tps_milli,
 			thinking_intensity, cost_micro_usd, priced, reservation_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING`,
-		r.ID, r.TS.UTC().UnixMilli(), r.KeyID, r.CallerID, r.Model, r.Provider, r.Source,
+		r.ID, r.TS.UTC().UnixMilli(), r.KeyID, r.CallerID, r.Model, r.Provider, r.Source, r.UpstreamModel,
 		r.AuthID, r.AuthLabel, r.AuthType, r.Tier, r.Result,
 		r.InputTokens, r.OutputTokens, r.ReasoningTokens, r.CachedTokens,
 		r.CacheReadTokens, r.CacheCreationTokens, r.TotalTokens,

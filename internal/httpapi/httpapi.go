@@ -73,6 +73,7 @@ func (a *API) register() {
 	a.route("/trends", a.trends)
 	a.route("/costs", a.costs)
 	a.route("/balance", a.balance)
+	a.route("/routes", a.routes)
 
 	a.route("/audit", a.audit)
 	a.route("/auth-quotas", a.authQuotas)
@@ -673,6 +674,20 @@ func (a *API) costs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOut(w, v, 200)
+}
+
+// routes 上游路由分布：请求别名 × 上游实际模型的聚合。
+func (a *API) routes(w http.ResponseWriter, r *http.Request) {
+	noStore(w)
+	v, e := a.svc.RouteReport(r.Context(), parseFilter(r))
+	if e != nil {
+		jsonOut(w, map[string]string{"error": e.Error()}, 500)
+		return
+	}
+	if v == nil {
+		v = []service.RouteRow{}
+	}
+	jsonOut(w, map[string]any{"items": v}, 200)
 }
 func (a *API) balance(w http.ResponseWriter, r *http.Request) {
 	v, e := a.svc.Balance(r.Context(), r.URL.Query().Get("key_id"), time.Time{})
