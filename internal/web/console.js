@@ -2008,21 +2008,19 @@ function renderRoutes() {
   const pages = Math.max(1, Math.ceil(rowsAll.length / ROUTE_PAGE_SIZE));
   if (routePage >= pages) routePage = pages - 1;
   const rows = rowsAll.slice(routePage * ROUTE_PAGE_SIZE, (routePage + 1) * ROUTE_PAGE_SIZE);
-  // 首列与维度聚合同构：名称行 + 占比 + 条形；行按上游真名 × 提供商聚合，不展示本地别名。
+  // 首列与维度聚合同构：名称行 + 占比 + 条形；行按上游真名聚合，不展示本地别名与提供商。
   $('route-body').innerHTML = '<div class="table-wrap fixed5"><table class="data"><thead><tr>'
     + '<th class="w-grow">上游模型</th>'
-    + '<th>提供商</th><th class="num">请求</th><th class="num">Token</th></tr></thead><tbody>'
+    + '<th class="num">请求</th><th class="num">Token</th></tr></thead><tbody>'
     + rows.map(rw => {
       const up = rw.upstream_model || '(未知)';
-      const prov = rw.provider || '';
       const name = '<span class="bar-name">' + esc(up) + '</span>';
       return '<tr>'
-      + '<td><div class="bar-cell" title="' + esc(up + (prov ? ' · ' + prov : '')) + '">'
+      + '<td><div class="bar-cell" title="' + esc(up) + '">'
         + '<div class="bar-top">' + name + '<span class="bar-pct">'
         + (shareOf(rw) < 10 ? shareOf(rw).toFixed(1) : shareOf(rw).toFixed(0)) + '%</span></div>'
         + '<div class="bar-line"><span style="width:'
         + ((Number(rw.requests) || 0) / maxReq * 100).toFixed(1) + '%"></span></div></div></td>'
-      + '<td>' + (prov ? esc(prov) : '—') + '</td>'
       + '<td class="num">' + fmtInt(rw.requests) + '</td>'
       + '<td class="num">' + fmtTok(rw.total_tokens) + '</td></tr>';
     }).join('')

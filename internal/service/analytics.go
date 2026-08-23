@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -298,28 +299,31 @@ func (s *Service) Balance(ctx context.Context, kid string, now time.Time) (Balan
 	return out, nil
 }
 
-// RouteRow 是一条「上游实际模型 × 提供商」的路由聚合行。
-// UpstreamModel 回退为请求别名（直连，或老数据没有上游真名时）。
+// RouteRow 是一条「上游实际模型」的路由聚合行。
+// UpstreamModel 为别名本身时表示该别名下没有（或有不唯一的）显式真名可归并。
 type RouteRow struct {
 	UpstreamModel string   `json:"upstream_model"`
-	Provider      string   `json:"provider"`
 	Requests      int64    `json:"requests"`
 	TotalTokens   int64    `json:"total_tokens"`
-	Models        []string `json:"models"` // 该上游组合涉及的本地别名，供前端按别名筛选
+	Models        []string `json:"models"` // 涉及的本地别名，供前端按别名筛选
 }
 
-// RouteReport 按上游实际模型 × 提供商聚合，用于暴露上游二次路由：
-// 同一别名被拆到多个真名、或渠道返回了意料之外的模型时一目了然；
-// Models 收集涉及的本地别名，前端据此做别名筛选。
+// RouteReport 按上游实际模型聚合，用于暴露上游二次路由：
+// 同一别名被拆到多个真名、或渠道返回了意料之外的模型时一目了然。
+// 部分请求嗅探到真名、部分没捕获到的别名，会把未捕获的请求归并进唯一真名行，
+// 避免「别名 + 真名」裂成两行重复计数；Models 收集涉及的本地别名供前端筛选。
 func (s *Service) RouteReport(ctx context.Context, f UsageFilter) ([]RouteRow, error) {
 	clause, args := requestFilter(f)
-	query := `SELECT COALESCE(NULLIF(upstream_model,''), model), COALESCE(provider,''),
+	query := `SELECT COALESCE(NULLIF(upstream_model,''), model), COALESCE(upstream_model,''),
 			COUNT(*), COALESCE(SUM(total_tokens),0),
 			COALESCE(GROUP_CONCAT(DISTINCT model),'')
 		FROM requests` + clause + `
-		GROUP BY COALESCE(NULLIF(upstream_model,''), model), COALESCE(provider,'')
+		GROUP BY COALESCE(NULLIF(upstream_model,''), model)
 		ORDER BY 3 DESC LIMIT 500`
-	var out []RouteRow
+	var aggs []struct {
+		row RouteRow
+		raw string // 原始 upstream_model；空 = 回退行（展示名实为别名）
+	}
 	err := s.st.Read(ctx, func(q store.Querier) error {
 		rows, err := q.QueryContext(ctx, query, args...)
 		if err != nil {
@@ -327,22 +331,81 @@ func (s *Service) RouteReport(ctx context.Context, f UsageFilter) ([]RouteRow, e
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var r RouteRow
+			var a struct {
+				row RouteRow
+				raw string
+			}
 			var models string
-			if err := rows.Scan(&r.UpstreamModel, &r.Provider, &r.Requests, &r.TotalTokens, &models); err != nil {
+			if err := rows.Scan(&a.row.UpstreamModel, &a.raw, &a.row.Requests, &a.row.TotalTokens, &models); err != nil {
 				return err
 			}
 			for _, m := range strings.Split(models, ",") {
 				if m = strings.TrimSpace(m); m != "" {
-					r.Models = append(r.Models, m)
+					a.row.Models = append(a.row.Models, m)
 				}
 			}
-			out = append(out, r)
+			aggs = append(aggs, a)
 		}
 		return rows.Err()
 	})
 	if err != nil {
 		return nil, fmt.Errorf("聚合上游路由失败: %w", err)
 	}
+	// 别名 → 唯一显式真名（出现多个真名时不归并，保留独立行暴露二次路由）。
+	truth := make(map[string]string)
+	counts := make(map[string]map[string]int)
+	for _, a := range aggs {
+		if a.raw == "" {
+			continue
+		}
+		for _, m := range a.row.Models {
+			set := counts[m]
+			if set == nil {
+				set = make(map[string]int)
+				counts[m] = set
+			}
+			set[a.raw]++
+		}
+	}
+	for alias, set := range counts {
+		if len(set) == 1 {
+			for name := range set {
+				truth[alias] = name
+			}
+		}
+	}
+	out := make([]RouteRow, 0, len(aggs))
+	idx := make(map[string]int)
+	union := func(dst, add []string) []string {
+		has := make(map[string]bool, len(dst))
+		for _, m := range dst {
+			has[m] = true
+		}
+		for _, m := range add {
+			if !has[m] {
+				dst = append(dst, m)
+				has[m] = true
+			}
+		}
+		return dst
+	}
+	for _, a := range aggs {
+		name := a.row.UpstreamModel
+		if a.raw == "" {
+			if t, ok := truth[name]; ok {
+				name = t
+			}
+		}
+		if i, ok := idx[name]; ok {
+			out[i].Requests += a.row.Requests
+			out[i].TotalTokens += a.row.TotalTokens
+			out[i].Models = union(out[i].Models, a.row.Models)
+			continue
+		}
+		idx[name] = len(out)
+		a.row.UpstreamModel = name
+		out = append(out, a.row)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Requests > out[j].Requests })
 	return out, nil
 }
