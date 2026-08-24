@@ -1989,19 +1989,30 @@ loaders.usage = async () => {
 };
 let routeRows = [], routePage = 0, routeModel = '';
 const ROUTE_PAGE_SIZE = 5;
-const routeModelSel = new Select('route-model', [{ value: '', label: '全部别名' }],
-  v => { routeModel = v; routePage = 0; renderRoutes(); }, { value: '', head: '按别名筛选' });
+// 必须选中本地别名才展示路由（无「全部」态）；未选时 value='' 显示占位符。
+const routeModelSel = new Select('route-model', [],
+  v => { routeModel = v; routePage = 0; renderRoutes(); }, { head: '按别名筛选', placeholder: '选择本地别名…' });
 async function loadRoutes() {
   const r = await api('/routes?' + new URLSearchParams(rangeParams()));
   routeRows = r.items || [];
   const names = [...new Set(routeRows.flatMap(r => r.models || []))].sort((a, b) => a.localeCompare(b));
   if (routeModel && !names.includes(routeModel)) { routeModel = ''; routeModelSel.value = ''; }
-  routeModelSel.setOptions([{ value: '', label: '全部别名' }].concat(names.map(n => ({ value: n, label: n }))));
-  routePage = 0;
+  routeModelSel.setOptions(names.map(n => ({ value: n, label: n })));
   renderRoutes();
 }
 function renderRoutes() {
-  const rowsAll = routeRows.filter(r => !routeModel || (r.models || []).includes(routeModel));
+  // 表格区与换页栏始终同构渲染：fixed5 撑住高度，换页栏位置不随内容浮动。
+  if (!routeModel) {
+    $('route-body').innerHTML = '<div class="table-wrap fixed5"><div class="empty">'
+      + '<p class="empty-title">未选择本地别名</p>'
+      + '<p class="empty-hint">在右上角选择一个本地别名，查看它实际路由到的上游模型</p></div></div>'
+      + '<div class="pager"><span class="mono">第 0 / 0 页 · 共 0 条映射</span><span class="grow"></span>'
+      + '<button type="button" class="btn small" disabled>上一页</button>'
+      + '<button type="button" class="btn small" disabled>下一页</button></div>';
+    $('route-count').textContent = '';
+    return;
+  }
+  const rowsAll = routeRows.filter(r => (r.models || []).includes(routeModel));
   const total = rowsAll.reduce((a, r) => a + (Number(r.requests) || 0), 0);
   const maxReq = Math.max(1, ...rowsAll.map(r => Number(r.requests) || 0));
   const shareOf = r => total > 0 ? (Number(r.requests) || 0) / total * 100 : 0;
