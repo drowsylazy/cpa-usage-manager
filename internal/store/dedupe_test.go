@@ -241,40 +241,74 @@ func TestDedupeRequestsRespectsSince(t *testing.T) {
 	}
 }
 
-func TestReconcileRequestDuplicates(t *testing.T) {
+// TestRecordPassiveUsageMergesIntoExecutor 验证入库时防重：
+// 执行器行已存在时，迟到的宿主回调在入库事务内被直接并入该行，
+// 不产生任何时刻可见的重复行；聚合只增加被吸收的明细增量。
+func TestRecordPassiveUsageMergesIntoExecutor(t *testing.T) {
 	s := openTestStore(t, filepath.Join(t.TempDir(), "cpa.db"), "owner-a")
 	ctx := context.Background()
 	base := time.UnixMilli(1_700_000_000_000).UTC()
-	execID, hostID := seedDuplicatePair(t, s, "race", base, "azure/gpt-5", "gpt-5")
 
-	// 以被动行为锚点也应找到执行器行，并保留执行器行。
-	merged, err := s.ReconcileRequestDuplicates(ctx, hostID)
-	if err != nil {
-		t.Fatalf("ReconcileRequestDuplicates 失败: %v", err)
+	exec := Request{
+		ID: "exec-race", TS: base, KeyID: "kid1", CallerID: "default",
+		Model: "azure/gpt-5", Result: ResultOK,
+		LatencyMS: 9864, CostMicroUSD: 1234, Priced: true,
 	}
-	if !merged {
-		t.Fatal("应识别出重复行")
+	if err := s.RecordUsage(ctx, exec); err != nil {
+		t.Fatalf("写入执行器行失败: %v", err)
 	}
-	if _, err := s.GetRequest(ctx, hostID); err == nil {
-		t.Fatal("被动行应被删除")
+	before := readRollupTotals(t, s)
+
+	host := Request{
+		ID: "host-race", TS: base.Add(400 * time.Millisecond), Model: "gpt-5",
+		Provider: "openai", AuthType: "api_key", Tier: "default", Result: ResultOK,
+		InputTokens: 700, OutputTokens: 300, TotalTokens: 1000,
+		LatencyMS: 9871, TTFTMS: 887,
 	}
-	r, err := s.GetRequest(ctx, execID)
+	hint := PassiveDedupeHint{Models: []string{"gpt-5"}, Near: host.TS, LatencyMS: host.LatencyMS}
+	if err := s.RecordPassiveUsage(ctx, host, hint); err != nil {
+		t.Fatalf("被动入库失败: %v", err)
+	}
+
+	if _, err := s.GetRequest(ctx, host.ID); err == nil {
+		t.Fatal("被动行不应插入，应被合并进执行器行")
+	}
+	got, err := s.GetRequest(ctx, exec.ID)
 	if err != nil {
 		t.Fatalf("执行器行应保留: %v", err)
 	}
-	if r.TotalTokens != 1000 || r.TTFTMS != 887 || r.CostMicroUSD != 1234 {
-		t.Fatalf("执行器行合并结果异常: %+v", r)
+	if got.InputTokens != 700 || got.OutputTokens != 300 || got.TotalTokens != 1000 {
+		t.Fatalf("token 明细未合并: %+v", got)
+	}
+	if got.TTFTMS != 887 || got.Provider != "openai" || got.AuthType != "api_key" || got.Tier != "default" {
+		t.Fatalf("展示字段未合并: %+v", got)
+	}
+	if got.CostMicroUSD != 1234 {
+		t.Fatalf("费用被改写: %d", got.CostMicroUSD)
+	}
+	after := readRollupTotals(t, s)
+	if after.reqCount != before.reqCount {
+		t.Fatalf("聚合请求数不应变化: 前 %d 后 %d", before.reqCount, after.reqCount)
+	}
+	if after.totalTokens != before.totalTokens+1000 || after.inputTokens != before.inputTokens+700 {
+		t.Fatalf("被吸收的明细应回补到聚合: 前 %+v 后 %+v", before, after)
+	}
+	if after.ttftSum != before.ttftSum+887 || after.ttftCount != before.ttftCount+1 {
+		t.Fatalf("首字延迟应回补: 前 %+v 后 %+v", before, after)
+	}
+	if after.cost != before.cost {
+		t.Fatalf("费用不应变化: 合并前 %d, 合并后 %d", before.cost, after.cost)
 	}
 
-	// 无重复可合并时返回 false 且不改动任何行。
-	merged, err = s.ReconcileRequestDuplicates(ctx, execID)
-	if err != nil {
-		t.Fatalf("二次对账失败: %v", err)
+	// 模型不匹配：按普通被动行落库。
+	lone := Request{
+		ID: "lone-race", TS: base.Add(time.Minute), CallerID: "default",
+		Model: "other-model", Result: ResultOK, InputTokens: 3, TotalTokens: 3,
 	}
-	if merged {
-		t.Fatal("已无重复行，不应再报合并")
+	if err := s.RecordPassiveUsage(ctx, lone, PassiveDedupeHint{Models: []string{"other-model"}, Near: lone.TS, LatencyMS: 50}); err != nil {
+		t.Fatalf("无重复被动入库失败: %v", err)
 	}
-	if got := countRequests(t, s); got != 1 {
-		t.Fatalf("请求行数应为 1，得到 %d", got)
+	if _, err := s.GetRequest(ctx, lone.ID); err != nil {
+		t.Fatalf("无重复时应正常插入: %v", err)
 	}
 }

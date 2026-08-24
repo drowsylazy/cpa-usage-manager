@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sort"
 	"strings"
@@ -181,6 +182,38 @@ type TrendPoint struct {
 	CostMicroUSD        int64     `json:"cost_micro_usd"`
 }
 
+// trendRangeBounds 返回趋势范围的 [from,to] Unix 秒：筛选里缺省的端点
+// 用分钟聚合表的实际边界补齐（一条 MIN/MAX 微查询，仅此场景触发）。
+func trendRangeBounds(ctx context.Context, s *Service, f UsageFilter) (int64, int64) {
+	var fromSec, toSec int64
+	if !f.From.IsZero() {
+		fromSec = f.From.UTC().Unix()
+	}
+	if !f.To.IsZero() {
+		toSec = f.To.UTC().Unix()
+	}
+	if fromSec > 0 && toSec > 0 {
+		return fromSec, toSec
+	}
+	var lo, hi sql.NullInt64
+	if err := s.st.Read(ctx, func(q store.Querier) error {
+		return q.QueryRowContext(ctx, `SELECT MIN(bucket_minute), MAX(bucket_minute) FROM usage_rollups`).Scan(&lo, &hi)
+	}); err != nil || !lo.Valid || !hi.Valid {
+		return fromSec, toSec
+	}
+	if fromSec == 0 {
+		fromSec = lo.Int64 * 60
+	}
+	if toSec == 0 {
+		toSec = hi.Int64*60 + 60
+	}
+	return fromSec, toSec
+}
+
+// maxTrendBuckets 限制单次趋势查询的桶数：范围远超粒度时自动加宽桶距，
+// 防止「全部范围 + 分钟粒度」这类组合一次吐出上万桶拖垮面板。
+const maxTrendBuckets = 400
+
 func (s *Service) Trends(ctx context.Context, f UsageFilter, grain string) ([]TrendPoint, error) {
 	// 分钟/时/日 用整数取整即可；周固定以周一为界，月为日历月，
 	// 二者都不能用「按秒整除」表达，交给 SQLite 的日期函数处理。
@@ -222,6 +255,14 @@ func (s *Service) Trends(ctx context.Context, f UsageFilter, grain string) ([]Tr
 	}
 	selectBucket := bucketExpr
 	if selectBucket == "" {
+		// 分钟/时/日按秒整除分桶；范围未知端点用库内实际边界补齐后，
+		// 若桶数超限则按倍增加宽桶距（保持原时间单位对齐）。
+		fromSec, toSec := trendRangeBounds(ctx, s, f)
+		if toSec > fromSec {
+			for (toSec-fromSec)/seconds > maxTrendBuckets {
+				seconds *= 2
+			}
+		}
 		selectBucket = `((bucket_minute*60)/?)*?`
 		// 两个占位符必须排在筛选参数之前。
 		args = append([]any{seconds, seconds}, args...)

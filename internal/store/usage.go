@@ -26,7 +26,7 @@ func (s *Store) RecordUsage(ctx context.Context, r Request) error {
 		r.TS = time.Now().UTC()
 	}
 	return s.Write(ctx, func(tx *sql.Tx) error {
-		err := insertRequestTx(ctx, tx, r)
+		err := insertRequestTx(ctx, s, tx, r)
 		if errors.Is(err, errDuplicateRequest) {
 			// 宿主重复回调同一请求：已入库，聚合不再累加，整体视为成功。
 			return nil
@@ -34,17 +34,17 @@ func (s *Store) RecordUsage(ctx context.Context, r Request) error {
 		if err != nil {
 			return err
 		}
-		return upsertRollupTx(ctx, tx, r)
+		return upsertRollupTx(ctx, s, tx, r)
 	})
 }
 
 // insertRequestTx 写入一条逐请求记录。
 // 同 ID 重复写入按幂等处理（忽略后写），避免宿主重复回调造成双计。
-func insertRequestTx(ctx context.Context, tx *sql.Tx, r Request) error {
+func insertRequestTx(ctx context.Context, s *Store, tx *sql.Tx, r Request) error {
 	if r.Result == "" {
 		r.Result = ResultOK
 	}
-	res, err := tx.ExecContext(ctx,
+	res, err := s.execHotTx(ctx, tx,
 		`INSERT INTO requests (
 			id, ts, key_id, caller_id, model, provider, source, upstream_model,
 			auth_id, auth_label, auth_type, tier, result,
@@ -74,7 +74,7 @@ func insertRequestTx(ctx context.Context, tx *sql.Tx, r Request) error {
 var errDuplicateRequest = fmt.Errorf("请求记录已存在")
 
 // upsertRollupTx 把一条请求累加进分钟聚合。
-func upsertRollupTx(ctx context.Context, tx *sql.Tx, r Request) error {
+func upsertRollupTx(ctx context.Context, s *Store, tx *sql.Tx, r Request) error {
 	if r.Result == "" {
 		r.Result = ResultOK
 	}
@@ -89,7 +89,7 @@ func upsertRollupTx(ctx context.Context, tx *sql.Tx, r Request) error {
 		ttftCount = 1
 	}
 
-	_, err := tx.ExecContext(ctx,
+	_, err := s.execHotTx(ctx, tx,
 		`INSERT INTO usage_rollups (
 			bucket_minute, model, key_id, caller_id, provider, source, auth_type, tier, result,
 			req_count, fail_count,
@@ -219,7 +219,7 @@ func (s *Store) BackfillRequestUsage(ctx context.Context, kid string, models []s
 		if e := row.Scan(&id); e != nil {
 			return e
 		}
-		return backfillRequestTx(ctx, tx, id, b)
+		return backfillRequestTx(ctx, tx, s, id, b)
 	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -234,94 +234,132 @@ func (s *Store) BackfillRequestUsage(ctx context.Context, kid string, models []s
 // 关联执行器已入库的记录。
 // 宿主 usage.handle 的 APIKey 字段在部分兼容渠道里是上游凭据而非插件 Key，
 // 无法用 kid 判重；同一请求的两次回调延迟仅差几毫秒，该组合足以唯一对应。
+// 只读快路径：命中可省去 RecordPassiveUsage 的写事务；未命中由其事务内
+// 探测兜底（防 TOCTOU）。
 func (s *Store) FindDuplicateExecutor(ctx context.Context, models []string, near time.Time, latencyMS int64) (string, bool, error) {
-	if len(normalizeModels(models)) == 0 {
-		return "", false, nil
-	}
-	frag, margs := modelMatchFragment(models)
-	args := make([]any, 0, len(margs)+5)
-	args = append(args, margs...)
-	args = append(args, latencyMS-dupLatencyWindow, latencyMS+dupLatencyWindow,
-		near.Add(-dupTSWindow).UnixMilli(), near.Add(dupTSWindow).UnixMilli(),
-		near.UnixMilli())
-	var id string
+	var (
+		id    string
+		found bool
+	)
 	err := s.Read(ctx, func(q Querier) error {
-		return q.QueryRowContext(ctx,
-			`SELECT id FROM requests
-			 WHERE key_id <> '' AND `+frag+`
-			   AND latency_ms BETWEEN ? AND ?
-			   AND ts BETWEEN ? AND ?
-			 ORDER BY ABS(ts - ?) LIMIT 1`, args...).Scan(&id)
+		twin, ok, err := duplicateProbeTx(ctx, q, models, near, latencyMS, true)
+		if err != nil || !ok {
+			return err
+		}
+		id, found = twin.ID, true
+		return nil
 	})
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", false, nil
-		}
 		return "", false, err
 	}
-	return id, true, nil
+	return id, found, nil
 }
 
 // BackfillRequestUsageByID 按 ID 回填宿主上报的用量明细（含首字延迟兜底）。
 func (s *Store) BackfillRequestUsageByID(ctx context.Context, id string, b UsageBackfill) error {
 	return s.Write(ctx, func(tx *sql.Tx) error {
-		return backfillRequestTx(ctx, tx, id, b)
+		return backfillRequestTx(ctx, tx, s, id, b)
 	})
 }
 
-// ReconcileRequestDuplicates 落库后对账，消除执行器/被动双写竞态。
-//
-// 同一请求可能触发两次落库（执行器结算与宿主 usage.handle），两者几乎同时发生，
-// 「先查后插」的判重存在窗口。这里以 anchor 行为起点找另一口径的重复行
-// （key_id 空否相反 + 模型候选匹配 + 延迟±dupLatencyWindow + 时间±dupTSWindow）：
-// 保留 key_id 非空的执行器行，把被动行的零值字段（token 明细、首字延迟、
-// provider/source/auth/tier 展示信息）合并进去，删除被动行，
-// 并从分钟聚合中扣减被动行的贡献。返回是否发生合并。
-func (s *Store) ReconcileRequestDuplicates(ctx context.Context, anchorID string) (bool, error) {
-	merged := false
-	err := s.Write(ctx, func(tx *sql.Tx) error {
-		anchor, e := loadRequestTx(ctx, tx, anchorID)
-		if e != nil {
-			return e
+// duplicateProbeTx 在写事务内按双写判重谓词查找另一口径的重复行。
+// executorRow=true 找执行器行（key_id<>”），false 找被动行（key_id=”）。
+// 单写者串行化保证「事务内探测→插入」原子成立：两个写入方必然一先一后
+// 提交，后者一定能看到前者已提交的行——这是入库时防重（替代事后对账）的根基。
+func duplicateProbeTx(ctx context.Context, q Querier, models []string, near time.Time, latencyMS int64, executorRow bool) (Request, bool, error) {
+	models = normalizeModels(models)
+	if len(models) == 0 {
+		return Request{}, false, nil
+	}
+	frag, margs := modelMatchFragment(models)
+	keyCond := `key_id = ''`
+	if executorRow {
+		keyCond = `key_id <> ''`
+	}
+	args := make([]any, 0, len(margs)+5)
+	args = append(args, margs...)
+	args = append(args, latencyMS-dupLatencyWindow, latencyMS+dupLatencyWindow,
+		near.Add(-dupTSWindow).UnixMilli(), near.Add(dupTSWindow).UnixMilli(),
+		near.UnixMilli())
+	r, err := scanRequest(q.QueryRowContext(ctx,
+		`SELECT `+requestColumns+` FROM requests
+		 WHERE `+keyCond+` AND `+frag+`
+		   AND latency_ms BETWEEN ? AND ?
+		   AND ts BETWEEN ? AND ?
+		 ORDER BY ABS(ts - ?) LIMIT 1`, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Request{}, false, nil
+	}
+	if err != nil {
+		return Request{}, false, err
+	}
+	return r, true, nil
+}
+
+// PassiveDedupeHint 携带被动入库时的事务内双查参数。
+type PassiveDedupeHint struct {
+	// Models 是宿主上报的模型候选（别名/原始名/裸名）。
+	Models []string
+	// Near 与 LatencyMS 是宿主观测的请求时刻与延迟。
+	Near      time.Time
+	LatencyMS int64
+}
+
+// RecordPassiveUsage 是被动统计路径（宿主 usage.handle 兜底）的入库入口：
+// 在同一写事务内先探测执行器行，命中则把本条字段并入该行（只补零值），
+// 不再插入新行——双写重复在入库时即被消除，任何时刻都不可见重复行；
+// 未命中才正常落库。
+func (s *Store) RecordPassiveUsage(ctx context.Context, r Request, dup PassiveDedupeHint) error {
+	if r.ID == "" {
+		return fmt.Errorf("请求记录缺少 id")
+	}
+	if r.TS.IsZero() {
+		r.TS = time.Now().UTC()
+	}
+	if dup.Near.IsZero() {
+		dup.Near = r.TS
+	}
+	return s.Write(ctx, func(tx *sql.Tx) error {
+		twin, found, err := duplicateProbeTx(ctx, tx, dup.Models, dup.Near, dup.LatencyMS, true)
+		if err != nil {
+			return err
 		}
-		frag, margs := modelMatchFragment(modelCandidatesOf(anchor.Model))
-		keyCond := `key_id = ''`
-		if anchor.KeyID == "" {
-			keyCond = `key_id <> ''`
+		if found {
+			return absorbIntoExecutorTx(ctx, tx, s, twin, r)
 		}
-		args := make([]any, 0, len(margs)+5)
-		args = append(args, anchorID)
-		args = append(args, margs...)
-		args = append(args, anchor.LatencyMS-dupLatencyWindow, anchor.LatencyMS+dupLatencyWindow,
-			anchor.TS.Add(-dupTSWindow).UnixMilli(), anchor.TS.Add(dupTSWindow).UnixMilli(),
-			anchor.TS.UnixMilli())
-		row := tx.QueryRowContext(ctx,
-			`SELECT `+requestColumns+` FROM requests
-			 WHERE id <> ? AND `+keyCond+` AND `+frag+`
-			   AND latency_ms BETWEEN ? AND ?
-			   AND ts BETWEEN ? AND ?
-			 ORDER BY ABS(ts - ?) LIMIT 1`, args...)
-		other, e := scanRequest(row)
-		if errors.Is(e, sql.ErrNoRows) {
+		err = insertRequestTx(ctx, s, tx, r)
+		if errors.Is(err, errDuplicateRequest) {
+			// 宿主重复回调同一请求：已入库，聚合不再累加，整体视为成功。
 			return nil
 		}
-		if e != nil {
-			return e
+		if err != nil {
+			return err
 		}
-		keeper, dropee := anchor, other
-		if keeper.KeyID == "" {
-			keeper, dropee = dropee, keeper
-		}
-		if e := mergeRequestPairTx(ctx, tx, keeper, dropee); e != nil {
-			return e
-		}
-		merged = true
-		return nil
+		return upsertRollupTx(ctx, s, tx, r)
 	})
-	if err != nil {
-		return false, err
+}
+
+// absorbIntoExecutorTx 把尚未落库的被动记录并入已存在的执行器行：
+// 只补 keeper 的零值/空值字段并把这些增量回补到其分钟聚合。
+// 被动行从未插入，因此无需删除行或扣减聚合；费用不参与合并
+// （执行器行的结算金额已入 Key 账本，改写会破坏明细与账本一致）。
+func absorbIntoExecutorTx(ctx context.Context, tx *sql.Tx, s *Store, keeper Request, drop Request) error {
+	delta := UsageBackfill{
+		InputTokens:         pickZero(keeper.InputTokens, drop.InputTokens),
+		OutputTokens:        pickZero(keeper.OutputTokens, drop.OutputTokens),
+		ReasoningTokens:     pickZero(keeper.ReasoningTokens, drop.ReasoningTokens),
+		CachedTokens:        pickZero(keeper.CachedTokens, drop.CachedTokens),
+		CacheReadTokens:     pickZero(keeper.CacheReadTokens, drop.CacheReadTokens),
+		CacheCreationTokens: pickZero(keeper.CacheCreationTokens, drop.CacheCreationTokens),
+		TotalTokens:         pickZero(keeper.TotalTokens, drop.TotalTokens),
 	}
-	return merged, nil
+	if keeper.TTFTMS == 0 && drop.TTFTMS > 0 {
+		delta.TTFTMS = drop.TTFTMS
+	}
+	if err := fillKeeperZeroTx(ctx, tx, s, drop, keeper.ID); err != nil {
+		return err
+	}
+	return addRollupDeltaTx(ctx, tx, s, keeper, delta)
 }
 
 // mergeRequestPairTx 把 dropee 行并入 keeper 行：仅补 keeper 的零值/空值字段，
@@ -329,7 +367,7 @@ func (s *Store) ReconcileRequestDuplicates(ctx context.Context, anchorID string)
 //
 // 费用不参与合并：执行器行的 cost_micro_usd 已按结算金额记入 Key 账本，
 // 改写会造成明细与账本口径不一致。
-func mergeRequestPairTx(ctx context.Context, tx *sql.Tx, keeper, dropee Request) error {
+func mergeRequestPairTx(ctx context.Context, tx *sql.Tx, s *Store, keeper, dropee Request) error {
 	delta := UsageBackfill{
 		InputTokens:         pickZero(keeper.InputTokens, dropee.InputTokens),
 		OutputTokens:        pickZero(keeper.OutputTokens, dropee.OutputTokens),
@@ -342,7 +380,22 @@ func mergeRequestPairTx(ctx context.Context, tx *sql.Tx, keeper, dropee Request)
 	if keeper.TTFTMS == 0 && dropee.TTFTMS > 0 {
 		delta.TTFTMS = dropee.TTFTMS
 	}
-	if _, err := tx.ExecContext(ctx,
+	if err := fillKeeperZeroTx(ctx, tx, s, dropee, keeper.ID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM requests WHERE id = ?`, dropee.ID); err != nil {
+		return fmt.Errorf("删除重复请求 %s 失败: %w", dropee.ID, err)
+	}
+	if err := subtractRollupTx(ctx, tx, s, dropee); err != nil {
+		return err
+	}
+	return addRollupDeltaTx(ctx, tx, s, keeper, delta)
+}
+
+// fillKeeperZeroTx 把 d 行的非空展示/用量字段补进 keeper 行的空缺位。
+// 被 mergeRequestPairTx（行已在库）与 absorbIntoExecutorTx（行未入库）共享。
+func fillKeeperZeroTx(ctx context.Context, tx *sql.Tx, s *Store, d Request, keeperID string) error {
+	_, err := s.execHotTx(ctx, tx,
 		`UPDATE requests SET
 		    input_tokens         = CASE WHEN input_tokens = 0         THEN ? ELSE input_tokens END,
 		    output_tokens        = CASE WHEN output_tokens = 0        THEN ? ELSE output_tokens END,
@@ -357,20 +410,15 @@ func mergeRequestPairTx(ctx context.Context, tx *sql.Tx, keeper, dropee Request)
 		    auth_type            = CASE WHEN auth_type = ''           THEN ? ELSE auth_type END,
 		    tier                 = CASE WHEN tier = ''                THEN ? ELSE tier END
 		 WHERE id = ?`,
-		dropee.InputTokens, dropee.OutputTokens, dropee.ReasoningTokens,
-		dropee.CachedTokens, dropee.CacheReadTokens, dropee.CacheCreationTokens,
-		dropee.TotalTokens, dropee.TTFTMS,
-		dropee.Provider, dropee.Source, dropee.AuthType, dropee.Tier,
-		keeper.ID); err != nil {
+		d.InputTokens, d.OutputTokens, d.ReasoningTokens,
+		d.CachedTokens, d.CacheReadTokens, d.CacheCreationTokens,
+		d.TotalTokens, d.TTFTMS,
+		d.Provider, d.Source, d.AuthType, d.Tier,
+		keeperID)
+	if err != nil {
 		return fmt.Errorf("合并重复请求失败: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM requests WHERE id = ?`, dropee.ID); err != nil {
-		return fmt.Errorf("删除重复请求 %s 失败: %w", dropee.ID, err)
-	}
-	if err := subtractRollupTx(ctx, tx, dropee); err != nil {
-		return err
-	}
-	return addRollupDeltaTx(ctx, tx, keeper, delta)
+	return nil
 }
 
 // dedupePairSQL 自连接找出「执行器行 a + 被动行 b」的历史重复对。
@@ -449,7 +497,7 @@ func (s *Store) dedupeBatch(ctx context.Context, sinceMS int64, limit int) (int,
 			if err != nil {
 				return err
 			}
-			if err := mergeRequestPairTx(ctx, tx, keeper, dropee); err != nil {
+			if err := mergeRequestPairTx(ctx, tx, s, keeper, dropee); err != nil {
 				return err
 			}
 			merged++
@@ -468,7 +516,7 @@ func pickZero(target, fill int64) int64 {
 }
 
 // addRollupDeltaTx 把合并进请求行的字段增量回补到该行的分钟聚合。
-func addRollupDeltaTx(ctx context.Context, tx *sql.Tx, r Request, d UsageBackfill) error {
+func addRollupDeltaTx(ctx context.Context, tx *sql.Tx, s *Store, r Request, d UsageBackfill) error {
 	if d.InputTokens == 0 && d.OutputTokens == 0 && d.ReasoningTokens == 0 &&
 		d.CachedTokens == 0 && d.CacheReadTokens == 0 && d.CacheCreationTokens == 0 &&
 		d.TotalTokens == 0 && d.TTFTMS == 0 {
@@ -478,7 +526,7 @@ func addRollupDeltaTx(ctx context.Context, tx *sql.Tx, r Request, d UsageBackfil
 	if d.TTFTMS > 0 {
 		ttftCount = 1
 	}
-	_, err := tx.ExecContext(ctx,
+	_, err := s.execHotTx(ctx, tx,
 		`UPDATE usage_rollups SET
 		    input_tokens = input_tokens + ?, output_tokens = output_tokens + ?,
 		    reasoning_tokens = reasoning_tokens + ?, cached_tokens = cached_tokens + ?,
@@ -516,7 +564,7 @@ func loadRequestTx(ctx context.Context, tx *sql.Tx, id string) (Request, error) 
 }
 
 // subtractRollupTx 从分钟聚合中扣减一条请求的贡献；计数归零则删除该聚合行。
-func subtractRollupTx(ctx context.Context, tx *sql.Tx, r Request) error {
+func subtractRollupTx(ctx context.Context, tx *sql.Tx, s *Store, r Request) error {
 	if r.Result == "" {
 		r.Result = ResultOK
 	}
@@ -554,8 +602,8 @@ func subtractRollupTx(ctx context.Context, tx *sql.Tx, r Request) error {
 	return nil
 }
 
-func backfillRequestTx(ctx context.Context, tx *sql.Tx, id string, b UsageBackfill) error {
-	_, err := tx.ExecContext(ctx,
+func backfillRequestTx(ctx context.Context, tx *sql.Tx, s *Store, id string, b UsageBackfill) error {
+	_, err := s.execHotTx(ctx, tx,
 		`UPDATE requests SET
 		    input_tokens = ?, output_tokens = ?, reasoning_tokens = ?,
 		    cached_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?,

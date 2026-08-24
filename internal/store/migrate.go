@@ -8,7 +8,7 @@ import (
 
 // SchemaVersion 是本代码期望的数据库 schema 版本。
 // 打开库时若发现库版本更高，说明是被更新版插件写过的库，拒绝降级使用。
-const SchemaVersion = 6
+const SchemaVersion = 7
 
 // migration 是一次版本化迁移。
 type migration struct {
@@ -271,7 +271,7 @@ var migrations = []migration{
 			// costForRule 只用 输入/输出/缓存读/缓存写 四档：推理 token 由
 			// Billable() 并入输出按输出价计，cached 并入缓存读按缓存读价计。
 			// price_reasoning / price_cached 填了永远不生效，留着会误导配置者。
-				`ALTER TABLE pricing_rules DROP COLUMN price_reasoning`,
+			`ALTER TABLE pricing_rules DROP COLUMN price_reasoning`,
 			`ALTER TABLE pricing_rules DROP COLUMN price_cached`,
 		},
 	},
@@ -342,6 +342,20 @@ var migrations = []migration{
 			// 组合索引让「失败请求分析」「按渠道过滤」直接走索引范围扫描。
 			`CREATE INDEX idx_requests_result_ts ON requests(result, ts DESC)`,
 			`CREATE INDEX idx_requests_provider_ts ON requests(provider, ts DESC)`,
+		},
+	},
+	{
+		version: 7,
+		name:    "quota_caller_indexes",
+		stmts: []string{
+			// ---- caller_scope 额度判定的专用索引 ----
+			// caller 归属模式下，预占事务按 caller 维度聚合在途预占：
+			// 并发 COUNT(*) 与 held/token 四档 SUM 均过滤 status='held' AND caller_id=?，
+			// 此前只有 (key_id,status) 索引，caller 查询只能走 held 部分索引后逐行过滤。
+			`CREATE INDEX idx_reservations_caller_status ON reservations(caller_id, status)`,
+			// FindKeyByCallerScope 按 caller_scope 等值 + created_at DESC 取一条，
+			// 无索引时是全表排序；Key 数多时鉴权路径每次都付这个代价。
+			`CREATE INDEX idx_plugin_keys_scope_created ON plugin_keys(caller_scope, created_at)`,
 		},
 	},
 }

@@ -27,7 +27,7 @@ func TestManagementAuthConsoleAndNoStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc := service.New(st, c, ps)
-	api := New(svc, st, "secret")
+	api := New(svc, st, Options{ManagementKey: "secret", CompressionEnabled: true})
 	r := httptest.NewRequest("GET", "/v0/management/plugins/cpa-usage-manager/health", nil)
 	w := httptest.NewRecorder()
 	api.Handler().ServeHTTP(w, r)

@@ -17,8 +17,10 @@ var consoleCSS []byte
 var consoleJS []byte
 
 var (
-	gzOnce  sync.Once
-	gzipped []byte
+	plainOnce sync.Once
+	plain     []byte
+	gzOnce    sync.Once
+	gzipped   []byte
 )
 
 // assemble 把 CSS / JS 注入 HTML 壳的占位符，产出自包含的单文件面板。
@@ -34,9 +36,11 @@ func assemble() []byte {
 // 界面语言为简体中文（应需求取消多语言）。图表使用内联 SVG 渲染，无外部依赖，
 // 保证 /console 在隔离环境亦可运行。
 //
-// 组装结果不常驻：现代客户端都走 ConsoleHTMLGzip 的预压缩路径，
-// 这条明文路径只在极端环境被触发，不值得为此多驻留一份 ~224KB。
-func ConsoleHTML() []byte { return assemble() }
+// 组装结果首次调用后常驻：构建期注入的内容进程内不变，缓存与 gzip 路径对称。
+func ConsoleHTML() []byte {
+	plainOnce.Do(func() { plain = assemble() })
+	return plain
+}
 
 // ConsoleHTMLGzip 返回预压缩的面板字节，供支持 gzip 的客户端直接输出。
 // 压缩在首次调用时做一次并常驻；调用方须自行设置 Content-Encoding: gzip。

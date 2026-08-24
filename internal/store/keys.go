@@ -257,16 +257,19 @@ func (s *Store) FindKeyByCallerScope(ctx context.Context, scope string) (PluginK
 // KeyFilter 是列出 Key 的筛选条件。
 type KeyFilter struct {
 	CallerID string
-	// OnlyActive 为 true 时只返回启用且未撤销的 Key。
+	// OnlyActive 为 true 时只返回启用且未撤销的 Key（旧口径，等价 Status=="active"）。
 	OnlyActive bool
+	// Status 按 keyStatus 语义过滤：active/disabled/revoked/expired；空为不过滤。
+	Status string
 	// Search 对 kid / label / principal 做子串匹配。
 	Search string
 	Limit  int
 	Offset int
 }
 
-// ListKeys 按条件列出 Key，返回结果与匹配总数。
-func (s *Store) ListKeys(ctx context.Context, f KeyFilter) ([]PluginKey, int64, error) {
+// keyFilterWhere 组装 caller/search/status 三类过滤条件。
+// nowMS 仅被 active/expired 分支使用，调用方统一取同一时刻保证两处一致。
+func keyFilterWhere(f KeyFilter, nowMS int64) ([]string, []any) {
 	var where []string
 	var args []any
 	if f.CallerID != "" {
@@ -274,13 +277,34 @@ func (s *Store) ListKeys(ctx context.Context, f KeyFilter) ([]PluginKey, int64, 
 		args = append(args, f.CallerID)
 	}
 	if f.OnlyActive {
+		// 旧口径：只看 enabled/revoked，不看 expires——通知扫描靠它发现
+		// 「已过期但形式上启用」的 Key 来发告警，不能并入下面的 active。
 		where = append(where, `enabled = 1 AND revoked_at IS NULL`)
+	}
+	switch f.Status {
+	case "active":
+		where = append(where, `enabled = 1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`)
+		args = append(args, nowMS)
+	case "disabled":
+		where = append(where, `enabled = 0 AND revoked_at IS NULL`)
+	case "revoked":
+		where = append(where, `revoked_at IS NOT NULL`)
+	case "expired":
+		where = append(where, `enabled = 1 AND revoked_at IS NULL AND expires_at IS NOT NULL AND expires_at <= ?`)
+		args = append(args, nowMS)
 	}
 	if t := strings.TrimSpace(f.Search); t != "" {
 		where = append(where, `(kid LIKE ? OR label LIKE ? OR principal LIKE ?)`)
 		pat := "%" + t + "%"
 		args = append(args, pat, pat, pat)
 	}
+	return where, args
+}
+
+// ListKeys 按条件列出 Key，返回结果与匹配总数。
+func (s *Store) ListKeys(ctx context.Context, f KeyFilter) ([]PluginKey, int64, error) {
+	nowMS := time.Now().UTC().UnixMilli()
+	where, args := keyFilterWhere(f, nowMS)
 	clause := ""
 	if len(where) > 0 {
 		clause = " WHERE " + strings.Join(where, " AND ")
@@ -319,6 +343,32 @@ func (s *Store) ListKeys(ctx context.Context, f KeyFilter) ([]PluginKey, int64, 
 		return nil, 0, err
 	}
 	return out, total, nil
+}
+
+// CountKeysByStatus 按四种 keyStatus 统计 Key 数量（只受 caller/search 过滤，
+// 不受 status/paging 影响），供面板在服务端分页后仍能展示全量状态徽标。
+func (s *Store) CountKeysByStatus(ctx context.Context, f KeyFilter) (map[string]int64, error) {
+	nowMS := time.Now().UTC().UnixMilli()
+	where, args := keyFilterWhere(KeyFilter{CallerID: f.CallerID, Search: f.Search}, nowMS)
+	clause := ""
+	if len(where) > 0 {
+		clause = " WHERE " + strings.Join(where, " AND ")
+	}
+	q := `SELECT
+		COALESCE(SUM(CASE WHEN enabled = 1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?) THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN enabled = 0 AND revoked_at IS NULL THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN revoked_at IS NOT NULL THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN enabled = 1 AND revoked_at IS NULL AND expires_at IS NOT NULL AND expires_at <= ? THEN 1 ELSE 0 END),0)
+		FROM plugin_keys` + clause
+	var active, disabled, revoked, expired int64
+	err := s.Read(ctx, func(qr Querier) error {
+		return qr.QueryRowContext(ctx, q, append([]any{nowMS, nowMS}, args...)...).
+			Scan(&active, &disabled, &revoked, &expired)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("统计 Key 状态失败: %w", err)
+	}
+	return map[string]int64{"active": active, "disabled": disabled, "revoked": revoked, "expired": expired}, nil
 }
 
 // KeyUpdate 是对 Key 的部分更新。nil 字段表示不改动。
@@ -521,15 +571,30 @@ func (s *Store) RotateKeyMaterial(ctx context.Context, kid string, hash, encrypt
 	})
 }
 
-// TouchKeyLastUsed 更新 Key 的最近使用时间。
-// 这是鉴权热路径上的写操作，失败不应影响鉴权结果，由调用方决定是否忽略错误。
-func (s *Store) TouchKeyLastUsed(ctx context.Context, kid string, at time.Time) error {
+// TouchKeysLastUsed 在单个写事务里批量更新多个 Key 的最近使用时间。
+// 鉴权热路径经服务层挂起表聚合后调用：每心跳周期最多一个写事务，
+// 替代此前每次鉴权一个。失败不影响调用方语义，由上层忽略。
+func (s *Store) TouchKeysLastUsed(ctx context.Context, touches map[string]int64) error {
+	if len(touches) == 0 {
+		return nil
+	}
 	return s.Write(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx,
-			`UPDATE plugin_keys SET last_used_at = ? WHERE kid = ?`,
-			at.UTC().UnixMilli(), kid)
-		if err != nil {
-			return fmt.Errorf("更新 Key %q 使用时间失败: %w", kid, err)
+		kids := make([]string, 0, len(touches))
+		var cases strings.Builder
+		args := make([]any, 0, len(touches)*2)
+		for kid, ms := range touches {
+			kids = append(kids, kid)
+			cases.WriteString(` WHEN kid = ? THEN ?`)
+			args = append(args, kid, ms)
+		}
+		for _, kid := range kids {
+			args = append(args, kid)
+		}
+		q := `UPDATE plugin_keys SET last_used_at = CASE` + cases.String() +
+			` ELSE last_used_at END WHERE kid IN (` +
+			strings.Repeat("?,", len(kids)-1) + `?)`
+		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("批量更新 Key 使用时间失败: %w", err)
 		}
 		return nil
 	})

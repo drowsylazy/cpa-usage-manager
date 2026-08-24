@@ -23,10 +23,32 @@ type API struct {
 	managementKey string
 	mux           *http.ServeMux
 	paths         []string // base 之下已注册的管理路径后缀，供 Paths 比对宿主声明表
+
+	// compression / minCompress 来自 response_compression 与
+	// response_compression_min_bytes 配置：false 时全部明文输出；
+	// 阈值以下的小响应跳过压缩（见 lazyGzipWriter）。
+	compression bool
+	minCompress int
 }
 
-func New(svc *service.Service, st *store.Store, managementKey string) *API {
-	a := &API{svc: svc, st: st, managementKey: managementKey, mux: http.NewServeMux()}
+// Options 是 httpapi 的构造参数。
+type Options struct {
+	ManagementKey string
+	// CompressionEnabled 对应 response_compression。
+	CompressionEnabled bool
+	// CompressionMinBytes 是触发 gzip 的最小字节数；<=0 表示不设阈值。
+	CompressionMinBytes int
+}
+
+func New(svc *service.Service, st *store.Store, opts Options) *API {
+	a := &API{
+		svc:           svc,
+		st:            st,
+		managementKey: opts.ManagementKey,
+		compression:   opts.CompressionEnabled,
+		minCompress:   opts.CompressionMinBytes,
+		mux:           http.NewServeMux(),
+	}
 	a.register()
 	return a
 }
@@ -138,7 +160,7 @@ var gzipWriters = sync.Pool{New: func() any { return gzip.NewWriter(nil) }}
 
 func (a *API) gzip(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") || isBinaryPath(r.URL.Path) || isSelfEncoded(r.URL.Path) {
+		if !a.compression || !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") || isBinaryPath(r.URL.Path) || isSelfEncoded(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -148,9 +170,58 @@ func (a *API) gzip(next http.Handler) http.Handler {
 			_ = gw.Close()
 			gzipWriters.Put(gw)
 		}()
-		w.Header().Set("Content-Encoding", "gzip")
-		next.ServeHTTP(&gzipResponseWriter{ResponseWriter: w, Writer: gw}, r)
+		var lw lazyGzipWriter
+		lw.ResponseWriter = w
+		lw.gw = gw
+		lw.min = a.minCompress
+		next.ServeHTTP(&lw, r)
+		// 处理器可能只 WriteHeader 不写 body（空响应），补发延迟的状态行。
+		lw.writeHeaderOnce()
 	})
+}
+
+// lazyGzipWriter 把「是否压缩」的决策推迟到首个 body 字节：管理接口都经 jsonOut
+// 单次 Encode 输出，首写长度即最终长度——低于阈值的 JSON 由此省掉压缩 CPU，
+// 也避免越压越大的反转。多次分片写入时按首片判定（当前无此形态的处理器）。
+type lazyGzipWriter struct {
+	http.ResponseWriter
+	gw    *gzip.Writer
+	min   int
+	code  int
+	wrote bool
+	useGz bool
+}
+
+func (w *lazyGzipWriter) WriteHeader(code int) {
+	// 只记录不发送：Content-Encoding 必须在状态行之前落定。
+	if !w.wrote {
+		w.code = code
+	}
+}
+
+func (w *lazyGzipWriter) writeHeaderOnce() {
+	if w.wrote {
+		return
+	}
+	w.wrote = true
+	if w.code == 0 {
+		w.code = http.StatusOK
+	}
+	if w.useGz {
+		w.Header().Set("Content-Encoding", "gzip")
+	}
+	w.ResponseWriter.WriteHeader(w.code)
+}
+
+func (w *lazyGzipWriter) Write(p []byte) (int, error) {
+	if !w.wrote {
+		w.useGz = w.min <= 0 || len(p) >= w.min
+	}
+	w.writeHeaderOnce()
+	if w.useGz {
+		return w.gw.Write(p)
+	}
+	return w.ResponseWriter.Write(p)
 }
 
 // isBinaryPath 报告路径是否属于二进制下载类接口，gzip 中介件应放行原样输出。
@@ -159,12 +230,6 @@ func isBinaryPath(p string) bool {
 		strings.HasSuffix(p, "/export/csv") || strings.HasSuffix(p, "/export/png")
 }
 
-type gzipResponseWriter struct {
-	http.ResponseWriter
-	Writer *gzip.Writer
-}
-
-func (w *gzipResponseWriter) Write(b []byte) (int, error) { return w.Writer.Write(b) }
 func jsonOut(w http.ResponseWriter, v any, status int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -252,12 +317,19 @@ func (a *API) keys(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(405)
 		return
 	}
-	items, total, e := a.st.ListKeys(r.Context(), store.KeyFilter{CallerID: r.URL.Query().Get("caller_id"), Search: r.URL.Query().Get("search"), Limit: atoi(r.URL.Query().Get("limit")), Offset: atoi(r.URL.Query().Get("offset"))})
+	q := r.URL.Query()
+	items, total, e := a.st.ListKeys(r.Context(), store.KeyFilter{CallerID: q.Get("caller_id"), Search: q.Get("search"), Status: q.Get("status"), Limit: atoi(q.Get("limit")), Offset: atoi(q.Get("offset"))})
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 500)
 		return
 	}
-	jsonOut(w, map[string]any{"items": items, "total": total}, 200)
+	// 状态计数不受 status/分页影响：前端真分页后徽标与「共 N 枚」仍拿得到全量口径。
+	counts, e := a.st.CountKeysByStatus(r.Context(), store.KeyFilter{CallerID: q.Get("caller_id"), Search: q.Get("search")})
+	if e != nil {
+		jsonOut(w, map[string]string{"error": e.Error()}, 500)
+		return
+	}
+	jsonOut(w, map[string]any{"items": items, "total": total, "status_counts": counts}, 200)
 }
 func (a *API) issue(w http.ResponseWriter, r *http.Request) {
 	var in service.IssueRequest

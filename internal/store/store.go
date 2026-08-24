@@ -29,8 +29,9 @@ const (
 	driverName = "sqlite"
 
 	// maxReadConns 是读连接池上限。WAL 下读不阻塞写。
+	// 本插件唯一读方是单用户管理面板，读并发极低；页缓存预算见 buildDSN。
 	// 实际打开上限多 1，用于常驻锚定连接（见 Store.anchor）。
-	maxReadConns = 8
+	maxReadConns = 4
 
 	// retryAttempts 是瞬时故障（磁盘 I/O、忙锁、临时文件打不开）的总尝试次数。
 	retryAttempts = 5
@@ -158,6 +159,16 @@ type Store struct {
 	onPricingChanged func()
 }
 
+// execHotTx 是写事务语句执行的统一收口（热路径语句都经它执行）。
+//
+// 曾在此接入跨事务的预编译缓存，实测否决：database/sql 的 tx.Stmt 绑定
+// 对 modernc 驱动仍会逐次重编译，收益为零；而惰性 Prepare 更会与单写
+// 连接池自锁——事务占用唯一连接时，PrepareContext 取不到空闲连接直接
+// 挂死。收口保留为未来绕过 database/sql 直连驱动时的唯一改动点。
+func (s *Store) execHotTx(ctx context.Context, tx *sql.Tx, query string, args ...any) (sql.Result, error) {
+	return tx.ExecContext(ctx, query, args...)
+}
+
 // Open 打开（必要时创建并迁移）数据库。
 func Open(ctx context.Context, opts Options) (*Store, error) {
 	if strings.TrimSpace(opts.Path) == "" {
@@ -271,12 +282,13 @@ func buildDSN(opts Options, write bool) string {
 		// 放宽 WAL 自动 checkpoint 阈值（默认 1000 页 ≈ 4MB）：每分钟心跳与
 		// 结算写入下，默认值会让 checkpoint 停顿更频繁地打断写事务。
 		q.Add("_pragma", "wal_autocheckpoint(4000)")
+		// 兜底限制 -wal 文件尺寸：checkpoint 长期无法推进时防止磁盘占用失控。
+		q.Add("_pragma", "journal_size_limit(67108864)")
 	} else {
 		q.Add("_pragma", "query_only(1)")
-		// 8MiB 页缓存/连接。cache_size 是**每连接**的：读池共 9 条连接，
-		// 上调到 32MiB 会带来最坏 288MB 的常驻水位，对本插件（跑在宿主
-		// 进程内）不可接受；8MiB 下趋势/维度聚合的热页命中已足够。
-		q.Add("_pragma", "cache_size(-8000)")
+		// 2MiB 页缓存/连接。cache_size 是**每连接**的：管理面读并发极低，
+		// 冷页有操作系统文件缓存兜底；把常驻内存预算让给宿主进程。
+		q.Add("_pragma", "cache_size(-2000)")
 	}
 	if opts.ReadOnly {
 		q.Set("mode", "ro")

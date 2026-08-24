@@ -95,15 +95,19 @@ executor.execute(_stream) / request_interceptor
 usage.handle(record)
   → claimHostUsage(record)                     按模型名匹配（同 kid 优先，其次 FIFO）
       命中 → 交给该请求，**不写行**；若该请求已落库则回填 token/首字延迟
-      未命中 → 走被动写入（跨进程/迟到回调的兜底，仍做落库后对账）
+      未命中 → 走被动写入（跨进程/迟到回调的兜底），事务内先探测执行器行，
+                命中即合并、不再插行（入库时防重）
 结算
   → 落库前合并宿主展示字段（provider/auth_type/tier，属聚合主键，只能落库前写）
   → 落库后仅回填 token 与首字延迟
   → claim.release(8s 宽限)                     容忍宿主稍晚回调
 ```
 
-写行的路径始终只有一条：认领命中即被动侧不写。数据库层的
-`ReconcileRequestDuplicates` / `DedupeRequests` 退居兜底，处理跨进程或超出宽限期的回调。
+写行的路径始终只有一条：认领命中即被动侧不写。双写残余竞态由**入库时防重**
+消除——单写者串行化保证两侧事务一先一后提交，后者的事务内探测必然看到前者的行：
+被动侧 `RecordPassiveUsage` 与执行器侧 `SettleReservation` 都在同一写事务内
+探测并合并另一口径的行，任何时刻库内不可见重复行，事后对账因此取消。
+`DedupeRequests` 仅在 Maintain 中按保留期批量清理历史遗留对。
 
 ### 2.4 读路径
 

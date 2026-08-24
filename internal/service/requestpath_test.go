@@ -136,32 +136,49 @@ func TestBuildReservePlanDisabledRuleFallsBack(t *testing.T) {
 }
 
 func TestEstimateTokens(t *testing.T) {
-	in, out := estimateTokens([]byte(`{"max_completion_tokens":512}`), 4096, 1_000_000)
+	in, out := ParseRequestMeta([]byte(`{"max_completion_tokens":512}`)).tokenEstimates(4096, 1_000_000)
 	if out != 512 {
 		t.Fatalf("max_completion_tokens 未生效: %d", out)
 	}
 	if in != int64(len(`{"max_completion_tokens":512}`))/2+1 {
 		t.Fatalf("input 估算异常: %d", in)
 	}
-	in, out = estimateTokens([]byte(`{}`), 4096, 1_000_000)
+	in, out = ParseRequestMeta([]byte(`{}`)).tokenEstimates(4096, 1_000_000)
 	if out != 4096 {
 		t.Fatalf("默认输出预占异常: %d", out)
 	}
-	in, out = estimateTokens([]byte(`{"max_tokens":1000000000}`), 4096, 10_000)
+	in, out = ParseRequestMeta([]byte(`{"max_tokens":1000000000}`)).tokenEstimates(4096, 10_000)
 	if out != 10_000 {
 		t.Fatalf("输出封顶异常: %d", out)
 	}
 }
 
 func TestExtractImageCount(t *testing.T) {
-	if got := extractImageCount([]byte(`{"n":5}`)); got != 5 {
+	if got := ParseRequestMeta([]byte(`{"n":5}`)).imageCount(); got != 5 {
 		t.Fatalf("n=5 -> %d", got)
 	}
-	if got := extractImageCount([]byte(`{"n":0}`)); got != 1 {
+	if got := ParseRequestMeta([]byte(`{"n":0}`)).imageCount(); got != 1 {
 		t.Fatalf("n=0 -> %d", got)
 	}
-	if got := extractImageCount([]byte(`not-json`)); got != 1 {
+	if got := ParseRequestMeta([]byte(`not-json`)).imageCount(); got != 1 {
 		t.Fatalf("非 JSON -> %d", got)
+	}
+}
+
+func TestRequestMetaTierAndThinking(t *testing.T) {
+	m := ParseRequestMeta([]byte(`{"model":" m ","service_tier":"flex","tier":"ignored","reasoning":{"effort":"high"},"reasoning_effort":"low"}`))
+	if got := m.ResolvedTier; got != "flex" {
+		t.Fatalf("ResolvedTier = %q", got)
+	}
+	if got := m.ResolvedThinking; got != "high" {
+		t.Fatalf("ResolvedThinking = %q", got)
+	}
+	m2 := ParseRequestMeta([]byte(`{"tier":"pro","thinking":{"effort":"medium"}}`))
+	if got := m2.ResolvedTier; got != "pro" {
+		t.Fatalf("ResolvedTier 兜底 = %q", got)
+	}
+	if got := m2.ResolvedThinking; got != "medium" {
+		t.Fatalf("thinking.effort 兜底 = %q", got)
 	}
 }
 

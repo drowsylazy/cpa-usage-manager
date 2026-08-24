@@ -33,7 +33,7 @@ func newTestAPI(t *testing.T) *API {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(service.New(st, c, ps), st, "secret")
+	return New(service.New(st, c, ps), st, Options{ManagementKey: "secret", CompressionEnabled: true})
 }
 
 func do(t *testing.T, a *API, method, path, body string) *httptest.ResponseRecorder {

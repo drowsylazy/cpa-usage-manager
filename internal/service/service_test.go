@@ -152,55 +152,65 @@ func TestFindDuplicateAndBackfillByID(t *testing.T) {
 	}
 }
 
-func TestReconcileRequestDuplicates(t *testing.T) {
+// TestSettleAbsorbsPreexistingPassiveRow 验证结算侧的入库时防重：
+// 宿主回调抢先落库后，执行器结算在同一事务内探测并合并被动行，
+// 库中任何时刻只有一行、聚合守恒。
+func TestSettleAbsorbsPreexistingPassiveRow(t *testing.T) {
 	s, st := testService(t)
 	ctx := context.Background()
-	ts := time.Now().UTC().Add(-2 * time.Second)
-	exec := store.Request{
-		ID: "req-exec", TS: ts, KeyID: "abc123", CallerID: store.DefaultCallerID,
-		Model: "stepfun/step-3.7-flash", Source: "openai", Result: store.ResultOK,
-		LatencyMS: 8844, TTFTMS: 828,
+	issued, err := s.IssueKey(ctx, IssueRequest{CallerID: store.DefaultCallerID, Actor: "admin"})
+	if err != nil {
+		t.Fatal(err)
 	}
+	ts := time.Now().UTC().Add(-2 * time.Second)
+
 	passive := store.Request{
-		ID: "req-passive", TS: ts, CallerID: store.DefaultCallerID,
+		ID: "req-passive-first", TS: ts, CallerID: store.DefaultCallerID,
 		Model: "step-3.7-flash", Provider: "openai-compatible-stepfun",
 		AuthType: "apikey", Tier: "auto", Result: store.ResultOK,
 		InputTokens: 14, OutputTokens: 214, TotalTokens: 228,
 		LatencyMS: 8839, TTFTMS: 826,
 	}
-	if err := st.RecordUsage(ctx, exec); err != nil {
-		t.Fatal(err)
-	}
 	if err := st.RecordUsage(ctx, passive); err != nil {
 		t.Fatal(err)
 	}
-	merged, err := s.ReconcileRequestDuplicates(ctx, passive.ID)
-	if err != nil || !merged {
-		t.Fatalf("对账未合并: merged=%v err=%v", merged, err)
+
+	res, err := s.Reserve(ctx, ReservationRequest{KeyID: issued.KID, CallerID: store.DefaultCallerID, Model: "stepfun/step-3.7-flash", EstimatedTokens: 228, Actor: "quota"})
+	if err != nil {
+		t.Fatal(err)
 	}
+	execReq := &store.Request{
+		ID: "req-exec-late", TS: ts.Add(5 * time.Millisecond), KeyID: issued.KID,
+		CallerID: store.DefaultCallerID, Model: "stepfun/step-3.7-flash",
+		Source: "openai", Result: store.ResultOK, LatencyMS: 8844,
+	}
+	usage := usageparse.Usage{InputTokens: 14, OutputTokens: 214, TotalTokens: 228}
+	if _, err := s.Settle(ctx, res.ID, usage, execReq); err != nil {
+		t.Fatal(err)
+	}
+
 	if _, err := st.GetRequest(ctx, passive.ID); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("被动行应被删除: %v", err)
+		t.Fatalf("被动行应被合并删除: %v", err)
 	}
-	got, err := st.GetRequest(ctx, exec.ID)
+	got, err := st.GetRequest(ctx, execReq.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.InputTokens != 14 || got.OutputTokens != 214 || got.TotalTokens != 228 {
-		t.Fatalf("执行器行应获得回填 token: %+v", got)
+		t.Fatalf("结算行应吸收被动行明细: %+v", got)
 	}
-	if got.TTFTMS != 828 || got.Provider != "openai-compatible-stepfun" || got.Tier != "auto" {
+	if got.Provider != "openai-compatible-stepfun" || got.Tier != "auto" || got.TTFTMS != 826 {
 		t.Fatalf("展示信息合并不符: provider=%q tier=%q ttft=%d", got.Provider, got.Tier, got.TTFTMS)
 	}
-	var reqCount, tokenSum int64
+	var reqCount int64
 	if err := st.Read(ctx, func(q store.Querier) error {
 		return q.QueryRowContext(ctx,
-			`SELECT COALESCE(SUM(req_count),0), COALESCE(SUM(total_tokens),0) FROM usage_rollups`).
-			Scan(&reqCount, &tokenSum)
+			`SELECT COALESCE(SUM(req_count),0) FROM usage_rollups`).Scan(&reqCount)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if reqCount != 1 || tokenSum != 228 {
-		t.Fatalf("聚合未正确扣减: req_count=%d total_tokens=%d", reqCount, tokenSum)
+	if reqCount != 1 {
+		t.Fatalf("聚合请求数应为 1，得到 %d", reqCount)
 	}
 }
 

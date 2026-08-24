@@ -1323,7 +1323,7 @@ window.addEventListener('resize', debounce(() => { if (activeTab === 'overview')
 
 // ---------- 密钥 ----------
 const keysView = {
-  cache: [], filtered: [], page: 0, size: 20, search: '', caller: '', status: '',
+  cache: [], total: 0, statusCounts: {}, page: 0, size: 20, search: '', caller: '', status: '',
   balanceSeq: 0,    // 余额异步响应的竞态守卫：快速切换抽屉对象时丢弃晚到的旧响应
 };
 // keyLabelOf 由 kid 查密钥标签；无标签或缓存未热时返回空串，由调用方决定回落值。
@@ -1333,13 +1333,24 @@ function keyLabelOf(kid) {
 }
 
 loaders.keys = async () => { await refreshKeys(); };
+// 密钥列表走服务端分页：limit/offset/status 都下推到 SQL，避免大基数用户
+// 一次拉上千条。status_counts 由后端附带，徽标与「共 N 枚」仍拿得到全量口径。
 async function refreshKeys() {
-  const q = new URLSearchParams({ limit: '1000' });
+  const q = new URLSearchParams({ limit: String(keysView.size), offset: String(keysView.page * keysView.size) });
   if (keysView.search) q.set('search', keysView.search);
   if (keysView.caller) q.set('caller_id', keysView.caller);
+  if (keysView.status) q.set('status', keysView.status);
   const r = await api('/keys?' + q);
   keysView.cache = r.items || [];
-  applyKeyFilter();
+  keysView.total = r.total || 0;
+  keysView.statusCounts = r.status_counts || {};
+  const pages = Math.max(1, Math.ceil(keysView.total / keysView.size));
+  if (keysView.page >= pages && keysView.page > 0) {
+    keysView.page = pages - 1;
+    return refreshKeys();
+  }
+  renderKeys();
+  updateBadges();
   // 详情 dialog 开着时同步刷新其内容；对象已被删除则关闭。
   const d = $('key-dialog');
   if (d.open && d.dataset.kid) {
@@ -1360,15 +1371,6 @@ const STATUS_META = {
   revoked: { label: '已撤销', pill: 'alarm' },
   expired: { label: '已过期', pill: '' },
 };
-function applyKeyFilter() {
-  keysView.filtered = keysView.status
-    ? keysView.cache.filter(k => keyStatus(k) === keysView.status)
-    : keysView.cache.slice();
-  const pages = Math.max(1, Math.ceil(keysView.filtered.length / keysView.size));
-  if (keysView.page >= pages) keysView.page = pages - 1;
-  renderKeys();
-  updateBadges();
-}
 function cycleKeysNow(d = new Date()) {
   const y = d.getUTCFullYear(), m = d.getUTCMonth(), day = d.getUTCDate();
   const u = new Date(Date.UTC(y, m, day));
@@ -1409,25 +1411,25 @@ function balRow(name, limit, remain, fmt) {
     + '<span class="bal-val mono">余 ' + fmt(Math.max(0, remain)) + ' / ' + fmt(limit) + '</span></div>';
 }
 function renderKeys() {
-  const list = keysView.filtered;
-  const totalAll = keysView.cache.length;
-  $('key-count').textContent = '共 ' + totalAll + ' 枚'
-    + (list.length !== totalAll ? ' · 筛选后 ' + list.length + ' 枚' : '');
-  const start = keysView.page * keysView.size;
-  const rows = list.slice(start, start + keysView.size);
+  // 服务端分页：cache 即当前页，total/status_counts 是筛选后的全量口径。
+  const rows = keysView.cache;
+  const allTotal = Object.values(keysView.statusCounts || {}).reduce((a, b) => a + Number(b) || 0, 0);
+  const filtered = keysView.search || keysView.caller || keysView.status;
+  $('key-count').textContent = '共 ' + allTotal + ' 枚'
+    + (filtered ? ' · 筛选后 ' + keysView.total + ' 枚' : '');
   $('key-rows').innerHTML = rows.map(keyCardHTML).join('')
     || '<div class="empty"><p class="empty-title">没有匹配的密钥</p>'
     + '<p class="empty-hint">调整筛选条件，或点击右上角「签发密钥」</p></div>';
 
-  const pages = Math.max(1, Math.ceil(list.length / keysView.size));
+  const pages = Math.max(1, Math.ceil(keysView.total / keysView.size));
   $('key-pager').innerHTML = '<span class="mono">第 ' + (keysView.page + 1) + ' / ' + pages + ' 页</span>'
     + '<span class="grow"></span>'
     + '<button type="button" class="btn small" id="key-prev"' + (keysView.page <= 0 ? ' disabled' : '') + '>上一页</button>'
     + '<button type="button" class="btn small" id="key-next"'
-    + ((keysView.page + 1) * keysView.size >= list.length ? ' disabled' : '') + '>下一页</button>';
+    + (keysView.page + 1 >= pages ? ' disabled' : '') + '>下一页</button>';
   const prev = $('key-prev'), next = $('key-next');
-  if (prev) prev.onclick = () => { keysView.page--; renderKeys(); };
-  if (next) next.onclick = () => { keysView.page++; renderKeys(); };
+  if (prev) prev.onclick = () => { keysView.page--; refreshKeys().catch(e => toast(e.message, 'err')); };
+  if (next) next.onclick = () => { keysView.page++; refreshKeys().catch(e => toast(e.message, 'err')); };
 }
 
 // usdPick / tokPick 选出卡片余量块展示的那一档：优先总额，其次当前周期
@@ -1659,7 +1661,7 @@ $('key-status-chips').addEventListener('click', e => {
   keysView.status = b.dataset.v;
   keysView.page = 0;
   renderStatusChips();
-  applyKeyFilter();
+  refreshKeys().catch(e2 => toast(e2.message, 'err'));
 });
 renderStatusChips();
 const keyCallerSel = new Select('key-caller', [{ value: '', label: '全部 caller' }], v => {
@@ -1982,6 +1984,8 @@ function fillReqSuggestions() {
       .map(x => ({ value: x.value, label: x.value }))))
     .catch(() => {});
   // 值提交 kid，但标签同时显示 —— datalist 在 Firefox 只显示 value，标签会丢
+  // 注：密钥列表改为服务端分页后，此处候选只覆盖当前页（全量候选需单独轻量
+  // 接口，待产品确认后再加）。
   reqKeyCombo.setOptions(keysView.cache.map(k => ({
     value: k.kid, label: k.label || '(无标签)', sub: k.kid,
   })));
@@ -2066,7 +2070,8 @@ let dimRows = [], dimPage = 0, dimSort = 'cost', dimDir = 'desc';
 const DIM_PAGE_SIZE = 5;
 async function loadDim() {
   const dim = dimSel.value;
-  const r = await api('/usage/dimension?' + new URLSearchParams({ dimension: dim, ...rangeParams() }));
+  // 与概览页口径一致：显式带 limit，后端还有 500 硬上限兜底。
+  const r = await api('/usage/dimension?' + new URLSearchParams({ dimension: dim, limit: '50', ...rangeParams() }));
   dimRows = r.rows || [];
   sortDimRows();
   dimPage = 0;
@@ -2940,7 +2945,8 @@ $('rp-list').addEventListener('click', ev => {
 
 // ---------- 徽标 ----------
 function updateBadges() {
-  const bad = keysView.cache.filter(k => keyStatus(k) !== 'active').length;
+  const sc = keysView.statusCounts || {};
+  const bad = (Number(sc.disabled) || 0) + (Number(sc.revoked) || 0) + (Number(sc.expired) || 0);
   const dot = document.querySelector('[data-badge="keys"]');
   if (dot) { dot.hidden = bad === 0; dot.textContent = bad > 99 ? '99+' : String(bad); }
   const sys = document.querySelector('[data-badge="system"]');

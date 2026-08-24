@@ -37,8 +37,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"runtime"
@@ -605,7 +605,11 @@ func configure(inline string) error {
 	go notifySweepLoop(svc, notifyStop)
 	runtimeState.st = st
 	runtimeState.svc = svc
-	runtimeState.api = httpapi.New(svc, st, os.Getenv("CPA_USAGE_MANAGER_MANAGEMENT_KEY"))
+	runtimeState.api = httpapi.New(svc, st, httpapi.Options{
+		ManagementKey:       os.Getenv("CPA_USAGE_MANAGER_MANAGEMENT_KEY"),
+		CompressionEnabled:  cfg.ResponseCompression,
+		CompressionMinBytes: cfg.ResponseCompressionMinBytes,
+	})
 	runtimeState.cfg = cfg
 	return nil
 }
@@ -896,7 +900,7 @@ func execute(body []byte) ([]byte, error) {
 	// 非流式响应体几乎总带 usage，这里只做非阻塞探测：宿主记账发生在
 	// 本次调用返回之后，同步等待只会白等一个超时。缺失的明细由认领在
 	// 宽限期内按请求 ID 回填。
-	settleReservation(svc, reservation, req, request, startedAt, time.Time{}, completedAt, status, parsed, usageparse.SniffModel(hostBody), claim)
+	settleReservation(svc, plan, reservation, req, startedAt, time.Time{}, completedAt, status, parsed, usageparse.SniffModel(hostBody), claim)
 	return okEnvelope(rpcExecutorResponse{Payload: hostBody, Headers: headers})
 }
 
@@ -984,7 +988,7 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 	}
 	if stream.StatusCode >= 400 {
 		_ = closeHostModelStream(stream.StreamID)
-		settleReservation(svc, reservation, req, request, startedAt, time.Time{}, time.Now(), stream.StatusCode, usageparse.Usage{}, "", claim)
+		settleReservation(svc, plan, reservation, req, startedAt, time.Time{}, time.Now(), stream.StatusCode, usageparse.Usage{}, "", claim)
 		return fmt.Errorf("host model status %d", stream.StatusCode)
 	}
 	if strings.TrimSpace(stream.StreamID) == "" {
@@ -1001,20 +1005,20 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 		if errRead != nil {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), claim)
+			settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), claim)
 			return errRead
 		}
 		var chunk rpcHostModelStreamReadResponse
 		if err := json.Unmarshal(chunkRaw, &chunk); err != nil {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), claim)
+			settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), claim)
 			return err
 		}
 		if chunk.Error != "" {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), claim)
+			settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), claim)
 			return fmt.Errorf("%s", chunk.Error)
 		}
 		if len(chunk.Payload) > 0 {
@@ -1027,7 +1031,7 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 			if err := emitPluginStreamChunk(pluginStreamID, chunk.Payload); err != nil {
 				completedAt = time.Now()
 				parsed, _ := acc.Result()
-				settleReservation(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 499, parsed, acc.Model(), claim)
+				settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 499, parsed, acc.Model(), claim)
 				return err
 			}
 		}
@@ -1044,21 +1048,21 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 	if parsed.IsZero() {
 		if rec, ok := claim.wait(svc.Config().Quota.Settlement.HostUsageWait.Std()); ok {
 			parsed = usageFromRecord(rec)
-			r := buildRequest(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 200)
+			r := buildRequest(svc, reservation, req, plan.Meta, startedAt, firstChunkAt, completedAt, 200)
 			r.UpstreamModel = acc.Model()
 			applyHostUsageToRequest(r, rec)
 			return finishSettle(svc, reservation, r, parsed, claim)
 		}
 	}
-	r := buildRequest(svc, reservation, req, request, startedAt, firstChunkAt, completedAt, 200)
+	r := buildRequest(svc, reservation, req, plan.Meta, startedAt, firstChunkAt, completedAt, 200)
 	r.UpstreamModel = acc.Model()
 	return finishSettle(svc, reservation, r, parsed, claim)
 }
 
 // settleReservation 解析 usage 结算预占并写请求记录；结算失败时释放预占兜底。
 // upstreamModel 是执行器从上游响应里嗅探到的真实模型名（可为空）。
-func settleReservation(svc *service.Service, reservation store.Reservation, req rpcExecutorRequest, body []byte, startedAt, firstChunkAt, completedAt time.Time, status int, usage usageparse.Usage, upstreamModel string, claim *usageClaim) {
-	r := buildRequest(svc, reservation, req, body, startedAt, firstChunkAt, completedAt, status)
+func settleReservation(svc *service.Service, plan service.ReservePlan, reservation store.Reservation, req rpcExecutorRequest, startedAt, firstChunkAt, completedAt time.Time, status int, usage usageparse.Usage, upstreamModel string, claim *usageClaim) {
+	r := buildRequest(svc, reservation, req, plan.Meta, startedAt, firstChunkAt, completedAt, status)
 	r.UpstreamModel = upstreamModel
 	// 认领已在结算前收到宿主口径（少见但可能）：结算前补齐展示字段，
 	// 使请求行与它的分钟聚合维度一致。
@@ -1110,7 +1114,7 @@ func backfillFromHostUsage(svc *service.Service, requestID string, rec rpcUsageR
 	}
 }
 
-func buildRequest(svc *service.Service, reservation store.Reservation, req rpcExecutorRequest, body []byte, startedAt, firstChunkAt, completedAt time.Time, status int) *store.Request {
+func buildRequest(svc *service.Service, reservation store.Reservation, req rpcExecutorRequest, meta service.RequestMeta, startedAt, firstChunkAt, completedAt time.Time, status int) *store.Request {
 	r := &store.Request{
 		ID:                uuid.NewString(),
 		TS:                startedAt,
@@ -1121,8 +1125,8 @@ func buildRequest(svc *service.Service, reservation store.Reservation, req rpcEx
 		Source:            req.SourceFormat,
 		AuthID:            req.AuthID,
 		AuthType:          req.AuthType,
-		Tier:              requestString(body, "service_tier", "tier"),
-		ThinkingIntensity: requestNestedString(body, []string{"reasoning", "effort"}, []string{"thinking", "effort"}, []string{"reasoning_effort"}),
+		Tier:              meta.ResolvedTier,
+		ThinkingIntensity: meta.ResolvedThinking,
 		LatencyMS:         millisBetween(startedAt, completedAt),
 		TTFTMS:            millisBetween(startedAt, firstChunkAt),
 		GenerationMS:      millisBetween(firstChunkAt, completedAt),
@@ -1142,41 +1146,6 @@ func millisBetween(from, to time.Time) int64 {
 		return 0
 	}
 	return to.Sub(from).Milliseconds()
-}
-
-func requestString(body []byte, keys ...string) string {
-	var value map[string]any
-	if len(body) == 0 || json.Unmarshal(body, &value) != nil {
-		return ""
-	}
-	for _, key := range keys {
-		if text, ok := value[key].(string); ok && strings.TrimSpace(text) != "" {
-			return strings.TrimSpace(text)
-		}
-	}
-	return ""
-}
-
-func requestNestedString(body []byte, paths ...[]string) string {
-	var value any
-	if len(body) == 0 || json.Unmarshal(body, &value) != nil {
-		return ""
-	}
-	for _, path := range paths {
-		current := value
-		for _, key := range path {
-			object, ok := current.(map[string]any)
-			if !ok {
-				current = nil
-				break
-			}
-			current = object[key]
-		}
-		if text, ok := current.(string); ok && strings.TrimSpace(text) != "" {
-			return strings.TrimSpace(text)
-		}
-	}
-	return ""
 }
 
 func requestBody(req rpcExecutorRequest) []byte {
@@ -1372,7 +1341,7 @@ func completeIntercepted(body []byte) ([]byte, error) {
 		_, _ = svc.Release(ctx, hold.reservation.ID)
 		return okEnvelope(map[string]any{})
 	}
-	r := buildRequest(svc, hold.reservation, rpcExecutorRequest{}, nil, req.StartedAt, time.Time{}, req.CompletedAt, req.StatusCode)
+	r := buildRequest(svc, hold.reservation, rpcExecutorRequest{}, hold.plan.Meta, req.StartedAt, time.Time{}, req.CompletedAt, req.StatusCode)
 	if rec, ok := hold.claim.wait(0); ok {
 		applyHostUsageToRequest(r, rec)
 	}
@@ -1407,18 +1376,65 @@ func handleManagement(body []byte) ([]byte, error) {
 	if api == nil {
 		return errorEnvelope("service_unavailable", "插件尚未注册"), nil
 	}
-	hr := httptest.NewRequest(req.Method, req.Path, bytes.NewReader(req.Body))
-	for k, vals := range req.Headers {
-		for _, v := range vals {
-			hr.Header.Add(k, v)
-		}
+	rw := newRPCResponseWriter()
+	api.Handler().ServeHTTP(rw, managementRequest(req))
+	return okEnvelope(rpcManagementResponse{StatusCode: rw.code, Headers: rw.hdr, Body: rw.buf.Bytes()})
+}
+
+// managementRequest 把宿主转发的管理调用还原为 net/http 请求。手工构造替代
+// httptest.NewRequest：管理 RPC 只消费 method/path/query/header/body 五要素，
+// 后者每次调用都为 RemoteAddr 等完整测试语义付费。
+func managementRequest(req rpcManagementRequest) *http.Request {
+	target := strings.TrimSpace(req.Path)
+	u, err := url.Parse(target)
+	if err != nil || (u.Path == "" && u.RawQuery == "") {
+		u = &url.URL{Path: target}
 	}
 	if len(req.Query) > 0 {
-		hr.URL.RawQuery = req.Query.Encode()
+		u.RawQuery = req.Query.Encode()
 	}
-	rw := httptest.NewRecorder()
-	api.Handler().ServeHTTP(rw, hr)
-	return okEnvelope(rpcManagementResponse{StatusCode: rw.Code, Headers: rw.Header(), Body: rw.Body.Bytes()})
+	hdr := make(http.Header, len(req.Headers))
+	for k, vals := range req.Headers {
+		for _, v := range vals {
+			hdr.Add(k, v)
+		}
+	}
+	return &http.Request{
+		Method:        req.Method,
+		URL:           u,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        hdr,
+		Body:          io.NopCloser(bytes.NewReader(req.Body)),
+		ContentLength: int64(len(req.Body)),
+		Host:          u.Host,
+	}
+}
+
+// rpcResponseWriter 是管理 RPC 的最小 ResponseWriter：把处理器输出收进缓冲，
+// 随信封 JSON 回传宿主，不携带 httptest.NewRecorder 用不到的快照语义。
+type rpcResponseWriter struct {
+	code int
+	hdr  http.Header
+	buf  bytes.Buffer
+}
+
+func newRPCResponseWriter() *rpcResponseWriter { return &rpcResponseWriter{hdr: http.Header{}} }
+
+func (w *rpcResponseWriter) Header() http.Header { return w.hdr }
+
+func (w *rpcResponseWriter) WriteHeader(code int) {
+	if w.code == 0 {
+		w.code = code
+	}
+}
+
+func (w *rpcResponseWriter) Write(p []byte) (int, error) {
+	if w.code == 0 {
+		w.code = http.StatusOK
+	}
+	return w.buf.Write(p)
 }
 
 // ---------- 宿主用量认领 ----------
@@ -1440,9 +1456,12 @@ const (
 )
 
 type usageClaim struct {
-	models     map[string]bool
-	keyID      string
-	created    time.Time
+	models  map[string]bool
+	keyID   string
+	created time.Time
+	// buckets 是该认领登记到的全部模型桶（models 的每个键一个），
+	// 注销时据此 O(模型数) 摘除，不再全局线性查找。
+	buckets    []*claimBucket
 	registered bool
 
 	mu    sync.Mutex
@@ -1451,10 +1470,34 @@ type usageClaim struct {
 	ready chan struct{}
 }
 
+// claimBucket 是同一归一化模型名下的在途认领集合。
+// 此前所有认领共享一条切片与一把全局锁，登记/注销/宿主回调匹配全部串行；
+// 分桶后竞争只发生在同模型请求之间，跨模型完全并行。
+type claimBucket struct {
+	mu     sync.Mutex
+	claims []*usageClaim
+}
+
 var (
-	usageClaimsMu sync.Mutex
-	usageClaims   []*usageClaim
+	claimBucketsMu sync.Mutex
+	claimBuckets   map[string]*claimBucket
 )
+
+// claimBucketFor 返回模型名对应的桶，惰性创建。桶在无引用后不主动回收：
+// 每个仅含一把互斥锁与一个切片头，量级受「出现过的不同模型数」约束，可忽略。
+func claimBucketFor(model string) *claimBucket {
+	claimBucketsMu.Lock()
+	defer claimBucketsMu.Unlock()
+	if claimBuckets == nil {
+		claimBuckets = make(map[string]*claimBucket)
+	}
+	b, ok := claimBuckets[model]
+	if !ok {
+		b = &claimBucket{}
+		claimBuckets[model] = b
+	}
+	return b
+}
 
 // normalizeModelKey 归一化模型名：小写、去空白、去「渠道/」前缀。
 // 执行器登记的是「渠道/模型」别名，宿主上报的是裸模型名，裸名才是共同锚点。
@@ -1467,6 +1510,7 @@ func normalizeModelKey(s string) string {
 }
 
 // registerUsageClaim 登记一次认领；models 是该请求可能被宿主上报的模型名。
+// 登记时顺带惰性清理同桶内已过期的认领（绝对存活上限兜底，异常路径残留）。
 func registerUsageClaim(keyID string, models ...string) *usageClaim {
 	c := &usageClaim{
 		models:  make(map[string]bool, len(models)),
@@ -1485,15 +1529,19 @@ func registerUsageClaim(keyID string, models ...string) *usageClaim {
 	}
 	c.registered = true
 	cutoff := time.Now().Add(-usageClaimMaxAge)
-	usageClaimsMu.Lock()
-	kept := usageClaims[:0]
-	for _, v := range usageClaims {
-		if v.created.After(cutoff) {
-			kept = append(kept, v)
+	for model := range c.models {
+		b := claimBucketFor(model)
+		b.mu.Lock()
+		kept := b.claims[:0]
+		for _, v := range b.claims {
+			if v.created.After(cutoff) {
+				kept = append(kept, v)
+			}
 		}
+		b.claims = append(kept, c)
+		b.mu.Unlock()
+		c.buckets = append(c.buckets, b)
 	}
-	usageClaims = append(kept, c)
-	usageClaimsMu.Unlock()
 	return c
 }
 
@@ -1507,14 +1555,17 @@ func (c *usageClaim) release(delay time.Duration) {
 		time.AfterFunc(delay, func() { c.release(0) })
 		return
 	}
-	usageClaimsMu.Lock()
-	for i, v := range usageClaims {
-		if v == c {
-			usageClaims = append(usageClaims[:i], usageClaims[i+1:]...)
-			break
+	for _, b := range c.buckets {
+		b.mu.Lock()
+		for i, v := range b.claims {
+			if v == c {
+				b.claims = append(b.claims[:i], b.claims[i+1:]...)
+				break
+			}
 		}
+		b.mu.Unlock()
 	}
-	usageClaimsMu.Unlock()
+	c.buckets = nil
 }
 
 // settled 登记本次认领已落库的请求行 ID，并返回此前已交付的宿主用量（若有）。
@@ -1543,19 +1594,11 @@ func (c *usageClaim) attach(u rpcUsageRecord) (string, bool) {
 	return c.reqID, true
 }
 
-// available 报告认领是否仍可吸收回调，且模型名匹配。
-func (c *usageClaim) available(keys []string) bool {
+// openFor 报告认领在模型 k 的桶中是否仍可吸收回调（未交付过且登记了该模型）。
+func (c *usageClaim) openFor(k string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.rec != nil {
-		return false
-	}
-	for _, k := range keys {
-		if k != "" && c.models[k] {
-			return true
-		}
-	}
-	return false
+	return c.rec == nil && c.models[k]
 }
 
 // wait 等待宿主交付用量，最长 d；d <= 0 时只做一次非阻塞探测。
@@ -1581,23 +1624,54 @@ func (c *usageClaim) wait(d time.Duration) (rpcUsageRecord, bool) {
 
 // claimHostUsage 为一条宿主用量记录寻找匹配的认领。
 // 命中返回（已落库的请求行 ID，true）；未命中返回 ("", false)，由调用方被动入库。
+//
+// 选择语义与旧的全局切片版一致：同模型并发时优先 kid 精确匹配，
+// 否则取最早登记的（FIFO）。扫描按模型桶进行，顺带惰性摘除过期残留。
 func claimHostUsage(u rpcUsageRecord) (string, bool) {
 	keys := []string{normalizeModelKey(u.Model), normalizeModelKey(u.Alias)}
 	if keys[0] == "" && keys[1] == "" {
 		return "", false
 	}
 	kid, _ := service.ParseKeyID(u.APIKey)
-	usageClaimsMu.Lock()
-	defer usageClaimsMu.Unlock()
 	var best *usageClaim
-	for _, c := range usageClaims {
-		if !c.available(keys) {
+	better := func(c *usageClaim) bool {
+		if best == nil {
+			return true
+		}
+		if kid != "" {
+			if c.keyID == kid && best.keyID != kid {
+				return true
+			}
+			if c.keyID != kid && best.keyID == kid {
+				return false
+			}
+		}
+		return c.created.Before(best.created)
+	}
+	for _, k := range keys {
+		if k == "" {
 			continue
 		}
-		// 同模型并发时优先 kid 精确匹配，否则取最早登记的（FIFO）。
-		if best == nil || (kid != "" && c.keyID == kid && best.keyID != kid) {
-			best = c
+		claimBucketsMu.Lock()
+		b := claimBuckets[k]
+		claimBucketsMu.Unlock()
+		if b == nil {
+			continue
 		}
+		cutoff := time.Now().Add(-usageClaimMaxAge)
+		b.mu.Lock()
+		kept := b.claims[:0]
+		for _, c := range b.claims {
+			if c.created.Before(cutoff) {
+				continue
+			}
+			kept = append(kept, c)
+			if c.openFor(k) && better(c) {
+				best = c
+			}
+		}
+		b.claims = kept
+		b.mu.Unlock()
 	}
 	if best == nil {
 		return "", false
@@ -1606,9 +1680,9 @@ func claimHostUsage(u rpcUsageRecord) (string, bool) {
 }
 
 func resetUsageClaims() {
-	usageClaimsMu.Lock()
-	usageClaims = nil
-	usageClaimsMu.Unlock()
+	claimBucketsMu.Lock()
+	claimBuckets = nil
+	claimBucketsMu.Unlock()
 }
 
 // applyHostUsageToRequest 用宿主口径补齐请求行的缺失字段（结算前调用）。
@@ -1708,14 +1782,17 @@ func handleUsage(body []byte) ([]byte, error) {
 	if cost, _, err := svc.Price(req.Model, usageFromRecord(u)); err == nil {
 		req.CostMicroUSD = cost
 	}
-	if err := st.RecordUsage(ctx, req); err != nil {
+	// 入库时防重：同一写事务内探测执行器行，命中即合并、不再插行——
+	// 双写重复在落库瞬间被消除，无需任何事后对账。上方的只读预检
+	// 只是省一次写事务的快路径，这里的原子探测才是正确性保证。
+	hint := store.PassiveDedupeHint{
+		Models:    modelCandidates(u.Model, u.Alias),
+		Near:      u.RequestedAt,
+		LatencyMS: u.Latency.Milliseconds(),
+	}
+	if err := st.RecordPassiveUsage(ctx, req, hint); err != nil {
 		// 用量记录失败不应让宿主把整次请求判为插件错误。
 		warnf("被动记录用量失败: %v", err)
-		return okEnvelope(map[string]any{})
-	}
-	// 落库后对账：与执行器结算行是同一请求时合并去重（消除双写竞态）。
-	if _, err := st.ReconcileRequestDuplicates(ctx, req.ID); err != nil {
-		warnf("请求 %s 落库对账失败: %v", req.ID, err)
 	}
 	return okEnvelope(map[string]any{})
 }

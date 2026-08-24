@@ -18,6 +18,13 @@
 
 ## Discovered durable knowledge
 
+- **入库时防重（2026-02 性能优化批）**：双写残余竞态改为两侧写事务内探测合并——被动侧 `store.RecordPassiveUsage`（带 PassiveDedupeHint）与执行器侧 `SettleReservation` 在同一事务内 `duplicateProbeTx` 探测另一口径行，命中即合并、不插行；`ReconcileRequestDuplicates`（store+service）已**整体删除**，main.go handleUsage 不再落库后对账，service.Settle 不再起 goroutine 对账。`DedupeRequests` 仅存于 Maintain 兜底。依据：单写者串行化使事务内「先查后插」原子成立，谓词与旧对账完全一致故覆盖面等价。
+- **schema v7**：`idx_reservations_caller_status(caller_id,status)`（caller_scope 预占聚合）与 `idx_plugin_keys_scope_created(caller_scope,created_at)`（FindKeyByCallerScope）。另：读池 cache_size 已降 -2000、maxReadConns=4；写池保持 -8000；DSN 增加 journal_size_limit(64MiB)。
+- **prepared statement 缓存实测否决**：database/sql 的 `tx.Stmt` 对 modernc 驱动仍逐次重编译（零收益）；更危险的是惰性 `db.PrepareContext` 在写事务内会与单写连接池自锁（MaxOpenConns=1，事务占满唯一连接，取不到连接做准备→永久挂死，实测发生）。热路径语句统一经 `Store.execHotTx` 收口，未来绕过 database/sql 时只改这一处。
+- **/keys 服务端分页契约（2026-02）**：query 支持 `status=active|disabled|revoked|expired` 与 limit/offset；响应含 `status_counts`（只受 caller/search 过滤，不受 status/分页影响），前端徽标与「共 N 枚」靠它拿全量口径。**OnlyActive 旧口径（不看 expires）必须保留**：通知扫描靠它发现「已过期但形式上启用」的 Key 发告警——曾误把它并入 active 语义导致 TestNotifySweepEdgeTriggers 失败。前端 keysView.cache 现在只是当前页数据：reqKeyCombo 密钥联想候选暂只覆盖当前页（全量候选接口待产品确认）。
+- **面板数据面收敛**：维度分组后端硬上限 500（limit<=0 或超限都 clamp，Total/Count 仍全量下推）；trends 超 400 桶自动倍增桶距（范围端点缺失时用 MIN/MAX(bucket_minute) 补齐）；usage 页 loadDim 显式 limit=50。gzip 中间件受 `response_compression`/`response_compression_min_bytes` 控制（首写长度判定，lazyGzipWriter）；`httpapi.New` 签名是 `(svc, st, httpapi.Options{ManagementKey, CompressionEnabled, CompressionMinBytes})`。管理 RPC 已不用 httptest（手工构造 Request + rpcResponseWriter）。console 明文/gzip 两版都 sync.Once 常驻。
+- **认领注册表分桶（2026-02）**：usageClaims 由全局切片改 `map[归一化模型名]*claimBucket`，桶锁独立；kid 优先+FIFO 选择语义不变（跨桶扫描用 created 比较保 FIFO）；过期残留登记/匹配时惰性摘除。usageClaim.buckets 记录所属桶供 O(模型数) 注销。
+
 - 本机环境：`GOROOT` 被错误设为 `D:\Go\bin`，正确值是 `D:\Go`——每次 go build/test 前需 `$env:GOROOT='D:\Go'`。
 - **禁止用 PowerShell 管道改写源文件**（`(Get-Content) -replace | Set-Content`）：会把 UTF-8 中文注释写成乱码并吞换行导致语法错误。改文件一律用 edit/write 工具。**2026-02 会话又犯两次：即使只替换 ASCII 标识符也会毁文件**（httpapi/reports_test.go 被 Get-Content|Set-Content 吞换行截断中文后整文件重写）——无条件禁用，每次先 Read 再 edit/write。
 - 用量缓存字段双口径：OpenAI 系上游把命中记进 `cached_tokens`（含在 input 内，cache_read/creation 为 0），Claude 系单独记 `cache_read_tokens/cache_creation_tokens`（input 不含）。库内存上游原样值，计价归一只在 `usageparse.Billable()`；面板展示「缓存读」统一用 `max(cache_read, cached)`（cacheReadOf()，v0.3.0 起应用于全部展示位）。部分上游（stepfun/agnes/nvidia 实测）完全不报缓存字段，插件无法补数据；缓存写在 OpenAI 系无对应字段。

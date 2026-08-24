@@ -165,6 +165,11 @@ type Service struct {
 	beatsMu      sync.Mutex
 	beats        map[string]struct{}
 	beatsStarted bool
+
+	// 鉴权成功的 Key 挂起表：由同一个心跳协程按周期批量刷 last_used_at，
+	// 鉴权热路径上不再出现独立写事务（见 requestpath.go queueKeyTouch）。
+	touchMu      sync.Mutex
+	touchPending map[string]int64
 }
 
 // pricingSnapshot 是一份不可变的计价规则快照。
@@ -289,7 +294,7 @@ func (s *Service) Authenticate(ctx context.Context, plain string) (Authenticated
 	if subtle.ConstantTimeCompare(got, k.KeyHash) != 1 || !k.Usable(time.Now().UTC()) {
 		return AuthenticatedKey{}, ErrInvalidKey
 	}
-	_ = s.st.TouchKeyLastUsed(ctx, kid, time.Now())
+	s.queueKeyTouch(kid)
 	return AuthenticatedKey{Record: k, Plaintext: plain}, nil
 }
 func parseKey(v string) (string, string, bool) {
@@ -474,18 +479,8 @@ func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req
 	}
 	out, err := s.st.SettleReservation(ctx, id, cost, billableTokens, time.Now(), req,
 		store.AuditEvent{Action: "quota.settle", EntityType: "reservation", EntityID: id, Detail: map[string]any{"cost_micro_usd": cost}})
-	if err == nil && req != nil {
-		// 落库后对账：宿主 usage.handle 的被动行可能先于本结算落库（双写竞态），
-		// 命中则把其 token/展示信息合并进本行并删除被动行。对账是跨进程兜底
-		// 而非客户端响应的前提，异步执行省去结算路径上的一次串行写事务；
-		// 写互斥锁保证与其它写事务串行，不会产生新的竞态。
-		go func(anchorID string) {
-			defer func() { _ = recover() }()
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			_, _ = s.st.ReconcileRequestDuplicates(ctx, anchorID)
-		}(req.ID)
-	}
+	// 双写防重已前移到 SettleReservation 事务内（入库时探测合并），
+	// 不再有逐请求的事后对账；历史遗留对由 Maintain 的 DedupeRequests 兜底。
 	return out, err
 }
 func (s *Service) Release(ctx context.Context, id string) (store.Reservation, error) {
@@ -511,11 +506,6 @@ func (s *Service) FindDuplicateExecutor(ctx context.Context, models []string, ne
 // BackfillRequestUsageByID 按 ID 回填宿主上报的用量明细。
 func (s *Service) BackfillRequestUsageByID(ctx context.Context, id string, b store.UsageBackfill) error {
 	return s.st.BackfillRequestUsageByID(ctx, id, b)
-}
-
-// ReconcileRequestDuplicates 落库后对账，合并执行器/被动双写产生的重复行。
-func (s *Service) ReconcileRequestDuplicates(ctx context.Context, anchorID string) (bool, error) {
-	return s.st.ReconcileRequestDuplicates(ctx, anchorID)
 }
 
 // UpdateKey、RevokeKey、DeleteKey 是管理面调用的薄封装，并统一写审计。

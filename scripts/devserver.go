@@ -32,7 +32,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	api := httpapi.New(service.New(st, c, ps), st, "dev-secret")
+	api := httpapi.New(service.New(st, c, ps), st, httpapi.Options{
+		ManagementKey:       "dev-secret",
+		CompressionEnabled:  c.ResponseCompression,
+		CompressionMinBytes: c.ResponseCompressionMinBytes,
+	})
 	log.Println("http://127.0.0.1:18080/console")
 	log.Fatal(http.ListenAndServe("127.0.0.1:18080", api.Handler()))
 }

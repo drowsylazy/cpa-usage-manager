@@ -89,12 +89,16 @@ type DimensionReport struct {
 	Count int64 `json:"count"`
 }
 
+// maxDimensionLimit 是维度分组的硬上限。limit<=0（旧语义为「全量」）或
+// 超过上限时一律按此值截断：模型/密钥基数大的用户曾可一次拉回数千分组，
+// 前端漏传 limit 时数据量与渲染时间都不可控；Total/Count 仍覆盖全部分组。
+const maxDimensionLimit = 500
+
 // GroupByDimension 按给定维度聚合用量。
 //
 // 默认走分钟聚合表（usage_rollups），维度不在聚合表里时退回逐请求表。
-// limit <= 0 时返回全部分组；limit > 0 时 SQL 层直接返回前 N 组（按
-// 费用/Token/名称排序），合计查询把 Total 与分组数下推到 SQL——
-// Total/Count 始终覆盖全部分组，而内存峰值保持 O(limit)，不随分组数膨胀。
+// 返回前 maxDimensionLimit 组（按费用/Token/名称排序），合计查询把 Total
+// 与分组数下推到 SQL——Total/Count 始终覆盖全部分组，内存峰值 O(limit)。
 func (s *Service) GroupByDimension(ctx context.Context, f UsageFilter, dimension string, limit int) (DimensionReport, error) {
 	dimension = strings.TrimSpace(dimension)
 	if dimension == "" {
@@ -116,12 +120,13 @@ func (s *Service) GroupByDimension(ctx context.Context, f UsageFilter, dimension
 		clause, args = requestFilter(f)
 	}
 
+	if limit <= 0 || limit > maxDimensionLimit {
+		limit = maxDimensionLimit
+	}
 	rowQuery := `SELECT ` + column + `, ` + agg + `
 		FROM ` + table + clause + ` GROUP BY 1` +
-		` ORDER BY 11 DESC, 10 DESC, 1`
-	if limit > 0 {
-		rowQuery += fmt.Sprintf(" LIMIT %d", limit)
-	}
+		` ORDER BY 11 DESC, 10 DESC, 1` +
+		fmt.Sprintf(" LIMIT %d", limit)
 	totalQuery := `SELECT ` + agg + `, COUNT(DISTINCT ` + column + `) FROM ` + table + clause
 
 	out := DimensionReport{Dimension: dimension}
@@ -148,28 +153,26 @@ func (s *Service) GroupByDimension(ctx context.Context, f UsageFilter, dimension
 	out.Total.Value = "__total__"
 	out.Count = int64(len(out.Rows))
 
-	if limit > 0 {
-		// 合计下推：一条不分组聚合查出全量 Total 与分组数，
-		// 避免为算合计而把全部分组装载进内存再排序截断。
-		var t DimensionRow
-		var cost, latencySum, ttftSum, tpsSum, ttftCount int64
-		if err := s.st.Read(ctx, func(q store.Querier) error {
-			return q.QueryRowContext(ctx, totalQuery, args...).Scan(
-				&t.Requests, &t.Failures,
-				&t.InputTokens, &t.OutputTokens, &t.ReasoningTokens, &t.CachedTokens,
-				&t.CacheReadTokens, &t.CacheCreationTokens, &t.TotalTokens, &cost,
-				&latencySum, &ttftSum, &tpsSum, &ttftCount, &out.Count)
-		}); err != nil {
-			return DimensionReport{}, err
-		}
-		t.CostMicroUSD = money.Micro(cost)
-		t.LatencyAvgMS = divOrZero(latencySum, t.Requests)
-		t.TTFTAvgMS = divOrZero(ttftSum, ttftCount)
-		t.TPSAvgMilli = divOrZero(tpsSum, t.Requests)
-		t.CacheHitRateBP = cacheHitRateBP(t)
-		t.Value = "__total__"
-		out.Total = t
+	// 合计下推：一条不分组聚合查出全量 Total 与分组数，
+	// 避免为算合计而把全部分组装载进内存再排序截断。
+	var t DimensionRow
+	var cost, latencySum, ttftSum, tpsSum, ttftCount int64
+	if err := s.st.Read(ctx, func(q store.Querier) error {
+		return q.QueryRowContext(ctx, totalQuery, args...).Scan(
+			&t.Requests, &t.Failures,
+			&t.InputTokens, &t.OutputTokens, &t.ReasoningTokens, &t.CachedTokens,
+			&t.CacheReadTokens, &t.CacheCreationTokens, &t.TotalTokens, &cost,
+			&latencySum, &ttftSum, &tpsSum, &ttftCount, &out.Count)
+	}); err != nil {
+		return DimensionReport{}, err
 	}
+	t.CostMicroUSD = money.Micro(cost)
+	t.LatencyAvgMS = divOrZero(latencySum, t.Requests)
+	t.TTFTAvgMS = divOrZero(ttftSum, ttftCount)
+	t.TPSAvgMilli = divOrZero(tpsSum, t.Requests)
+	t.CacheHitRateBP = cacheHitRateBP(t)
+	t.Value = "__total__"
+	out.Total = t
 	return out, nil
 }
 

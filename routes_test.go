@@ -33,7 +33,8 @@ func TestManagementRegistrationCoversAllRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	api := httpapi.New(service.New(st, c, ps), st, "secret")
+	api := httpapi.New(service.New(st, c, ps), st, httpapi.Options{
+		ManagementKey: "secret", CompressionEnabled: true})
 
 	reg := managementRegistration()
 	const base = "/v0/management/plugins/cpa-usage-manager"
