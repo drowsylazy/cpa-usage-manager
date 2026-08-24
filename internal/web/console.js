@@ -1089,7 +1089,12 @@ function trendSeries() {
     { key: 'cost', label: '费用', color: cssVar('--series-1'), val: p => p.cost_micro_usd, money: true },
   ];
   return [
-    { key: 'input', label: '输入', color: cssVar('--series-1'), tok: true, val: p => p.input_tokens },
+    // 堆叠必须互不重叠：OpenAI/Gemini 的 cached_tokens 已含在 input_tokens 内，
+    // 先从输入中拆出再单列「缓存读」，否则缓存命中被计两遍，
+    // 堆叠总量会虚高且与概览「总消耗 Token」（EffectiveTotal 口径）对不上。
+    // Claude 口径 cached_tokens 恒为 0，减法无影响。
+    { key: 'input', label: '输入', color: cssVar('--series-1'), tok: true,
+      val: p => Math.max(0, (+p.input_tokens || 0) - Math.min(+p.cached_tokens || 0, +p.input_tokens || 0)) },
     { key: 'output', label: '输出', color: cssVar('--series-2'), tok: true, val: p => p.output_tokens },
     { key: 'cache-read', label: '缓存读', color: cssVar('--series-3'), tok: true, val: p => cacheReadOf(p) },
     { key: 'cache-creation', label: '缓存写', color: cssVar('--series-4'), tok: true, val: p => p.cache_creation_tokens || 0 },
