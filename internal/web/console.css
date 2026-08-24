@@ -288,7 +288,7 @@ h1,h2,h3,p{margin:0}
 .split{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);gap:14px}
 .split.even{grid-template-columns:1fr 1fr}
 .split.triple{grid-template-columns:repeat(3,minmax(0,1fr))}
-.split.wide{grid-template-columns:minmax(0,1fr) minmax(0,.6fr)}
+.split.wide{grid-template-columns:minmax(0,1fr) minmax(0,.8fr)}
 @media (max-width:1020px){.split,.split.even,.split.triple,.split.wide{grid-template-columns:minmax(0,1fr)}}
 
 /* ── 固定 5 行版式：表格区高度恒定（不足留白），换页栏常驻不跳 ── */
