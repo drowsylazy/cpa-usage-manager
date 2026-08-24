@@ -86,15 +86,6 @@ func (s *Service) ListRequests(ctx context.Context, f UsageFilter, limit, offset
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	columns := map[string]string{"ts": "ts", "cost": "cost_micro_usd", "tokens": "total_tokens", "latency": "latency_ms", "model": "model"}
-	column := columns[sortBy]
-	if column == "" {
-		column = "ts"
-	}
-	direction := "DESC"
-	if strings.EqualFold(order, "asc") {
-		direction = "ASC"
-	}
 	clause, args := requestFilter(f)
 	var total int64
 	if err := s.st.Read(ctx, func(q store.Querier) error {
@@ -102,7 +93,7 @@ func (s *Service) ListRequests(ctx context.Context, f UsageFilter, limit, offset
 	}); err != nil {
 		return RequestPage{}, err
 	}
-	query := `SELECT id,ts,key_id,caller_id,model,provider,source,upstream_model,auth_id,auth_label,auth_type,tier,result,input_tokens,output_tokens,reasoning_tokens,cached_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,latency_ms,ttft_ms,generation_ms,tps_milli,thinking_intensity,cost_micro_usd,priced,reservation_id FROM requests` + clause + ` ORDER BY ` + column + ` ` + direction + `, id DESC LIMIT ? OFFSET ?`
+	query := `SELECT id,ts,key_id,caller_id,model,provider,source,upstream_model,auth_id,auth_label,auth_type,tier,result,input_tokens,output_tokens,reasoning_tokens,cached_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,latency_ms,ttft_ms,generation_ms,tps_milli,thinking_intensity,cost_micro_usd,priced,reservation_id FROM requests` + clause + ` ORDER BY ` + requestSortClause(sortBy, order) + ` LIMIT ? OFFSET ?`
 	args = append(args, limit, max(0, offset))
 	var items []store.Request
 	err := s.st.Read(ctx, func(q store.Querier) error {
@@ -112,20 +103,69 @@ func (s *Service) ListRequests(ctx context.Context, f UsageFilter, limit, offset
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var r store.Request
-			var ts, cost int64
-			var priced int
-			if err := rows.Scan(&r.ID, &ts, &r.KeyID, &r.CallerID, &r.Model, &r.Provider, &r.Source, &r.UpstreamModel, &r.AuthID, &r.AuthLabel, &r.AuthType, &r.Tier, &r.Result, &r.InputTokens, &r.OutputTokens, &r.ReasoningTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens, &r.TotalTokens, &r.LatencyMS, &r.TTFTMS, &r.GenerationMS, &r.TPSMilli, &r.ThinkingIntensity, &cost, &priced, &r.ReservationID); err != nil {
+			r, err := scanRequestItem(rows)
+			if err != nil {
 				return err
 			}
-			r.TS = time.UnixMilli(ts).UTC()
-			r.CostMicroUSD = money.Micro(cost)
-			r.Priced = priced != 0
 			items = append(items, r)
 		}
 		return rows.Err()
 	})
 	return RequestPage{Items: items, Total: total}, err
+}
+
+// IterateRequests 按 ListRequests 相同的过滤与排序流式遍历请求行，
+// 每行调用一次 fn，不在内存中累积整批结果。CSV 导出等大批量场景用
+// 它替代先全量装载再逐行写出，峰值内存 O(1)。limit 由调用方决定。
+func (s *Service) IterateRequests(ctx context.Context, f UsageFilter, limit int, sortBy, order string, fn func(store.Request) error) error {
+	clause, args := requestFilter(f)
+	query := `SELECT id,ts,key_id,caller_id,model,provider,source,upstream_model,auth_id,auth_label,auth_type,tier,result,input_tokens,output_tokens,reasoning_tokens,cached_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,latency_ms,ttft_ms,generation_ms,tps_milli,thinking_intensity,cost_micro_usd,priced,reservation_id FROM requests` + clause + ` ORDER BY ` + requestSortClause(sortBy, order) + ` LIMIT ?`
+	args = append(args, max(0, limit))
+	return s.st.Read(ctx, func(q store.Querier) error {
+		rows, err := q.QueryContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			r, err := scanRequestItem(rows)
+			if err != nil {
+				return err
+			}
+			if err := fn(r); err != nil {
+				return err
+			}
+		}
+		return rows.Err()
+	})
+}
+
+// requestSortClause 把排序参数收敛为白名单列 + 方向的 ORDER BY 片段。
+func requestSortClause(sortBy, order string) string {
+	columns := map[string]string{"ts": "ts", "cost": "cost_micro_usd", "tokens": "total_tokens", "latency": "latency_ms", "model": "model"}
+	column := columns[sortBy]
+	if column == "" {
+		column = "ts"
+	}
+	direction := "DESC"
+	if strings.EqualFold(order, "asc") {
+		direction = "ASC"
+	}
+	return column + ` ` + direction + `, id DESC`
+}
+
+// scanRequestItem 扫描一行请求明细（列清单见上面的 SELECT）。
+func scanRequestItem(sc interface{ Scan(...any) error }) (store.Request, error) {
+	var r store.Request
+	var ts, cost int64
+	var priced int
+	if err := sc.Scan(&r.ID, &ts, &r.KeyID, &r.CallerID, &r.Model, &r.Provider, &r.Source, &r.UpstreamModel, &r.AuthID, &r.AuthLabel, &r.AuthType, &r.Tier, &r.Result, &r.InputTokens, &r.OutputTokens, &r.ReasoningTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens, &r.TotalTokens, &r.LatencyMS, &r.TTFTMS, &r.GenerationMS, &r.TPSMilli, &r.ThinkingIntensity, &cost, &priced, &r.ReservationID); err != nil {
+		return store.Request{}, err
+	}
+	r.TS = time.UnixMilli(ts).UTC()
+	r.CostMicroUSD = money.Micro(cost)
+	r.Priced = priced != 0
+	return r, nil
 }
 
 type TrendPoint struct {

@@ -8,7 +8,7 @@ import (
 
 // SchemaVersion 是本代码期望的数据库 schema 版本。
 // 打开库时若发现库版本更高，说明是被更新版插件写过的库，拒绝降级使用。
-const SchemaVersion = 5
+const SchemaVersion = 6
 
 // migration 是一次版本化迁移。
 type migration struct {
@@ -331,6 +331,17 @@ var migrations = []migration{
 			// model 列统一存宿主别名（用户配置名）；upstream_model 记录
 			// 上游实际声明的模型名，仅在两者不同时填写（空 = 直连）。
 			`ALTER TABLE requests ADD COLUMN upstream_model TEXT NOT NULL DEFAULT ''`,
+		},
+	},
+	{
+		version: 6,
+		name:    "request_filter_indexes",
+		stmts: []string{
+			// ---- 面板筛选维度的专用索引 ----
+			// result / provider 是低基数列，此前过滤只能走 (ts) 索引回表逐行判断；
+			// 组合索引让「失败请求分析」「按渠道过滤」直接走索引范围扫描。
+			`CREATE INDEX idx_requests_result_ts ON requests(result, ts DESC)`,
+			`CREATE INDEX idx_requests_provider_ts ON requests(provider, ts DESC)`,
 		},
 	},
 }

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -183,6 +182,7 @@ func (s *Store) UpsertPricingRule(ctx context.Context, r PricingRule) (PricingRu
 	if err != nil {
 		return PricingRule{}, err
 	}
+	s.notifyPricingChanged()
 	return s.GetPricingRuleByPattern(ctx, r.MatchKind, r.Pattern)
 }
 
@@ -262,7 +262,7 @@ func (s *Store) ListPricingRules(ctx context.Context, onlyEnabled bool) ([]Prici
 // 兜底规则（glob:*，最低优先级）不允许删除：它是 unknown_policy=allow
 // 能正常工作的前提，删掉会让所有未配价模型突然变成「未知模型」。
 func (s *Store) DeletePricingRule(ctx context.Context, id int64) error {
-	return s.Write(ctx, func(tx *sql.Tx) error {
+	err := s.Write(ctx, func(tx *sql.Tx) error {
 		var r PricingRule
 		row := tx.QueryRowContext(ctx, `SELECT `+pricingColumns+` FROM pricing_rules WHERE id = ?`, id)
 		r, err := scanPricingRule(row)
@@ -281,6 +281,11 @@ func (s *Store) DeletePricingRule(ctx context.Context, id int64) error {
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	s.notifyPricingChanged()
+	return nil
 }
 
 // ResetPricingRules 清空全部非兜底计价规则，恢复到仅剩全模型免费兜底规则的初始状态。
@@ -296,12 +301,16 @@ func (s *Store) ResetPricingRules(ctx context.Context) (int64, error) {
 		n, _ = res.RowsAffected()
 		return nil
 	})
-	return n, err
+	if err != nil {
+		return n, err
+	}
+	s.notifyPricingChanged()
+	return n, nil
 }
 
 // SetPricingRuleEnabled 启用/停用规则。
 func (s *Store) SetPricingRuleEnabled(ctx context.Context, id int64, enabled bool) error {
-	return s.Write(ctx, func(tx *sql.Tx) error {
+	err := s.Write(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
 			`UPDATE pricing_rules SET enabled = ?, updated_at = ? WHERE id = ?`,
 			boolInt(enabled), nowMillis(), id)
@@ -313,6 +322,11 @@ func (s *Store) SetPricingRuleEnabled(ctx context.Context, id int64, enabled boo
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	s.notifyPricingChanged()
+	return nil
 }
 
 // ReplaceModelsDevRules 用一批 models.dev 同步结果替换既有 models_dev 来源规则。
@@ -435,16 +449,25 @@ func (s *Store) ReplaceModelsDevRules(ctx context.Context, rules []PricingRule, 
 	if err != nil {
 		return 0, 0, 0, err
 	}
+	s.notifyPricingChanged()
 	return applied, skipped, removed, nil
 }
 
-// SortRulesForMatching 把规则按匹配顺序排序（优先级降序，同级按 id 升序）。
-// 供服务层在内存中缓存规则表后自行排序使用。
-func SortRulesForMatching(rules []PricingRule) {
-	sort.SliceStable(rules, func(i, j int) bool {
-		if rules[i].Priority != rules[j].Priority {
-			return rules[i].Priority > rules[j].Priority
-		}
-		return rules[i].ID < rules[j].ID
-	})
+// 计价规则变更钩子 ---------------------------------------------------------
+
+// SetPricingChangeHandler 注册计价规则变更回调（写事务提交成功后调用）。
+// 服务层用它失效内存中的计价快照；回调必须快速返回、不得阻塞。
+func (s *Store) SetPricingChangeHandler(fn func()) {
+	s.pricingHookMu.Lock()
+	s.onPricingChanged = fn
+	s.pricingHookMu.Unlock()
+}
+
+func (s *Store) notifyPricingChanged() {
+	s.pricingHookMu.Lock()
+	fn := s.onPricingChanged
+	s.pricingHookMu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/drowsylazy/cpa-usage-manager/internal/money"
@@ -204,11 +205,12 @@ func (s *Store) GetReservation(ctx context.Context, id string) (Reservation, err
 }
 
 // SettleReservation 原子结束预占并更新 Key 累计器；request 非 nil 时同事务写入请求与分钟聚合。
+// audits 非空时在同一写事务内追加审计事件——结算与留痕原子化，省去独立的一次写事务。
 //
 // billableTokens 是本次真实消耗的计费 token 合计（输入+输出+缓存读+缓存写，
 // 由 usageparse.Billable().Sum() 得出，与 cost 同一口径）。它累加进 token 累计器，
 // 与金额累计器在同一条 UPDATE 里完成，保证两种口径的周期归零点严格一致。
-func (s *Store) SettleReservation(ctx context.Context, id string, cost money.Micro, billableTokens int64, now time.Time, request *Request) (Reservation, error) {
+func (s *Store) SettleReservation(ctx context.Context, id string, cost money.Micro, billableTokens int64, now time.Time, request *Request, audits ...AuditEvent) (Reservation, error) {
 	if cost < 0 {
 		return Reservation{}, errors.New("结算金额不能为负")
 	}
@@ -275,6 +277,11 @@ func (s *Store) SettleReservation(ctx context.Context, id string, cost money.Mic
 		out.SettledMicroUSD = cost
 		t := now.UTC()
 		out.SettledAt = &t
+		for _, e := range audits {
+			if err := appendAuditTx(ctx, tx, e); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	return out, err
@@ -308,20 +315,24 @@ func (s *Store) ReleaseReservation(ctx context.Context, id string, now time.Time
 	return out, err
 }
 
-func (s *Store) HeartbeatReservation(ctx context.Context, id string, at time.Time) error {
-	if at.IsZero() {
-		at = time.Now().UTC()
+// TouchReservations 批量续期在途预占的心跳。单个写事务覆盖全部活跃预占，
+// 供集中式心跳协程每轮调用，避免每个流式请求各占一个定时器与一次写事务。
+func (s *Store) TouchReservations(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := strings.Repeat("?,", len(ids))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, time.Now().UTC().UnixMilli())
+	for _, id := range ids {
+		args = append(args, id)
 	}
 	return s.Write(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `UPDATE reservations SET heartbeat_at=? WHERE id=? AND status='held'`, at.UTC().UnixMilli(), id)
-		if err != nil {
-			return err
-		}
-		n, _ := res.RowsAffected()
-		if n == 0 {
-			return fmt.Errorf("%w: held reservation %q", ErrNotFound, id)
-		}
-		return nil
+		_, err := tx.ExecContext(ctx,
+			`UPDATE reservations SET heartbeat_at=? WHERE status='held' AND id IN (`+placeholders+`)`,
+			args...)
+		return err
 	})
 }
 

@@ -52,7 +52,7 @@ func (s *Service) FX() *fx.Service {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fxSvc == nil {
-		client := &http.Client{Timeout: fx.DefaultTimeout}
+		client := &http.Client{Timeout: fx.DefaultTimeout, Transport: sharedTransport}
 		s.fxSvc = fx.NewService(NewMetaFXCache(s.st), fx.DefaultTTL, fx.DefaultProviders(client)...)
 	}
 	return s.fxSvc

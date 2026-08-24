@@ -769,16 +769,20 @@ function cacheReadOf(r) {
 loaders.overview = async () => {
   if (!trend.grainManual) trendGrainSel.value = autoGrain();
   const p = rangeParams();
-  const [dimModel, dimKey, points, costs] = await Promise.all([
-    api('/usage/dimension?' + new URLSearchParams({ dimension: 'model', limit: '200', ...p })),
-    api('/usage/dimension?' + new URLSearchParams({ dimension: 'key_id', limit: '100', ...p })),
+  // 汇率与四路数据并发拉取（原先串行在 Promise.all 之后，多付一个 RTT）。
+  const [dimModel, dimKey, points, costs, fx] = await Promise.all([
+    api('/usage/dimension?' + new URLSearchParams({ dimension: 'model', limit: '50', ...p })),
+    api('/usage/dimension?' + new URLSearchParams({ dimension: 'key_id', limit: '50', ...p })),
     api('/trends?' + new URLSearchParams({ grain: trendGrainSel.value, ...p })),
     api('/costs?' + new URLSearchParams(p)),
+    S.fx ? null : api('/exchange-rate').catch(() => null),
   ]);
-  if (!S.fx) { S.fx = await api('/exchange-rate').catch(() => null); }
+  if (!S.fx && fx) S.fx = fx;
   trend.points = Array.isArray(points) ? points : [];
   ovCache.models = dimModel.rows || [];
+  ovCache.modelCount = dimModel.count;
   ovCache.keys = dimKey.rows || [];
+  ovCache.keyCount = dimKey.count;
   renderReadouts(dimModel.total || {}, costs);
   renderModels(ovCache.models);
   renderKeySpend(ovCache.keys);
@@ -822,7 +826,7 @@ function renderReadouts(total, costs) {
 }
 
 // ---------- 概览占比卡：指标切换（费用 / Token / 请求） ----------
-const ovCache = { models: [], keys: [] };
+const ovCache = { models: [], modelCount: null, keys: [], keyCount: null };
 const ovMetric = {
   models: localStorage.getItem('ov-models-metric') || 'tokens',
   keys: localStorage.getItem('ov-keys-metric') || 'cost',
@@ -955,8 +959,9 @@ function drawDonut(mountId, entries, fmt) {
 function renderModels(rows) {
   const m = ovMetric.models;
   const e = donutEntries(rows, m);
-  $('ov-models-sub').textContent = METRIC_SUBS[m] + ' · 前 5 + 其他，共 ' + e.count + ' 项';
-  drawDonut('ov-models', e, { metric: m, center: rows.length + ' 个模型' });
+  const n = Number.isInteger(ovCache.modelCount) ? ovCache.modelCount : rows.length;
+  $('ov-models-sub').textContent = METRIC_SUBS[m] + ' · 前 5 + 其他，共 ' + n + ' 项';
+  drawDonut('ov-models', e, { metric: m, center: n + ' 个模型' });
 }
 function renderKeySpend(rows) {
   const m = ovMetric.keys;
@@ -964,8 +969,9 @@ function renderKeySpend(rows) {
     value: keyLabelOf(r.value) || '(无标签)',
   }));
   const e = donutEntries(withKey, m);
-  $('ov-keys-sub').textContent = METRIC_SUBS[m] + ' · 前 5 + 其他，共 ' + e.count + ' 枚';
-  drawDonut('ov-keys', e, { metric: m, center: withKey.length + ' 枚密钥' });
+  const n = Number.isInteger(ovCache.keyCount) ? ovCache.keyCount : rows.length;
+  $('ov-keys-sub').textContent = METRIC_SUBS[m] + ' · 前 5 + 其他，共 ' + n + ' 枚';
+  drawDonut('ov-keys', e, { metric: m, center: n + ' 枚密钥' });
 }
 
 // ---------- 趋势图（内联 SVG 堆叠面积）----------

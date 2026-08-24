@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/drowsylazy/cpa-usage-manager/internal/store"
@@ -36,9 +37,51 @@ type ReservePlan struct {
 	ImageCount     int64
 }
 
-// TouchReservation 更新在途预占的心跳，防止超时释放。
-func (s *Service) TouchReservation(ctx context.Context, id string) error {
-	return s.st.HeartbeatReservation(ctx, id, time.Now().UTC())
+// heartbeatInterval 是集中式预占心跳的批量续期间隔。预占默认过期阈值 2h，
+// 30s 的续期粒度远低于它；全部活跃预占合并为每轮一个写事务。
+const heartbeatInterval = 30 * time.Second
+
+// TrackReservation 登记一条在途预占，由服务内唯一的后台协程按
+// heartbeatInterval 批量续期心跳（替代每请求一个 ticker goroutine +
+// 每分钟一次独立写事务）。返回的 stop 函数注销该预占，结算/释放后必须调用。
+func (s *Service) TrackReservation(id string) (stop func()) {
+	s.beatsMu.Lock()
+	if s.beats == nil {
+		s.beats = make(map[string]struct{})
+	}
+	s.beats[id] = struct{}{}
+	if !s.beatsStarted {
+		s.beatsStarted = true
+		go s.reservationBeatLoop()
+	}
+	s.beatsMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.beatsMu.Lock()
+			delete(s.beats, id)
+			s.beatsMu.Unlock()
+		})
+	}
+}
+
+func (s *Service) reservationBeatLoop() {
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.beatsMu.Lock()
+		ids := make([]string, 0, len(s.beats))
+		for id := range s.beats {
+			ids = append(ids, id)
+		}
+		s.beatsMu.Unlock()
+		if len(ids) == 0 {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		_ = s.st.TouchReservations(ctx, ids)
+		cancel()
+	}
 }
 
 // ResolveIdentity 从请求头解析插件 Key。

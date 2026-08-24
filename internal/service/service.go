@@ -17,6 +17,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/drowsylazy/cpa-usage-manager/internal/config"
@@ -148,7 +149,37 @@ type Service struct {
 	catalogMu  sync.Mutex
 	catalogRaw map[string]ModelsDevProvider
 	catalogAt  time.Time
+
+	// pricingSnap 是启用计价规则的只读快照（已按匹配顺序排列）。
+	// 计价规则是管理员低频写入的静态数据，Reserve/Settle 每请求都要匹配，
+	// 快照命中时省去每次 1 次全表 SELECT。失效走 Store 的写后回调；
+	// TTL 兜底覆盖跨进程改写（另一实例持租约修改）的极端场景。
+	pricingSnap atomic.Pointer[pricingSnapshot]
+
+	// lastSweepAt 记录上次内联清扫陈旧预占的时刻（Unix 秒）。
+	// HoldReservation 的清扫在写锁事务内执行，节流到每 sweepInterval 一次，
+	// 避免高并发下每个 Reserve 都附带一条 UPDATE。
+	lastSweepAt atomic.Int64
+
+	// 集中式预占心跳注册表：所有在途预占共用一个 goroutine 批量续期。
+	beatsMu      sync.Mutex
+	beats        map[string]struct{}
+	beatsStarted bool
 }
+
+// pricingSnapshot 是一份不可变的计价规则快照。
+type pricingSnapshot struct {
+	rules []store.PricingRule
+	at    time.Time
+}
+
+const (
+	// pricingCacheTTL 是计价快照的最长存活时间；事件失效为主，此值只兜底跨进程改写。
+	pricingCacheTTL = time.Minute
+	// sweepInterval 是两次内联清扫陈旧预占的最小间隔。预占默认过期阈值 2h，
+	// 30s 的清扫粒度远低于它，不影响僵死预占的回收时效。
+	sweepInterval = 30 * time.Second
+)
 
 // Config 返回当前生效的配置副本，供 httpapi 读取展示项与开关。
 func (s *Service) Config() config.Config {
@@ -161,7 +192,9 @@ func (s *Service) Config() config.Config {
 func (s *Service) Store() *store.Store { return s.st }
 
 func New(st *store.Store, c config.Config, ps PepperSet) *Service {
-	return &Service{st: st, cfg: c, peppers: ps}
+	s := &Service{st: st, cfg: c, peppers: ps}
+	st.SetPricingChangeHandler(func() { s.pricingSnap.Store(nil) })
+	return s
 }
 func (s *Service) pepper(id string) (Pepper, bool) {
 	s.mu.RLock()
@@ -375,7 +408,14 @@ func (s *Service) Reserve(ctx context.Context, r ReservationRequest) (store.Rese
 	if r.ExpiresAt.IsZero() {
 		r.ExpiresAt = now.Add(s.cfg.Quota.Stream.StaleReservationTimeout.Std())
 	}
-	res, _, err := s.st.HoldReservation(ctx, store.HoldReservationParams{ID: uuid.NewString(), KeyID: r.KeyID, CallerID: r.CallerID, Model: r.Model, IdempotencyKey: r.IdempotencyKey, HeldMicroUSD: cost, ReservedTokens: r.EstimatedTokens, ExpiresAt: r.ExpiresAt, Now: now, SweepStaleBefore: now.Add(-s.cfg.Quota.Stream.StaleReservationTimeout.Std())})
+	// 清扫节流：写锁内的 DELETE/UPDATE 只有到间隔才执行一次，
+	// 高并发 Reserve 不再各自附带一条清扫语句。
+	var sweepBefore time.Time
+	last := s.lastSweepAt.Load()
+	if now.Unix()-last >= int64(sweepInterval.Seconds()) && s.lastSweepAt.CompareAndSwap(last, now.Unix()) {
+		sweepBefore = now.Add(-s.cfg.Quota.Stream.StaleReservationTimeout.Std())
+	}
+	res, _, err := s.st.HoldReservation(ctx, store.HoldReservationParams{ID: uuid.NewString(), KeyID: r.KeyID, CallerID: r.CallerID, Model: r.Model, IdempotencyKey: r.IdempotencyKey, HeldMicroUSD: cost, ReservedTokens: r.EstimatedTokens, ExpiresAt: r.ExpiresAt, Now: now, SweepStaleBefore: sweepBefore})
 	if err == nil {
 		_ = s.st.AppendAudit(ctx, store.AuditEvent{Actor: r.Actor, Action: "quota.reserve", EntityType: "reservation", EntityID: res.ID, Detail: map[string]any{"key_id": r.KeyID, "cost_micro_usd": cost}})
 	}
@@ -432,14 +472,19 @@ func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req
 	if u.IsZero() {
 		billableTokens = r.ReservedTokens
 	}
-	out, err := s.st.SettleReservation(ctx, id, cost, billableTokens, time.Now(), req)
-	if err == nil {
-		_ = s.st.AppendAudit(ctx, store.AuditEvent{Action: "quota.settle", EntityType: "reservation", EntityID: id, Detail: map[string]any{"cost_micro_usd": cost}})
+	out, err := s.st.SettleReservation(ctx, id, cost, billableTokens, time.Now(), req,
+		store.AuditEvent{Action: "quota.settle", EntityType: "reservation", EntityID: id, Detail: map[string]any{"cost_micro_usd": cost}})
+	if err == nil && req != nil {
 		// 落库后对账：宿主 usage.handle 的被动行可能先于本结算落库（双写竞态），
-		// 命中则把其 token/展示信息合并进本行并删除被动行。
-		if req != nil {
-			_, _ = s.st.ReconcileRequestDuplicates(ctx, req.ID)
-		}
+		// 命中则把其 token/展示信息合并进本行并删除被动行。对账是跨进程兜底
+		// 而非客户端响应的前提，异步执行省去结算路径上的一次串行写事务；
+		// 写互斥锁保证与其它写事务串行，不会产生新的竞态。
+		go func(anchorID string) {
+			defer func() { _ = recover() }()
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			_, _ = s.st.ReconcileRequestDuplicates(ctx, anchorID)
+		}(req.ID)
 	}
 	return out, err
 }
@@ -528,17 +573,31 @@ func (s *Service) DeleteKey(ctx context.Context, kid, actor string) error {
 }
 
 func (s *Service) matchPricing(ctx context.Context, model string) (store.PricingRule, bool, error) {
-	rules, err := s.st.ListPricingRules(ctx, true)
+	rules, err := s.pricingRules(ctx)
 	if err != nil {
 		return store.PricingRule{}, false, err
 	}
-	store.SortRulesForMatching(rules)
 	for _, r := range rules {
 		if r.Matches(model) {
 			return r, !r.IsFallback(), nil
 		}
 	}
 	return store.PricingRule{}, false, nil
+}
+
+// pricingRules 返回按匹配顺序排列的启用规则快照：命中内存快照时零 DB 往返，
+// 过期（或被写回调失效）时重新加载。ListPricingRules 的 SQL 已按
+// priority DESC, id ASC 排序，与匹配顺序一致，无需再排。
+func (s *Service) pricingRules(ctx context.Context) ([]store.PricingRule, error) {
+	if snap := s.pricingSnap.Load(); snap != nil && time.Since(snap.at) < pricingCacheTTL {
+		return snap.rules, nil
+	}
+	rules, err := s.st.ListPricingRules(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	s.pricingSnap.Store(&pricingSnapshot{rules: rules, at: time.Now()})
+	return rules, nil
 }
 func (s *Service) Price(model string, u usageparse.Usage) (money.Micro, bool, error) {
 	r, p, e := s.matchPricing(context.Background(), model)

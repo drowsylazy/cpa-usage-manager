@@ -271,7 +271,7 @@ const notifyStateKey = "notify_state"
 var shoutrrrSend = func(url, title, body string) error {
 	sender, err := shoutrrr.NewSenderWithOptions(
 		log.New(io.Discard, "", 0),
-		types.SenderOptions{HTTPClient: &http.Client{Timeout: 15 * time.Second}},
+		types.SenderOptions{HTTPClient: &http.Client{Timeout: 15 * time.Second, Transport: sharedTransport}},
 		url)
 	if err != nil {
 		return err
@@ -439,10 +439,33 @@ func (s *Service) RunNotifySweep(ctx context.Context) (int, error) {
 			}
 		}
 	}
-	if err := s.saveNotifyState(ctx, state); err != nil {
-		return sent, err
+	// 状态未变化时跳过写事务：扫描每分钟一轮，绝大多数轮次没有任何
+	// 边沿事件，逐轮全量改写 preferences 是纯粹的写放大。
+	if !notifyStatesEqual(prev, state) {
+		if err := s.saveNotifyState(ctx, state); err != nil {
+			return sent, err
+		}
 	}
 	return sent, nil
+}
+
+// notifyStatesEqual 比较两份告警状态是否完全一致。
+func notifyStatesEqual(a, b notifyState) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for kid, flags := range a {
+		bFlags, ok := b[kid]
+		if !ok || len(flags) != len(bFlags) {
+			return false
+		}
+		for capID, v := range flags {
+			if bFlags[capID] != v {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // notifyCaps 从 Key 行构建参与评估的额度档，周期计数器跨期视为归零

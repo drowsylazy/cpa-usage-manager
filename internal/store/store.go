@@ -152,6 +152,10 @@ type Store struct {
 
 	// onLeaseLost 在租约被接管时回调（用于上层告警）。
 	onLeaseLost func()
+
+	// pricingHookMu / onPricingChanged 是计价规则变更回调（服务层失效快照用）。
+	pricingHookMu    sync.Mutex
+	onPricingChanged func()
 }
 
 // Open 打开（必要时创建并迁移）数据库。
@@ -264,8 +268,15 @@ func buildDSN(opts Options, write bool) string {
 		q.Set("_txlock", "immediate")
 		// 8MiB 页缓存，减少写放大与临时溢出。
 		q.Add("_pragma", "cache_size(-8000)")
+		// 放宽 WAL 自动 checkpoint 阈值（默认 1000 页 ≈ 4MB）：每分钟心跳与
+		// 结算写入下，默认值会让 checkpoint 停顿更频繁地打断写事务。
+		q.Add("_pragma", "wal_autocheckpoint(4000)")
 	} else {
 		q.Add("_pragma", "query_only(1)")
+		// 8MiB 页缓存/连接。cache_size 是**每连接**的：读池共 9 条连接，
+		// 上调到 32MiB 会带来最坏 288MB 的常驻水位，对本插件（跑在宿主
+		// 进程内）不可接受；8MiB 下趋势/维度聚合的热页命中已足够。
+		q.Add("_pragma", "cache_size(-8000)")
 	}
 	if opts.ReadOnly {
 		q.Set("mode", "ro")

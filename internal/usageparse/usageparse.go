@@ -217,6 +217,9 @@ func ParseJSON(body []byte) (Usage, bool) {
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return Usage{}, false
 	}
+	if !bytes.Contains(trimmed, usageKeyProbe) {
+		return Usage{}, false
+	}
 	var acc Usage
 	found := false
 	for _, c := range findUsageContainers(trimmed, 0) {
@@ -236,6 +239,12 @@ type container struct {
 	raw    json.RawMessage
 	gemini bool
 }
+
+// usageKeyProbe 是全部 usage 容器键（"usage" / "usageMetadata" / "usage_metadata"）
+// 的公共文本前缀。流式 delta 块绝大多数不含用量字段，一次 bytes.Contains
+// 就能零分配地跳过整棵递归解析；误命中（正文里恰好含这段文本）只会退回
+// 完整解析，不影响正确性。
+var usageKeyProbe = []byte(`"usage`)
 
 // findUsageContainers 在 JSON 树中递归查找 usage / usageMetadata 容器。
 //
@@ -398,47 +407,64 @@ func Parse(body []byte) (Usage, bool) {
 
 // SSEPayloads 按 SSE 规范提取所有事件的 data 载荷。
 // 同一事件内的多行 data 以换行拼接；[DONE] 哨兵被跳过。
+//
+// 返回值是输入的子切片或单次拼接结果，调用方只读不持有（现有调用方均只读）。
 func SSEPayloads(body []byte) [][]byte {
 	if len(body) == 0 || len(body) > MaxBodyBytes {
 		return nil
 	}
+	// 惰性 CR 归一：绝大多数上游只发 \n，先探测再拷贝，
+	// 避免每个 chunk 白付两次整段 ReplaceAll。
+	normalized := body
+	if bytes.IndexByte(body, '\r') >= 0 {
+		normalized = bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+		normalized = bytes.ReplaceAll(normalized, []byte("\r"), []byte("\n"))
+	}
 	var out [][]byte
-	var cur []string
+	var cur [][]byte
 	flush := func() {
 		if len(cur) == 0 {
 			return
 		}
-		joined := strings.Join(cur, "\n")
+		var t []byte
+		if len(cur) == 1 {
+			t = cur[0] // 单行 data（最常见）：零拷贝
+		} else {
+			n := len(cur) - 1
+			for _, c := range cur {
+				n += len(c)
+			}
+			t = make([]byte, 0, n)
+			for i, c := range cur {
+				if i > 0 {
+					t = append(t, '\n')
+				}
+				t = append(t, c...)
+			}
+		}
 		cur = cur[:0]
-		t := strings.TrimSpace(joined)
-		if t == "" || t == "[DONE]" {
+		t = bytes.TrimSpace(t)
+		if len(t) == 0 || bytes.Equal(t, []byte("[DONE]")) {
 			return
 		}
-		out = append(out, []byte(t))
+		out = append(out, t)
 	}
-	// 统一换行，逐行扫描。
-	normalized := bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
-	normalized = bytes.ReplaceAll(normalized, []byte("\r"), []byte("\n"))
 	for line := range bytes.SplitSeq(normalized, []byte("\n")) {
-		s := string(line)
-		if s == "" {
+		if len(line) == 0 {
 			// 空行表示事件结束。
 			flush()
 			continue
 		}
-		if strings.HasPrefix(s, ":") {
+		if line[0] == ':' {
 			// 注释行。
 			continue
 		}
-		field, value, found := strings.Cut(s, ":")
-		if !found {
-			continue
-		}
-		if field != "data" {
+		field, value, found := bytes.Cut(line, []byte(":"))
+		if !found || !bytes.Equal(field, []byte("data")) {
 			// event / id / retry 等字段与用量无关。
 			continue
 		}
-		cur = append(cur, strings.TrimPrefix(value, " "))
+		cur = append(cur, bytes.TrimPrefix(value, []byte(" ")))
 	}
 	flush()
 	return out
@@ -496,7 +522,12 @@ func (a *Accumulator) FeedChunk(payload []byte) {
 		a.found = true
 		return
 	}
-	for _, line := range bytes.Split(payload, []byte("\n")) {
+	// 逐行兜底只可能命中含 usage 键的行；不含时零分配直接返回，
+	// 避免 N 行载荷跑 N 轮完整解析。
+	if !bytes.Contains(payload, usageKeyProbe) {
+		return
+	}
+	for line := range bytes.SplitSeq(payload, []byte("\n")) {
 		if u, ok := Parse(bytes.TrimSpace(line)); ok {
 			a.usage.merge(u)
 			a.found = true

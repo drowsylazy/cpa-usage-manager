@@ -286,12 +286,13 @@ func (s *Service) ExportCSV(ctx context.Context, w io.Writer, req ExportRequest)
 	name := fmt.Sprintf("cpa-usage-manager_%s_%s.csv", kind, time.Now().UTC().Format("20060102-150405"))
 	switch kind {
 	case "requests":
-		page, err := s.ListRequests(ctx, f, limit, 0, req.Filter.Sort, req.Filter.Order)
-		if err != nil {
+		// 流式写出：逐行遍历，不把整页请求装载进内存（上限 10 万行时
+		// 全量装载约需数十 MB 峰值）。
+		if err := cw.Write(requestCSVHeader); err != nil {
 			return "", err
 		}
-		if err := writeCSV(cw, requestCSVHeader, len(page.Items), func(i int) []string {
-			return requestCSVRow(page.Items[i])
+		if err := s.IterateRequests(ctx, f, limit, req.Filter.Sort, req.Filter.Order, func(r store.Request) error {
+			return cw.Write(requestCSVRow(r))
 		}); err != nil {
 			return "", err
 		}

@@ -1231,21 +1231,10 @@ func notifySweepLoop(svc *service.Service, stop <-chan struct{}) {
 	}
 }
 
+// startReservationHeartbeat 把预占登记进服务层的集中心跳注册表：
+// 单个后台协程批量续期全部在途预占，不再每请求各起一个 ticker goroutine。
 func startReservationHeartbeat(svc *service.Service, reservationID string) func() {
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				_ = svc.TouchReservation(context.Background(), reservationID)
-			}
-		}
-	}()
-	return func() { close(done) }
+	return svc.TrackReservation(reservationID)
 }
 
 func hostModelExecute(hostCallbackID string, req rpcExecutorRequest, body []byte, stream bool) ([]byte, http.Header, int, error) {
@@ -1329,13 +1318,20 @@ func interceptAfter(body []byte) ([]byte, error) {
 		return okEnvelope(rejectResponse(http.StatusTooManyRequests, err.Error()))
 	}
 	imageHoldsMu.Lock()
+	removed := 0
 	for id, h := range imageHolds {
 		if h.created.Before(time.Now().Add(-imageHoldMaxAge)) {
 			delete(imageHolds, id)
+			removed++
 			if h.stopHeart != nil {
 				h.stopHeart() // 停掉残留条目的心跳 ticker，回收 goroutine
 			}
 		}
+	}
+	// Go 的 map 删除元素后不会缩容：一次突发把 bucket 数组撑大后即使清空
+	// 也照常常驻。归零时重建，把数组还回去（与 regexpCache 超限重建同思路）。
+	if removed > 0 && len(imageHolds) == 0 {
+		imageHolds = make(map[string]imageHold)
 	}
 	imageHolds[requestID] = imageHold{
 		reservation: reservation,

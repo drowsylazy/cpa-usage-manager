@@ -85,12 +85,16 @@ type DimensionReport struct {
 	Dimension string         `json:"dimension"`
 	Rows      []DimensionRow `json:"rows"`
 	Total     DimensionRow   `json:"total"`
+	// Count 是分组总数，不受 limit 截断影响；前端据此展示「共 N 项」。
+	Count int64 `json:"count"`
 }
 
 // GroupByDimension 按给定维度聚合用量。
 //
 // 默认走分钟聚合表（usage_rollups），维度不在聚合表里时退回逐请求表。
-// limit <= 0 时返回全部分组。
+// limit <= 0 时返回全部分组；limit > 0 时 SQL 层直接返回前 N 组（按
+// 费用/Token/名称排序），合计查询把 Total 与分组数下推到 SQL——
+// Total/Count 始终覆盖全部分组，而内存峰值保持 O(limit)，不随分组数膨胀。
 func (s *Service) GroupByDimension(ctx context.Context, f UsageFilter, dimension string, limit int) (DimensionReport, error) {
 	dimension = strings.TrimSpace(dimension)
 	if dimension == "" {
@@ -105,61 +109,35 @@ func (s *Service) GroupByDimension(ctx context.Context, f UsageFilter, dimension
 		}
 	}
 
-	var query string
-	var args []any
-	if fromRollups {
-		clause, a := rollupFilter(f)
-		args = a
-		query = `SELECT ` + column + `,
-			COALESCE(SUM(req_count),0), COALESCE(SUM(fail_count),0),
-			COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-			COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(cached_tokens),0),
-			COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0),
-			COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_micro_usd),0),
-			COALESCE(SUM(latency_sum),0), COALESCE(SUM(ttft_sum),0),
-			COALESCE(SUM(tps_milli_sum),0), COALESCE(SUM(ttft_count),0)
-			FROM usage_rollups` + clause + ` GROUP BY 1`
-	} else {
-		clause, a := requestFilter(f)
-		args = a
-		query = `SELECT ` + column + `,
-			COUNT(*), COALESCE(SUM(CASE WHEN result <> 'ok' THEN 1 ELSE 0 END),0),
-			COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-			COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(cached_tokens),0),
-			COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0),
-			COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_micro_usd),0),
-			COALESCE(SUM(latency_ms),0), COALESCE(SUM(ttft_ms),0),
-			COALESCE(SUM(tps_milli),0), COALESCE(SUM(CASE WHEN ttft_ms > 0 THEN 1 ELSE 0 END),0)
-			FROM requests` + clause + ` GROUP BY 1`
+	table, agg := "usage_rollups", rollupAggregates
+	clause, args := rollupFilter(f)
+	if !fromRollups {
+		table, agg = "requests", requestAggregates
+		clause, args = requestFilter(f)
 	}
-	query += ` ORDER BY 11 DESC, 10 DESC, 1`
+
+	rowQuery := `SELECT ` + column + `, ` + agg + `
+		FROM ` + table + clause + ` GROUP BY 1` +
+		` ORDER BY 11 DESC, 10 DESC, 1`
 	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
+		rowQuery += fmt.Sprintf(" LIMIT %d", limit)
 	}
+	totalQuery := `SELECT ` + agg + `, COUNT(DISTINCT ` + column + `) FROM ` + table + clause
 
 	out := DimensionReport{Dimension: dimension}
 	err := s.st.Read(ctx, func(q store.Querier) error {
-		rows, err := q.QueryContext(ctx, query, args...)
+		rows, err := q.QueryContext(ctx, rowQuery, args...)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var r DimensionRow
-			var cost, latencySum, ttftSum, tpsSum, ttftCount int64
-			if err := rows.Scan(&r.Value, &r.Requests, &r.Failures,
-				&r.InputTokens, &r.OutputTokens, &r.ReasoningTokens, &r.CachedTokens,
-				&r.CacheReadTokens, &r.CacheCreationTokens, &r.TotalTokens, &cost,
-				&latencySum, &ttftSum, &tpsSum, &ttftCount); err != nil {
+			r, sums, err := scanDimensionRow(rows)
+			if err != nil {
 				return err
 			}
-			r.CostMicroUSD = money.Micro(cost)
-			r.LatencyAvgMS = divOrZero(latencySum, r.Requests)
-			r.TTFTAvgMS = divOrZero(ttftSum, ttftCount)
-			r.TPSAvgMilli = divOrZero(tpsSum, r.Requests)
-			r.CacheHitRateBP = cacheHitRateBP(r)
 			out.Rows = append(out.Rows, r)
-			accumulate(&out.Total, r, latencySum, ttftSum, tpsSum, ttftCount)
+			accumulate(&out.Total, r, sums)
 		}
 		return rows.Err()
 	})
@@ -168,11 +146,78 @@ func (s *Service) GroupByDimension(ctx context.Context, f UsageFilter, dimension
 	}
 	finalizeTotal(&out.Total)
 	out.Total.Value = "__total__"
+	out.Count = int64(len(out.Rows))
+
+	if limit > 0 {
+		// 合计下推：一条不分组聚合查出全量 Total 与分组数，
+		// 避免为算合计而把全部分组装载进内存再排序截断。
+		var t DimensionRow
+		var cost, latencySum, ttftSum, tpsSum, ttftCount int64
+		if err := s.st.Read(ctx, func(q store.Querier) error {
+			return q.QueryRowContext(ctx, totalQuery, args...).Scan(
+				&t.Requests, &t.Failures,
+				&t.InputTokens, &t.OutputTokens, &t.ReasoningTokens, &t.CachedTokens,
+				&t.CacheReadTokens, &t.CacheCreationTokens, &t.TotalTokens, &cost,
+				&latencySum, &ttftSum, &tpsSum, &ttftCount, &out.Count)
+		}); err != nil {
+			return DimensionReport{}, err
+		}
+		t.CostMicroUSD = money.Micro(cost)
+		t.LatencyAvgMS = divOrZero(latencySum, t.Requests)
+		t.TTFTAvgMS = divOrZero(ttftSum, ttftCount)
+		t.TPSAvgMilli = divOrZero(tpsSum, t.Requests)
+		t.CacheHitRateBP = cacheHitRateBP(t)
+		t.Value = "__total__"
+		out.Total = t
+	}
 	return out, nil
 }
 
+// rollupAggregates / requestAggregates 是两表的聚合列清单（14 列），
+// 分组查询与合计查询共用同一份文本，保证两条查询口径严格一致。
+const rollupAggregates = `COALESCE(SUM(req_count),0), COALESCE(SUM(fail_count),0),
+			COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+			COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(cached_tokens),0),
+			COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0),
+			COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_micro_usd),0),
+			COALESCE(SUM(latency_sum),0), COALESCE(SUM(ttft_sum),0),
+			COALESCE(SUM(tps_milli_sum),0), COALESCE(SUM(ttft_count),0)`
+
+const requestAggregates = `COUNT(*), COALESCE(SUM(CASE WHEN result <> 'ok' THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+			COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(cached_tokens),0),
+			COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0),
+			COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_micro_usd),0),
+			COALESCE(SUM(latency_ms),0), COALESCE(SUM(ttft_ms),0),
+			COALESCE(SUM(tps_milli),0), COALESCE(SUM(CASE WHEN ttft_ms > 0 THEN 1 ELSE 0 END),0)`
+
+// dimRawSums 是一行分组的原始聚合值（均值换算前的 sum/count），
+// 供合计行用「sum 累加 / count 累加」精确重算均值。
+type dimRawSums struct {
+	latencySum, ttftSum, tpsSum, ttftCount int64
+}
+
+// scanDimensionRow 扫描一行分组结果（维度值 + 14 个聚合列）。
+func scanDimensionRow(sc interface{ Scan(...any) error }) (DimensionRow, dimRawSums, error) {
+	var r DimensionRow
+	var sums dimRawSums
+	var cost int64
+	if err := sc.Scan(&r.Value, &r.Requests, &r.Failures,
+		&r.InputTokens, &r.OutputTokens, &r.ReasoningTokens, &r.CachedTokens,
+		&r.CacheReadTokens, &r.CacheCreationTokens, &r.TotalTokens, &cost,
+		&sums.latencySum, &sums.ttftSum, &sums.tpsSum, &sums.ttftCount); err != nil {
+		return DimensionRow{}, dimRawSums{}, err
+	}
+	r.CostMicroUSD = money.Micro(cost)
+	r.LatencyAvgMS = divOrZero(sums.latencySum, r.Requests)
+	r.TTFTAvgMS = divOrZero(sums.ttftSum, sums.ttftCount)
+	r.TPSAvgMilli = divOrZero(sums.tpsSum, r.Requests)
+	r.CacheHitRateBP = cacheHitRateBP(r)
+	return r, sums, nil
+}
+
 // accumulate 把一行并入合计行，均值字段在最后统一重算。
-func accumulate(total *DimensionRow, r DimensionRow, latencySum, ttftSum, tpsSum, ttftCount int64) {
+func accumulate(total *DimensionRow, r DimensionRow, sums dimRawSums) {
 	total.Requests += r.Requests
 	total.Failures += r.Failures
 	total.InputTokens += r.InputTokens
@@ -184,10 +229,10 @@ func accumulate(total *DimensionRow, r DimensionRow, latencySum, ttftSum, tpsSum
 	total.TotalTokens += r.TotalTokens
 	total.CostMicroUSD = total.CostMicroUSD.AddSat(r.CostMicroUSD)
 	// 合计行的均值用「累加的 sum / 累加的 count」，而非各行均值的平均。
-	total.LatencyAvgMS += latencySum
-	total.TTFTAvgMS += ttftSum
-	total.TPSAvgMilli += tpsSum
-	total.CacheHitRateBP += ttftCount
+	total.LatencyAvgMS += sums.latencySum
+	total.TTFTAvgMS += sums.ttftSum
+	total.TPSAvgMilli += sums.tpsSum
+	total.CacheHitRateBP += sums.ttftCount
 }
 
 // finalizeTotal 把 accumulate 暂存的 sum/count 换算为均值。

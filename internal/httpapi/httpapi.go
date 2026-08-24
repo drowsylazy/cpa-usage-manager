@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/drowsylazy/cpa-usage-manager/internal/money"
@@ -100,8 +101,19 @@ func (a *API) register() {
 	a.route("/dedupe", a.dedupe)
 }
 func (a *API) Handler() http.Handler { return a.gzip(a.mux) }
+
+// console 输出管理面板壳。面板字节在 init 阶段已预压缩，
+// 客户端支持 gzip 时直接吐预压缩结果，不再逐请求现场压缩；
+// 该路径在 gzip 中介件里放行（isSelfEncoded），避免二次压缩。
 func (a *API) console(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Add("Vary", "Accept-Encoding")
+	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(web.ConsoleHTMLGzip())
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(web.ConsoleHTML())
 }
@@ -114,14 +126,28 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 		next(w, r)
 	}
 }
+
+// isSelfEncoded 报告路径的处理器自行协商 Content-Encoding，gzip 中介件应放行。
+func isSelfEncoded(p string) bool {
+	return strings.HasSuffix(p, "/console")
+}
+
+// gzipWriters 复用 gzip.Writer：其内部 deflate 窗口与哈希表约 260KB，
+// 面板一次刷新触发多个 API 请求，逐请求新建是纯浪费的瞬时分配。
+var gzipWriters = sync.Pool{New: func() any { return gzip.NewWriter(nil) }}
+
 func (a *API) gzip(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") || isBinaryPath(r.URL.Path) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") || isBinaryPath(r.URL.Path) || isSelfEncoded(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		gw := gzip.NewWriter(w)
-		defer gw.Close()
+		gw := gzipWriters.Get().(*gzip.Writer)
+		gw.Reset(w)
+		defer func() {
+			_ = gw.Close()
+			gzipWriters.Put(gw)
+		}()
 		w.Header().Set("Content-Encoding", "gzip")
 		next.ServeHTTP(&gzipResponseWriter{ResponseWriter: w, Writer: gw}, r)
 	})

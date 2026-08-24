@@ -82,7 +82,7 @@ func NewModelsDevSyncer(url string, client *http.Client) *ModelsDevSyncer {
 		url = ModelsDevURL
 	}
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		client = &http.Client{Timeout: 30 * time.Second, Transport: sharedTransport}
 	}
 	return &ModelsDevSyncer{URL: url, Client: client}
 }
