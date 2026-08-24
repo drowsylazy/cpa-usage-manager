@@ -166,14 +166,19 @@ func (a *API) gzip(next http.Handler) http.Handler {
 		}
 		gw := gzipWriters.Get().(*gzip.Writer)
 		gw.Reset(w)
-		defer func() {
-			_ = gw.Close()
-			gzipWriters.Put(gw)
-		}()
 		var lw lazyGzipWriter
 		lw.ResponseWriter = w
 		lw.gw = gw
 		lw.min = a.minCompress
+		defer func() {
+			// 只有真正走了 gzip 分支才需要收尾：Close 一个从未写入的
+			// gzip.Writer 会向响应追加一整个「空 gzip 流」的二进制字节，
+			// 恰好落在明文 body 之后（v0.4.0 面板 JSON 后脏字符的根因）。
+			if lw.useGz {
+				_ = gw.Close()
+			}
+			gzipWriters.Put(gw)
+		}()
 		next.ServeHTTP(&lw, r)
 		// 处理器可能只 WriteHeader 不写 body（空响应），补发延迟的状态行。
 		lw.writeHeaderOnce()

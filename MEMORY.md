@@ -18,6 +18,8 @@
 
 ## Discovered durable knowledge
 
+- **gzip 池化 writer 的空流泄漏（v0.4.0 回归，2026-02 修复）**：`sync.Pool` 取出的 `gzip.Writer` 若 Reset 后从未被写入，`Close()` 仍会向目标输出一整个「空 gzip 流」的二进制字节——在 lazyGzipWriter 的明文分支（响应小于 min_bytes）恰好追加到 JSON 尾部，浏览器 `r.json()` 报 "Unexpected non-whitespace character after JSON"，DevTools 里表现为可读 JSON 后一个 � 替换符。修复：仅 `lw.useGz` 为真才 Close。判据函数 `jsonBytesValid`（httpapi/lazygzip_test.go）与浏览器同口径，可复用于任何「body 必须是单值 JSON」的断言。
+
 - **入库时防重（2026-02 性能优化批）**：双写残余竞态改为两侧写事务内探测合并——被动侧 `store.RecordPassiveUsage`（带 PassiveDedupeHint）与执行器侧 `SettleReservation` 在同一事务内 `duplicateProbeTx` 探测另一口径行，命中即合并、不插行；`ReconcileRequestDuplicates`（store+service）已**整体删除**，main.go handleUsage 不再落库后对账，service.Settle 不再起 goroutine 对账。`DedupeRequests` 仅存于 Maintain 兜底。依据：单写者串行化使事务内「先查后插」原子成立，谓词与旧对账完全一致故覆盖面等价。
 - **schema v7**：`idx_reservations_caller_status(caller_id,status)`（caller_scope 预占聚合）与 `idx_plugin_keys_scope_created(caller_scope,created_at)`（FindKeyByCallerScope）。另：读池 cache_size 已降 -2000、maxReadConns=4；写池保持 -8000；DSN 增加 journal_size_limit(64MiB)。
 - **prepared statement 缓存实测否决**：database/sql 的 `tx.Stmt` 对 modernc 驱动仍逐次重编译（零收益）；更危险的是惰性 `db.PrepareContext` 在写事务内会与单写连接池自锁（MaxOpenConns=1，事务占满唯一连接，取不到连接做准备→永久挂死，实测发生）。热路径语句统一经 `Store.execHotTx` 收口，未来绕过 database/sql 时只改这一处。

@@ -12,7 +12,7 @@
 | P0-2 | ✅ 已实施 | service 挂起表 + 心跳协程批量刷 `TouchKeysLastUsed`；queueKeyTouch 同时负责拉起心跳协程（纯鉴权场景） |
 | P0-3 | ✅ 已实施 | 入库时防重：`RecordPassiveUsage`/`SettleReservation` 事务内探测合并；删除逐请求对账与 goroutine；Maintain 兜底保留 |
 | P0-4 | ✅ 已实施 | schema v7：`idx_reservations_caller_status` + `idx_plugin_keys_scope_created` |
-| P0-5 | ✅ 已实施 | gzip 尊重开关与 min_bytes（首写长度判定，lazyGzipWriter）；httptest 替换为手工 Request + rpcResponseWriter；New 改 Options 签名 |
+| P0-5 | ✅ 已实施 | gzip 尊重开关与 min_bytes（首写长度判定，lazyGzipWriter）；httptest 替换为手工 Request + rpcResponseWriter；New 改 Options 签名。**回归修复**：明文分支误 Close 未使用的池化 gzip.Writer 导致「JSON 后空流脏字节」，改为仅 useGz 时 Close |
 | P0-6 | ✅ 已实施 | console 明文 sync.Once 常驻 |
 | P0-7 | ✅ 已实施 | 维度分组硬上限 500（Total/Count 不受影响）；trends 超 400 桶自动倍增桶距；前端 loadDim 带 limit=50 |
 | P1-1 | ❌ 实测否决 | tx.Stmt 对 modernc 驱动仍逐次重编译（零收益），惰性 Prepare 更会与单写连接池自锁挂死；保留 `execHotTx` 收口待未来绕过 database/sql |
