@@ -300,7 +300,7 @@ func (s *Service) Balance(ctx context.Context, kid string, now time.Time) (Balan
 }
 
 // RouteRow 是一条「上游实际模型」的路由聚合行。
-// UpstreamModel 为别名本身时表示该别名下没有（或有不唯一的）显式真名可归并。
+// UpstreamModel 为别名本身时表示该别名下完全没有显式真名可分摊。
 type RouteRow struct {
 	UpstreamModel string   `json:"upstream_model"`
 	Requests      int64    `json:"requests"`
@@ -310,8 +310,9 @@ type RouteRow struct {
 
 // RouteReport 按上游实际模型聚合，用于暴露上游二次路由：
 // 同一别名被拆到多个真名、或渠道返回了意料之外的模型时一目了然。
-// 部分请求嗅探到真名、部分没捕获到的别名，会把未捕获的请求归并进唯一真名行，
-// 避免「别名 + 真名」裂成两行重复计数；Models 收集涉及的本地别名供前端筛选。
+// 部分请求嗅探到真名、部分没捕获到的别名，未捕获请求按各真名行已捕获量
+// 加权分摊（requests 按请求占比、token 按 token 占比），本地别名不再单独成行；
+// Models 收集涉及的本地别名供前端筛选。
 func (s *Service) RouteReport(ctx context.Context, f UsageFilter) ([]RouteRow, error) {
 	clause, args := requestFilter(f)
 	query := `SELECT COALESCE(NULLIF(upstream_model,''), model), COALESCE(upstream_model,''),
@@ -351,61 +352,96 @@ func (s *Service) RouteReport(ctx context.Context, f UsageFilter) ([]RouteRow, e
 	if err != nil {
 		return nil, fmt.Errorf("聚合上游路由失败: %w", err)
 	}
-	// 别名 → 唯一显式真名（出现多个真名时不归并，保留独立行暴露二次路由）。
-	truth := make(map[string]string)
-	counts := make(map[string]map[string]int)
-	for _, a := range aggs {
-		if a.raw == "" {
+	// 回退行（raw==''，展示名实为别名）的归并：把该别名下未捕获真名的请求
+	// 按各显式真名行**已捕获**的量加权分摊（requests 按请求占比、token 按 token
+	// 占比，最大余数法保整数守恒），别名不再单独成行；该别名完全没有显式真名时
+	// 才保留为独立行。权重取原始快照，多个别名分摊到同一真名行时互不干扰。
+	type agg struct {
+		row RouteRow
+		raw string // 原始 upstream_model；空 = 回退行
+		req int64  // 已捕获原始值，作分摊权重
+		tok int64
+	}
+	rows2 := make([]agg, len(aggs))
+	for i, a := range aggs {
+		rows2[i] = agg{row: a.row, raw: a.raw, req: a.row.Requests, tok: a.row.TotalTokens}
+	}
+	targets := make(map[string][]int) // 别名 → 显式真名行下标
+	for i := range rows2 {
+		if rows2[i].raw == "" {
 			continue
 		}
-		for _, m := range a.row.Models {
-			set := counts[m]
-			if set == nil {
-				set = make(map[string]int)
-				counts[m] = set
-			}
-			set[a.raw]++
+		for _, m := range rows2[i].row.Models {
+			targets[m] = append(targets[m], i)
 		}
 	}
-	for alias, set := range counts {
-		if len(set) == 1 {
-			for name := range set {
-				truth[alias] = name
-			}
-		}
-	}
-	out := make([]RouteRow, 0, len(aggs))
-	idx := make(map[string]int)
-	union := func(dst, add []string) []string {
-		has := make(map[string]bool, len(dst))
-		for _, m := range dst {
-			has[m] = true
-		}
-		for _, m := range add {
-			if !has[m] {
-				dst = append(dst, m)
-				has[m] = true
-			}
-		}
-		return dst
-	}
-	for _, a := range aggs {
-		name := a.row.UpstreamModel
-		if a.raw == "" {
-			if t, ok := truth[name]; ok {
-				name = t
-			}
-		}
-		if i, ok := idx[name]; ok {
-			out[i].Requests += a.row.Requests
-			out[i].TotalTokens += a.row.TotalTokens
-			out[i].Models = union(out[i].Models, a.row.Models)
+	drop := make(map[int]bool)
+	for i := range rows2 {
+		if rows2[i].raw != "" {
 			continue
 		}
-		idx[name] = len(out)
-		a.row.UpstreamModel = name
-		out = append(out, a.row)
+		dst := targets[rows2[i].row.UpstreamModel]
+		if len(dst) == 0 {
+			continue
+		}
+		wReq := make([]int64, len(dst))
+		wTok := make([]int64, len(dst))
+		for k, j := range dst {
+			wReq[k] = rows2[j].req
+			wTok[k] = rows2[j].tok
+		}
+		for k, j := range dst {
+			rows2[j].row.Requests += shareInt(rows2[i].row.Requests, wReq, k)
+			rows2[j].row.TotalTokens += shareInt(rows2[i].row.TotalTokens, wTok, k)
+		}
+		drop[i] = true
+	}
+	out := make([]RouteRow, 0, len(rows2))
+	for i := range rows2 {
+		if !drop[i] {
+			out = append(out, rows2[i].row)
+		}
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Requests > out[j].Requests })
 	return out, nil
+}
+
+// shareInt 把 total 按 weights 加权分成 len(weights) 份，返回第 k 份。
+// 最大余数法：各份之和恒等于 total（权重和为 0 时全部给第 0 份）。
+func shareInt(total int64, weights []int64, k int) int64 {
+	var wsum int64
+	for _, w := range weights {
+		if w < 0 {
+			w = 0
+		}
+		wsum += w
+	}
+	if wsum <= 0 || total <= 0 {
+		if k == 0 {
+			return total
+		}
+		return 0
+	}
+	shares := make([]int64, len(weights))
+	var acc int64
+	for i, w := range weights {
+		if w < 0 {
+			w = 0
+		}
+		shares[i] = total * w / wsum
+		acc += shares[i]
+	}
+	rem := total - acc
+	if rem > 0 {
+		order := make([]int, len(weights))
+		for i := range order {
+			order[i] = i
+		}
+		sort.SliceStable(order, func(a, b int) bool { return weights[order[a]] > weights[order[b]] })
+		for i := 0; rem > 0 && i < len(order); i++ {
+			shares[order[i]]++
+			rem--
+		}
+	}
+	return shares[k]
 }

@@ -2045,16 +2045,24 @@ const DIMS = [
   { value: 'key_id', label: '密钥' },
   { value: 'caller_id', label: 'caller' },
 ];
-let dimRows = [], dimPage = 0;
+let dimRows = [], dimPage = 0, dimSort = 'cost', dimDir = 'desc';
 const DIM_PAGE_SIZE = 5;
 async function loadDim() {
   const dim = dimSel.value;
   const r = await api('/usage/dimension?' + new URLSearchParams({ dimension: dim, ...rangeParams() }));
-  // 费用相同时（如全部未计价）按请求数降序，保证视觉排序稳定。
-  dimRows = (r.rows || []).slice()
-    .sort((a, b) => b.cost_micro_usd - a.cost_micro_usd || (b.requests || 0) - (a.requests || 0));
+  dimRows = r.rows || [];
+  sortDimRows();
   dimPage = 0;
   renderDim();
+}
+// 排序键由表头点击驱动（与请求明细同款交互），客户端全量重排。
+function sortDimRows() {
+  const val = r => dimSort === 'requests' ? (Number(r.requests) || 0)
+    : dimSort === 'failures' ? (Number(r.failures) || 0)
+    : dimSort === 'tokens' ? (Number(effTokens(r)) || 0)
+    : (Number(r.cost_micro_usd) || 0);
+  const sgn = dimDir === 'asc' ? 1 : -1;
+  dimRows.sort((a, b) => sgn * (val(a) - val(b)));
 }
 function renderDim() {
   const rowsAll = dimRows;
@@ -2087,11 +2095,20 @@ function renderDim() {
   const pages = Math.max(1, Math.ceil(rowsAll.length / DIM_PAGE_SIZE));
   if (dimPage >= pages) dimPage = pages - 1;
   const rows = rowsAll.slice(dimPage * DIM_PAGE_SIZE, (dimPage + 1) * DIM_PAGE_SIZE);
+  // 数值列表头可点击排序（同请求明细：th.sort + data-dir，点击换键/切向）。
+  const th = (label, key, num, wide) => '<th class="' + (wide ? 'w-grow' : num ? 'num' : '')
+    + (key ? ' sort"' : '"')
+    + (key ? ' data-sort="' + key + '"' : '')
+    + (key && dimSort === key ? ' data-dir="' + dimDir + '"' : '') + '>' + label + '</th>';
   $('dim-body').innerHTML = '<div class="table-wrap fixed5"><table class="data"><thead><tr>'
-    + '<th class="w-grow">' + esc((DIMS.find(d => d.value === dimSel.value) || {}).label || dimSel.value) + '</th>'
-    + '<th class="num">请求</th><th class="num">失败</th><th class="num">Token</th><th class="num">费用</th>'
-    + '<th class="num">缓存</th>'
-    + '<th class="num">平均延迟</th><th class="num">TPS</th></tr></thead><tbody>'
+    + th(esc((DIMS.find(d => d.value === dimSel.value) || {}).label || dimSel.value), '', false, true)
+    + th('请求', 'requests', true)
+    + th('失败', 'failures', true)
+    + th('Token', 'tokens', true)
+    + th('费用', 'cost', true)
+    + th('缓存', '', true)
+    + th('平均延迟', '', true)
+    + th('TPS', '', true) + '</tr></thead><tbody>'
     + rows.map(row => {
       const share = shareOf(row);
       const hit = cacheHitRate(row);
@@ -2119,6 +2136,17 @@ function renderDim() {
   if (prev) prev.onclick = () => { dimPage--; renderDim(); };
   if (next) next.onclick = () => { dimPage++; renderDim(); };
 }
+// 表头排序：#dim-body 常驻不重建，事件委托一次绑定即可。
+$('dim-body').addEventListener('click', e => {
+  const thEl = e.target.closest('th.sort');
+  if (!thEl) return;
+  const keyName = thEl.dataset.sort;
+  if (dimSort === keyName) dimDir = dimDir === 'desc' ? 'asc' : 'desc';
+  else { dimSort = keyName; dimDir = 'desc'; }
+  sortDimRows();
+  dimPage = 0;
+  renderDim();
+});
 // fmtTPS 展示 TPS：超过 3000 token/s 视为宿主缓冲整转产生的坏测量
 // （与后端落库上限同口径），v0.3.0 之前入库的历史脏行在展示层一并隐藏。
 const maxPlausibleTPS = 3000;
