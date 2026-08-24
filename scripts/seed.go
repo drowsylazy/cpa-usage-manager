@@ -72,13 +72,13 @@ func tk(n int64) *int64            { return &n }
 
 var keySpecs = []keySpec{
 	{label: "本地开发", quota: mic(50), daily: mic(5), conc: 4, weight: 22, fill: .34},
-	// 同时配金额与 token 限额：两把闸并列
-	{label: "CI 流水线", quota: mic(200), daily: mic(20), tokLim: tk(50_000_000), tokDay: tk(5_000_000), conc: 12, weight: 26, fill: .82},
+	// v0.3.10 起金额与 Token 限额互斥二选一；本枚演示纯 Token 闸。
+	{label: "CI 流水线", tokLim: tk(50_000_000), tokDay: tk(5_000_000), conc: 12, weight: 26, fill: .82},
 	{label: "移动端 App", quota: mic(120), conc: 8, weight: 18, fill: .97},
 	// 只配 token 限额、不配金额：证明 token 是独立的一把闸
 	{label: "数据分析脚本", tokLim: tk(20_000_000), tokDay: tk(2_000_000), conc: 0, weight: 14, fill: .62},
 	{label: "", quota: mic(30), conc: 2, weight: 8, fill: .11},
-	{label: "长标签测试：市场部门季度报告自动生成流水线（负责人：李四）", quota: mic(80), tokDay: tk(800_000), conc: 3, weight: 6, fill: .58},
+	{label: "长标签测试：市场部门季度报告自动生成流水线（负责人：李四）", quota: mic(80), conc: 3, weight: 6, fill: .58},
 	{label: "已停用的旧密钥", quota: mic(25), conc: 1, weight: 3, fill: .44, disable: true},
 	{label: "已撤销的泄露密钥", quota: mic(10), conc: 1, weight: 1, fill: .9, revoke: true},
 }
