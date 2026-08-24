@@ -89,6 +89,11 @@ func (a *API) register() {
 	a.route("/pricing/reset", a.pricingReset)
 	a.route("/pricing/sync", a.pricingSync)
 
+	a.route("/model-routes", a.modelRoutes)
+	a.route("/model-routes/save", a.modelRouteSave)
+	a.route("/model-routes/delete", a.modelRouteDelete)
+	a.route("/model-routes/judge", a.modelRouteJudge)
+
 	a.route("/usage", a.usage)
 	a.route("/usage/summary", a.usageSummary)
 	a.route("/usage/dimension", a.usageDimension)

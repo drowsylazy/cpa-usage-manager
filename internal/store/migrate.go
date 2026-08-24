@@ -8,7 +8,7 @@ import (
 
 // SchemaVersion 是本代码期望的数据库 schema 版本。
 // 打开库时若发现库版本更高，说明是被更新版插件写过的库，拒绝降级使用。
-const SchemaVersion = 7
+const SchemaVersion = 8
 
 // migration 是一次版本化迁移。
 type migration struct {
@@ -356,6 +356,27 @@ var migrations = []migration{
 			// FindKeyByCallerScope 按 caller_scope 等值 + created_at DESC 取一条，
 			// 无索引时是全表排序；Key 数多时鉴权路径每次都付这个代价。
 			`CREATE INDEX idx_plugin_keys_scope_created ON plugin_keys(caller_scope, created_at)`,
+		},
+	},
+	{
+		version: 8,
+		name:    "model_routes",
+		stmts: []string{
+			// ---- 模型路由（集合别名）----
+			// rule 列存路由规则脚本（internal/routelang 语法定义），保存期已
+			// 编译校验；引用的目标模型名在编译期静态提取，不单独落列。
+			// alias 匹配大小写不敏感，NOCASE 唯一索引由数据库兜底。
+			`CREATE TABLE model_routes (
+				id               INTEGER PRIMARY KEY,
+				alias            TEXT    NOT NULL,
+				rule             TEXT    NOT NULL,
+				cooldown_seconds INTEGER NOT NULL DEFAULT 60,
+				pricing_mode     TEXT    NOT NULL DEFAULT 'target',
+				enabled          INTEGER NOT NULL DEFAULT 1,
+				created_at       INTEGER NOT NULL,
+				updated_at       INTEGER NOT NULL
+			)`,
+			`CREATE UNIQUE INDEX idx_model_routes_alias ON model_routes(alias COLLATE NOCASE)`,
 		},
 	},
 }

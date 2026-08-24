@@ -2537,6 +2537,167 @@ $('fx-refresh').addEventListener('click', async () => {
   } catch (e) { toast(e.message, 'err'); }
 });
 
+// ---------- 模型集合（路由别名） ----------
+// 集合别名 = 一条规则脚本 + 有序目标链；保存期服务端编译校验并回填 refs。
+const routeCache = { items: [], judge: { model: '', timeout_ms: 8000 }, modelsLoaded: false };
+const TIPS_routeRule = 'when 条件 -> 候选链；候选链为 "模型"、priority ["a","b"]（声明序即回退序）'
+  + '或 weighted {"a":3,"b":1}（加权随机，选中者排首）。最后必须有一条无条件兜底分支（-> ...）。\n'
+  + '变量：input_tokens / body_len / model / stream / thinking_effort / source。'
+  + 'ai_judge(["simple","hard"]) 返回其中一项，可与 == 连用做智能分级（需先配置评判模型）。\n'
+  + '# 开头是注释。';
+
+loaders.routes = async () => {
+  const r = await api('/model-routes');
+  routeCache.items = r.items || [];
+  routeCache.judge = r.judge || routeCache.judge;
+  renderRouteJudgeState();
+  renderRouteCards();
+  stamp();
+};
+function renderRouteJudgeState() {
+  const badge = $('route-judge-state');
+  if (badge) badge.hidden = !!routeCache.judge.model;
+}
+function routeCard(r) {
+  const refs = (r.refs || []).map(x => '<span class="rt-ref">' + esc(x) + '</span>').join('')
+    || '<span class="note">规则未引用任何目标</span>';
+  const rulePreview = esc(r.rule || '');
+  const modeBadge = r.pricing_mode === 'alias' ? '<span class="pill trace">按别名声价</span>' : '<span class="pill signal">按目标计价</span>';
+  return '<div class="rt-card' + (r.enabled ? '' : ' off') + '" role="listitem" data-id="' + r.id + '">'
+    + '<div class="rt-top"><span class="rt-alias">' + esc(r.alias) + '</span>'
+    + '<span class="pill ' + (r.enabled ? 'live' : '') + '">' + (r.enabled ? '启用' : '停用') + '</span></div>'
+    + '<div class="rt-meta">' + modeBadge
+    + '<span>冷却 <b>' + (r.cooldown_seconds || 0) + 's</b></span></div>'
+    + '<pre class="rt-rule" title="规则脚本">' + rulePreview + '</pre>'
+    + '<div class="rt-chips">' + refs + '</div>'
+    + '<div class="rt-acts">'
+    + '<button type="button" class="btn small" data-route-toggle="' + r.id + '">' + (r.enabled ? '停用' : '启用') + '</button>'
+    + '<button type="button" class="btn small" data-route-edit="' + r.id + '">编辑</button>'
+    + '<button type="button" class="btn small danger" data-route-del="' + r.id + '">删除</button>'
+    + '</div></div>';
+}
+function renderRouteCards() {
+  const items = routeCache.items;
+  $('route-rows').innerHTML = items.length
+    ? items.map(routeCard).join('')
+    : '<div class="empty"><p class="empty-title">还没有模型集合</p>'
+      + '<p class="empty-hint">新建集合后，插件 Key 请求别名即按规则路由到健康目标，失败自动转移。</p></div>';
+}
+async function loadRouteModelList() {
+  if (routeCache.modelsLoaded) return;
+  try {
+    const r = await api('/usage/dimension?' + new URLSearchParams({ dimension: 'model', limit: '200' }));
+    $('route-model-list').innerHTML = (r.rows || []).filter(x => x.value)
+      .map(x => '<option value="' + esc(x.value) + '">').join('');
+    routeCache.modelsLoaded = true;
+  } catch (_) { /* 候选列表只是辅助，失败不打断编辑 */ }
+}
+function routeFormBody(r) {
+  return '<div class="form-grid">'
+    + fieldRow('别名', '<input id="rt-alias" list="route-model-list" value="' + (r ? esc(r.alias) : '') + '" placeholder="如 auto" spellcheck="false" maxlength="128">')
+    + fieldRow('状态', '<select id="rt-enabled"><option value="true"' + (!r || r.enabled ? ' selected' : '') + '>启用</option>'
+      + '<option value="false"' + (r && !r.enabled ? ' selected' : '') + '>停用</option></select>')
+    + fieldRow('计价模式', '<select id="rt-mode"><option value="target"' + (!r || r.pricing_mode !== 'alias' ? ' selected' : '') + '>按实际目标计价</option>'
+      + '<option value="alias"' + (r && r.pricing_mode === 'alias' ? ' selected' : '') + '>按别名自身计价</option></select>')
+    + fieldRow(labelWithTip('冷却秒数', '目标失败后的进程内冷却时长；冷却期内该目标被跳过，到期自动恢复。0 为不冷却。'),
+      '<input id="rt-cooldown" type="number" min="0" max="86400" value="' + (r ? (r.cooldown_seconds || 0) : 60) + '">')
+    + '</div>'
+    + fieldRow(labelWithTip('规则脚本', TIPS_routeRule),
+      '<textarea id="rt-rule" class="mono-area" spellcheck="false" placeholder=\'-> "gpt-4o-mini"\'>'
+      + esc(r ? r.rule : '') + '</textarea>');
+}
+function collectRouteForm() {
+  return {
+    alias: $('rt-alias').value.trim(),
+    enabled: $('rt-enabled').value === 'true',
+    pricing_mode: $('rt-mode').value,
+    cooldown_seconds: Math.max(0, Math.min(86400, parseInt($('rt-cooldown').value, 10) || 0)),
+    rule: $('rt-rule').value,
+  };
+}
+$('route-add').addEventListener('click', () => {
+  loadRouteModelList();
+  openSheet({
+    title: '新建模型集合', okText: '保存',
+    body: routeFormBody(null),
+    note: TIPS_routeRule,
+    onOk: async () => {
+      const body = collectRouteForm();
+      const res = await post('/model-routes/save', { ...body, actor: 'console' });
+      if (res.warning) toast(res.warning, 'err');
+      toast('集合已创建', 'ok');
+      loaders.routes().catch(() => {});
+    },
+  });
+});
+$('route-rows').addEventListener('click', e => {
+  const editBtn = e.target.closest('button[data-route-edit]');
+  if (editBtn) {
+    const r = routeCache.items.find(x => x.id === parseInt(editBtn.dataset.routeEdit, 10));
+    if (!r) return;
+    loadRouteModelList();
+    openSheet({
+      title: '编辑集合 · ' + r.alias, okText: '保存',
+      body: routeFormBody(r),
+      note: TIPS_routeRule,
+      onOk: async () => {
+        const body = { id: r.id, actor: 'console', ...collectRouteForm() };
+        const res = await post('/model-routes/save', body);
+        if (res.warning) toast(res.warning, 'err');
+        toast('集合已更新', 'ok');
+        loaders.routes().catch(() => {});
+      },
+    });
+    return;
+  }
+  const delBtn = e.target.closest('button[data-route-del]');
+  if (delBtn) {
+    const id = parseInt(delBtn.dataset.routeDel, 10);
+    const r = routeCache.items.find(x => x.id === id);
+    confirmSheet('删除集合 · ' + (r ? r.alias : '#' + id),
+      '删除后请求该别名将不再被接管（宿主按未知模型报错）。历史统计不受影响。',
+      async () => {
+        await post('/model-routes/delete', { id, actor: 'console' });
+        loaders.routes().catch(() => {});
+      });
+    return;
+  }
+  const toggleBtn = e.target.closest('button[data-route-toggle]');
+  if (toggleBtn) {
+    const id = parseInt(toggleBtn.dataset.routeToggle, 10);
+    const r = routeCache.items.find(x => x.id === id);
+    if (!r) return;
+    // 快捷开关复用 save 端点全量提交，避免额外端点。
+    post('/model-routes/save', {
+      id: r.id, alias: r.alias, rule: r.rule,
+      cooldown_seconds: r.cooldown_seconds, pricing_mode: r.pricing_mode,
+      enabled: !r.enabled, actor: 'console',
+    }).then(() => loaders.routes().catch(() => {}))
+      .catch(err => toast(err.message, 'err'));
+  }
+});
+$('route-judge-btn').addEventListener('click', () => {
+  const j = routeCache.judge || {};
+  openSheet({
+    title: 'AI 评判设置', okText: '保存',
+    body: '<div class="form-grid">'
+      + fieldRow(labelWithTip('评判模型', '执行 ai_judge 时调用的模型名，经宿主正常转发与计费；留空表示未配置，含 ai_judge 的规则将无法保存或回落兜底分支。'),
+        '<input id="jd-model" value="' + esc(j.model || '') + '" placeholder="如 gpt-4o-mini" spellcheck="false">')
+      + fieldRow(labelWithTip('超时（毫秒）', 'ai_judge 在转发前同步执行，最长等待此时长；超时即回落兜底分支。500~120000。'),
+        '<input id="jd-timeout" type="number" min="500" max="120000" step="100" value="' + (j.timeout_ms || 8000) + '">')
+      + '</div>',
+    note: '发送给评判模型的是脱敏摘要：结构化指标加对话文本前 2000 字符，绝不发送完整请求体。同一输入组合的结论缓存 10 分钟。',
+    onOk: async () => {
+      const model = $('jd-model').value.trim();
+      const timeout_ms = Math.max(500, Math.min(120000, parseInt($('jd-timeout').value, 10) || 8000));
+      const saved = await post('/model-routes/judge', { model, timeout_ms });
+      routeCache.judge = saved && saved.model !== undefined ? saved : { model, timeout_ms };
+      renderRouteJudgeState();
+      toast('评判设置已保存', 'ok');
+    },
+  });
+});
+
 // ---------- 认证额度 ----------
 loaders.auth = async () => {
   const r = await api('/auth-quotas');

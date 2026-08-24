@@ -367,3 +367,47 @@ response_compression_min_bytes: 1024
 | 计价模型统一引入行为差异 | 结算与展示共用一张表、一套取整规则；不提供旧数据迁移，历史账本一致性由用户自行重建 |
 | 独占鉴权影响存量宿主 | 文档明示；`quota.enabled=false` 提供纯统计模式 |
 | 前端单文件体积 | 沿用两插件做法，echarts CDN + 多语言按需内联 |
+
+---
+
+## 12. 模型路由（集合别名 + 规则语言，v0.5.0）
+
+### 12.1 数据与语言
+
+- SQLite `model_routes` 表（schema v8）：`alias` NOCASE 唯一、`rule` 脚本文本、`cooldown_seconds`（默认 60）、`pricing_mode`（target|alias）、`enabled`。写后回调失效服务层内存快照（atomic.Pointer + 60s TTL 兜底跨进程改写）。
+- 规则脚本由 `internal/routelang` 解释（纯 Go 手写 lexer/parser/eval，零依赖）：`when <条件> -> <候选链>` 分支式；候选链构造器 `"模型"` / `priority [...]`（声明序即回退链）/ `weighted {...}`（加权随机，选中者排首其余按权重降序跟随）；无条件兜底分支必填且只能是最后一条；无循环无赋值 ⇒ 求值天然终止。语法错误带行列号供面板定位。
+
+### 12.2 运行时行为
+
+```
+执行器入口：MatchRoute(剥思考后缀 + EqualFold) → BuildRouteEnv → ResolveChain
+ResolveChain = Eval（ai_judge 失败自动回落兜底分支并记审计）→ 冷却过滤（保序摘除）
+全冷却 → upstream_error 信封；命中 → 预占一次 + 登记认领（别名+全部引用目标含后缀形态的超集）
+逐目标尝试：成功/终局失败 → 单行结算（model=别名, upstream_model=成功目标）
+            可转移失败 → MarkRouteFail + 审计 route.failover → 换下一目标
+流式仅在首字节前可切换（dialHostStream 窗口）；routeFailureEligible 判定可转移性
+```
+
+- **可转移失败**：401/402/403/408/429、5xx、连接类文本错误；404 除 Responses 存储引用（previous_response_id 等）外可转；400/422、context 取消/超时、emit 失败不可转。
+- **计价**：`target` 模式预占按首选目标规则（PricingOverride），结算按实际成功目标（剥后缀）匹配；`alias` 模式全程按别名声价。维度统计恒记别名。
+- **认领防双计**：宿主 usage.handle 上报的目标真名（可能带思考后缀）命中认领则并入业务请求行；judge 调用不登记认领，自然被动入账到评判模型名下。
+
+### 12.3 ai_judge
+
+- 评判模型/超时存偏好 KV（`routing_judge_model` / `routing_judge_timeout_ms`，默认 8000ms，500~120000 校验）。
+- 发送脱敏摘要：结构化指标 + 对话文本前 2000 字符（messages/contents/system/input 容器内 content/text 字段，map 键排序保证确定性）；绝不发送原始 body 全文。
+- 进程内 LRU 缓存（512 条 × 10min TTL，key=judge_model+变量快照+options 的 SHA-256）+ single-flight 合并同 key 并发。
+- 失败/超时/越界输出 → 整条规则回落无条件兜底分支 + 审计 `route.ai_fallback`；保存期强制：使用 ai_judge 的规则必须已配置评判模型。
+- judge 调用经 main.configure 注入的钩子走 `host.model.execute`（服务层不直接持有 C ABI 回调）。
+
+### 12.4 model_registrar
+
+- 能力位 `model_registrar`（quota.enabled 且存在启用路由时声明）；dispatch 新增 `model.register` 方法返回 `{provider, models}`，ModelInfo 字段 PascalCase 无 tag 与宿主对齐（ID/Name/DisplayName=别名原文、Object=model、OwnedBy=cpa-usage-manager、Description=`集合别名 · N 个目标`、UserDefined=true）。旧宿主忽略能力位，静默降级。
+
+### 12.5 已知限制
+
+- 冷却进程内保存：reconfigure/重启丢失、多实例各自独立——failover 链本身兜底。
+- `input_tokens` 为 len(body)/2+1 封顶粗估（CJK 偏低 1.5~2x），阈值条件需留余量。
+- ai_judge 同步阻塞热路径 ≤ timeout_ms；摘要文本发往 judge 目标模型（隐私边界见 README）。
+- 别名流量仅面向插件 Key（cum-/caller_scope）；原生 Key 打别名走宿主原生路径报未知模型，预期共存行为。
+- 引用模型禁命中任何启用别名（含自引用）：路由不嵌套，编译期校验拒绝。

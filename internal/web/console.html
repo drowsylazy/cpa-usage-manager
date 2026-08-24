@@ -74,6 +74,7 @@
     <button role="tab" id="tab-keys" class="tab" data-tab="keys">密钥<span class="tab-dot" data-badge="keys" hidden></span></button>
     <button role="tab" id="tab-usage" class="tab" data-tab="usage">用量</button>
     <button role="tab" id="tab-pricing" class="tab" data-tab="pricing">价格</button>
+    <button role="tab" id="tab-routes" class="tab" data-tab="routes">模型集合</button>
     <button role="tab" id="tab-auth" class="tab" data-tab="auth">认证额度</button>
     <button role="tab" id="tab-system" class="tab" data-tab="system">系统<span class="tab-dot alarm" data-badge="system" hidden></span></button>
     <span class="tabs-meta mono" id="stamp"></span>
@@ -237,6 +238,27 @@
       </table>
     </div>
     <nav class="pager" id="pricing-pager"></nav>
+  </article>
+</section>
+
+<!-- ── 模型集合 ─────────────────────────────────────────────────── -->
+<section class="view" id="view-routes" role="tabpanel" aria-labelledby="tab-routes" hidden>
+  <article class="panel">
+    <div class="panel-head">
+      <div><h2 class="panel-title">模型集合</h2><p class="panel-sub">集合别名经规则脚本映射到有序目标链：失败自动转移，命中别名的插件 Key 流量按集合路由</p></div>
+      <div class="panel-tools">
+        <button type="button" class="btn" id="route-judge-btn">
+          <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5a5 5 0 0 1 5 5c0 2.6-1.7 4.1-2.8 5.2-.6.6-1 1.1-1 1.8h-2.4c0-.9.5-1.6 1.1-2.3.9-1 1.9-2 2-3.4A2.9 2.9 0 0 0 12 7.4"/><circle cx="12" cy="19" r=".8"/></svg>
+          <span>AI 评判设置<span id="route-judge-state" class="pill warn" hidden>未配置</span></span>
+        </button>
+        <button type="button" class="btn primary" id="route-add">
+          <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          <span>新建集合</span>
+        </button>
+      </div>
+    </div>
+    <div class="ky-grid" id="route-rows" role="list" aria-label="模型集合列表"></div>
+    <datalist id="route-model-list"></datalist>
   </article>
 </section>
 

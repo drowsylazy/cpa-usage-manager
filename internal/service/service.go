@@ -170,6 +170,20 @@ type Service struct {
 	// 鉴权热路径上不再出现独立写事务（见 requestpath.go queueKeyTouch）。
 	touchMu      sync.Mutex
 	touchPending map[string]int64
+
+	// 模型路由：快照（atomic + TTL，routes.go）、目标冷却状态器、ai_judge
+	// 的设置缓存 / LRU 结果缓存 / single-flight 与宿主执行钩子。
+	routeSnap atomic.Pointer[routeSnapshot]
+	coolMu    sync.Mutex
+	cooldowns map[string]time.Time
+
+	judgeCfgMu  sync.Mutex
+	judgeConf   judgeSettings
+	judgeConfAt time.Time
+	judgeExec   atomic.Pointer[func(ctx context.Context, model string, body []byte) ([]byte, int, error)]
+	judgeFlMu   sync.Mutex
+	judgeFlights map[string]*judgeFlight
+	judgeLRU     *judgeLRU
 }
 
 // pricingSnapshot 是一份不可变的计价规则快照。
@@ -199,6 +213,10 @@ func (s *Service) Store() *store.Store { return s.st }
 func New(st *store.Store, c config.Config, ps PepperSet) *Service {
 	s := &Service{st: st, cfg: c, peppers: ps}
 	st.SetPricingChangeHandler(func() { s.pricingSnap.Store(nil) })
+	// 路由写后即时失效快照；TTL 只兜底跨进程改写。
+	st.SetRoutesChangedHandler(s.invalidateRoutes)
+	s.judgeLRU = newJudgeLRU(judgeCacheMax)
+	s.judgeFlights = make(map[string]*judgeFlight)
 	return s
 }
 func (s *Service) pepper(id string) (Pepper, bool) {
@@ -358,6 +376,9 @@ type ReservationRequest struct {
 	EstimatedImages                        int64
 	Actor                                  string
 	ExpiresAt                              time.Time
+	// PricingOverride 非空时跳过按 Model 的规则匹配，直接采用该计价规则
+	// （别名路由 mode=target：执行器已按首选目标匹配）。
+	PricingOverride *store.PricingRule
 }
 
 func (s *Service) Reserve(ctx context.Context, r ReservationRequest) (store.Reservation, error) {
@@ -378,9 +399,16 @@ func (s *Service) Reserve(ctx context.Context, r ReservationRequest) (store.Rese
 	if r.EstimatedImages < 0 {
 		return store.Reservation{}, fmt.Errorf("%w: image estimate", ErrQuotaExceeded)
 	}
-	rule, priced, err := s.matchPricing(ctx, r.Model)
-	if err != nil {
-		return store.Reservation{}, err
+	var rule store.PricingRule
+	priced := false
+	if r.PricingOverride != nil {
+		rule, priced = *r.PricingOverride, true
+	} else {
+		var err error
+		rule, priced, err = s.matchPricing(ctx, r.Model)
+		if err != nil {
+			return store.Reservation{}, err
+		}
 	}
 	if r.EstimatedTokens == 0 && r.EstimatedImages == 0 && s.cfg.Quota.Limits.RequireEstimate {
 		return store.Reservation{}, fmt.Errorf("%w: 缺少用量估算", ErrQuotaExceeded)
@@ -431,7 +459,17 @@ func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req
 	if err != nil {
 		return store.Reservation{}, err
 	}
-	rule, priced, e := s.matchPricing(ctx, r.Model)
+	// 别名路由 mode=target：按最终成功目标（剥思考后缀）计价；
+	// mode=alias 或直连流量仍按预占模型名匹配。
+	pricingName := r.Model
+	if req != nil && strings.TrimSpace(req.UpstreamModel) != "" {
+		if m, ok := s.MatchRoute(ctx, r.Model); ok && m.Route.PricingMode == "target" {
+			if base, _ := StripThinkingSuffix(req.UpstreamModel); base != "" {
+				pricingName = base
+			}
+		}
+	}
+	rule, priced, e := s.matchPricing(ctx, pricingName)
 	if e != nil {
 		return store.Reservation{}, e
 	}
@@ -560,6 +598,12 @@ func (s *Service) DeleteKey(ctx context.Context, kid, actor string) error {
 		_ = s.st.AppendAudit(ctx, store.AuditEvent{Actor: actor, Action: "key.delete", EntityType: "key", EntityID: kid})
 	}
 	return err
+}
+
+// LookupPricing 按模型名匹配启用计价规则（执行器为别名路由构造
+// PricingOverride 用）。priced=false 表示只命中兜底免费规则或无规则。
+func (s *Service) LookupPricing(ctx context.Context, model string) (store.PricingRule, bool, error) {
+	return s.matchPricing(ctx, model)
 }
 
 func (s *Service) matchPricing(ctx context.Context, model string) (store.PricingRule, bool, error) {

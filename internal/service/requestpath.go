@@ -36,6 +36,12 @@ type ReservePlan struct {
 	TokenEstimate  int64
 	ImageCount     int64
 
+	// Rule / Priced 是预占实际采用的计价规则（Priced=false 表示未命中任何
+	// 非兜底规则）。别名流量 mode=target 时执行器据此构造 PricingOverride，
+	// 免去 Reserve 重复匹配。
+	Rule   store.PricingRule
+	Priced bool
+
 	// Meta 是请求体的单次解析结果：执行器入口解析一次，
 	// 预占估算与结算落库（tier/thinking_intensity）共用，不再重复整包反序列化。
 	Meta RequestMeta
@@ -231,16 +237,26 @@ func (m RequestMeta) imageCount() int64 {
 // 锁定决策：预占使用保守上限（输入按 body 字符数/2+1，输出取 max_tokens 或
 // default_output_reserve，均封顶 max_token_estimate），由 Reserve 按规则算出金额。
 func (s *Service) BuildReservePlan(ctx context.Context, model string, body []byte) (ReservePlan, error) {
+	return s.buildPlan(ctx, model, body, model)
+}
+
+// BuildReservePlanWithPricing 是别名路由的变体：计价按 pricingModel 匹配，
+// plan.Model 仍为 model（集合别名，维度统计锚点）。
+func (s *Service) BuildReservePlanWithPricing(ctx context.Context, model string, body []byte, pricingModel string) (ReservePlan, error) {
+	return s.buildPlan(ctx, model, body, pricingModel)
+}
+
+func (s *Service) buildPlan(ctx context.Context, model string, body []byte, pricingModel string) (ReservePlan, error) {
 	meta := ParseRequestMeta(body)
 	model = FirstNonEmpty(model, meta.Model)
-	rule, _, err := s.matchPricing(ctx, model)
+	rule, priced, err := s.matchPricing(ctx, pricingModel)
 	if err != nil {
 		return ReservePlan{}, err
 	}
 	if !rule.Enabled {
 		return ReservePlan{}, ErrModelDisabled
 	}
-	plan := ReservePlan{Model: model, PricingRuleID: rule.ID, BillingMode: rule.BillingMode, Meta: meta}
+	plan := ReservePlan{Model: model, PricingRuleID: rule.ID, BillingMode: rule.BillingMode, Rule: rule, Priced: priced, Meta: meta}
 	switch rule.BillingMode {
 	case store.BillingModePerImage:
 		plan.ImageCount = meta.imageCount()

@@ -2,89 +2,397 @@ package service
 
 import (
 	"context"
-	"database/sql"
+	"errors"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/drowsylazy/cpa-usage-manager/internal/routelang"
+	"github.com/drowsylazy/cpa-usage-manager/internal/store"
 )
 
-func TestRouteReport(t *testing.T) {
+func insertRoute(t *testing.T, s *Service, alias, rule string) store.ModelRoute {
+	t.Helper()
+	id, err := s.st.InsertModelRoute(context.Background(), store.ModelRoute{Alias: alias, Rule: rule, CooldownSeconds: 60, PricingMode: "target", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.st.GetModelRoute(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func TestStripThinkingSuffix(t *testing.T) {
+	cases := []struct{ in, base, suffix string }{
+		{"auto", "auto", ""},
+		{"Auto-High", "Auto", "-high"},
+		{" auto-low ", "auto", "-low"},
+		{"gpt-4o-mini", "gpt-4o-mini", ""},
+		{"high", "high", ""},
+	}
+	for _, c := range cases {
+		b, s := StripThinkingSuffix(c.in)
+		if b != c.base || s != c.suffix {
+			t.Fatalf("StripThinkingSuffix(%q) = (%q,%q), 期望 (%q,%q)", c.in, b, s, c.base, c.suffix)
+		}
+	}
+}
+
+func TestMatchRouteCaseAndSuffix(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	insertRoute(t, s, "Auto", `-> priority ["a", "b"]`)
+	if _, ok := s.MatchRoute(ctx, "AUTO"); !ok {
+		t.Fatal("大小写不敏感匹配失败")
+	}
+	m, ok := s.MatchRoute(ctx, "auto-high")
+	if !ok {
+		t.Fatal("剥后缀匹配失败")
+	}
+	if m.Suffix != "-high" || m.Route.Alias != "Auto" {
+		t.Fatalf("suffix=%q alias=%q", m.Suffix, m.Route.Alias)
+	}
+	if _, ok := s.MatchRoute(ctx, "other"); ok {
+		t.Fatal("未定义别名不应命中")
+	}
+}
+
+func TestRouteSnapshotInvalidationAndTTLReload(t *testing.T) {
 	s, st := testService(t)
 	ctx := context.Background()
-	ts := time.Now().UTC().Add(-time.Hour)
-
-	seedRequest(t, st, "rt1", ts, "claude-4", "", "ok", 1_000_000, 100)
-	seedRequest(t, st, "rt2", ts, "gpt-5", "", "ok", 2_000_000, 200)
-	seedRequest(t, st, "rt3", ts, "gpt-5", "", "fail", 500_000, 50)
-	seedRequest(t, st, "rt4", ts.Add(-time.Minute), "wild", "", "ok", 10, 10)
-	seedRequest(t, st, "rt5", ts.Add(time.Minute), "wild", "", "ok", 20, 20)
-	seedRequest(t, st, "rt6", ts, "multi3", "", "ok", 300, 300)
-	seedRequest(t, st, "rt7", ts.Add(-time.Minute), "multi3", "", "ok", 100, 100)
-	seedRequest(t, st, "rt8", ts.Add(time.Minute), "multi3", "", "ok", 100, 100)
-	// rt3 模拟二次路由：上游声明了渠道前缀真名；rt2 同别名但未捕获到真名。
-	// rt4/rt5 模拟一个别名真的路由到两个上游；rt6/rt7 显式真名 + rt8 未捕获，
-	// 未捕获请求应按已捕获量分摊进 p1/p2（请求数 1:1、token 3:1）。
-	if err := st.Write(ctx, func(tx *sql.Tx) error {
-		for _, p := range []struct{ id, up string }{
-			{"rt3", "openrouter/gpt-5"},
-			{"rt4", "a/wild"},
-			{"rt5", "b/wild"},
-			{"rt6", "p/multi3"},
-			{"rt7", "q/multi3"},
-		} {
-			if _, e := tx.ExecContext(ctx, `UPDATE requests SET upstream_model=? WHERE id=?`, p.up, p.id); e != nil {
-				return e
-			}
-		}
-		return nil
-	}); err != nil {
+	if _, ok := s.MatchRoute(ctx, "auto"); ok {
+		t.Fatal("空表不应命中")
+	}
+	insertRoute(t, s, "auto", `-> "x"`)
+	// 写回调已失效快照，无需等待 TTL。
+	if _, ok := s.MatchRoute(ctx, "auto"); !ok {
+		t.Fatal("插入后应立即生效（写回调失效）")
+	}
+	if err := st.DeleteModelRoute(ctx, s.mustRouteID(t, s, "auto")); err != nil {
 		t.Fatal(err)
 	}
+	if _, ok := s.MatchRoute(ctx, "auto"); ok {
+		t.Fatal("删除后不应命中")
+	}
+}
 
-	rows, err := s.RouteReport(ctx, UsageFilter{})
+func (s *Service) mustRouteID(t *testing.T, _ *Service, alias string) int64 {
+	t.Helper()
+	rows, err := s.st.ListModelRoutes(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	// gpt-5 的未捕获行归并进唯一真名 openrouter/gpt-5；wild 两真名保持两行；
-	// multi3 的未捕获行按比例分摊进 p/q 后别名行消失。
-	if len(rows) != 6 {
-		t.Fatalf("应聚合为 6 条映射（claude-4 + openrouter/gpt-5 + a/b wild + p/q multi3），得到 %d：%+v", len(rows), rows)
-	}
-	find := func(up string) *RouteRow {
-		for i := range rows {
-			if rows[i].UpstreamModel == up {
-				return &rows[i]
-			}
-		}
-		return nil
-	}
-	routed := find("openrouter/gpt-5")
-	if routed == nil || routed.Requests != 2 || routed.TotalTokens != 250 || len(routed.Models) != 1 || routed.Models[0] != "gpt-5" {
-		t.Fatalf("未捕获真名的请求应并入唯一真名行: %+v", routed)
-	}
-	direct := find("claude-4")
-	if direct == nil || direct.Requests != 1 || direct.TotalTokens != 100 {
-		t.Fatalf("无显式真名的直连行应保留为别名本身: %+v", direct)
-	}
-	for _, name := range []string{"a/wild", "b/wild"} {
-		w := find(name)
-		if w == nil || w.Requests != 1 {
-			t.Fatalf("无未捕获请求时多真名各行保持原样，%s 行异常: %+v", name, w)
+	for _, r := range rows {
+		if r.Alias == alias {
+			return r.ID
 		}
 	}
-	if find("multi3") != nil {
-		t.Fatalf("有显式真名的别名不应再单独成行: %+v", rows)
-	}
-	p, q := find("p/multi3"), find("q/multi3")
-	// token 按 300:100 分摊 100 条 → 精确 75/25；请求数权重 1:1 时归入方不定，只验总量守恒。
-	if p == nil || q == nil || p.Requests+q.Requests != 3 || p.Requests < 1 || q.Requests < 1 || p.TotalTokens != 375 || q.TotalTokens != 125 {
-		t.Fatalf("未捕获请求应按已捕获量加权分摊且总量守恒: p=%+v q=%+v", p, q)
-	}
-	// 时间过滤生效：把窗口收窄到未来，应无数据。
-	future, err := s.RouteReport(ctx, UsageFilter{From: time.Now().UTC().Add(time.Hour)})
+	t.Fatalf("找不到路由 %q", alias)
+	return 0
+}
+
+func TestResolveChainCooldownFilterOrder(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	row := insertRoute(t, s, "auto", `-> priority ["a", "b", "c"]`)
+	prog, err := routelang.Compile(row.Rule)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(future) != 0 {
-		t.Fatalf("未来窗口不应有数据: %+v", future)
+	m := RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
+	env := &routelang.Env{Vars: map[string]any{"input_tokens": int64(1), "body_len": int64(2), "model": "auto", "stream": false, "thinking_effort": "", "source": "openai"}}
+
+	chain, fellBack, err := s.ResolveChain(ctx, m, env, "")
+	if err != nil || fellBack {
+		t.Fatalf("首次求值失败: %v fellBack=%v", err, fellBack)
+	}
+	if len(chain) != 3 || chain[0] != "a" || chain[1] != "b" || chain[2] != "c" {
+		t.Fatalf("链序错误: %v", chain)
+	}
+	// 冷却 b：过滤保序摘除。
+	s.MarkRouteFail(row.ID, "B", row.CooldownSeconds)
+	chain, _, err = s.ResolveChain(ctx, m, env, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chain) != 2 || chain[0] != "a" || chain[1] != "c" {
+		t.Fatalf("冷却后应为 [a c]: %v", chain)
+	}
+	// 全冷却 → 哨兵。
+	s.MarkRouteFail(row.ID, "a", row.CooldownSeconds)
+	s.MarkRouteFail(row.ID, "c", row.CooldownSeconds)
+	if _, _, err := s.ResolveChain(ctx, m, env, ""); !errors.Is(err, ErrAllTargetsCooling) {
+		t.Fatalf("全冷却应返回哨兵: %v", err)
+	}
+	// 到期自然恢复：把截止时刻拨回过去（同包内直接操作状态器，避免真实睡眠）。
+	s.coolMu.Lock()
+	for k := range s.cooldowns {
+		s.cooldowns[k] = time.Now().Add(-time.Second)
+	}
+	s.coolMu.Unlock()
+	chain, _, err = s.ResolveChain(ctx, m, env, "")
+	if err != nil || len(chain) != 3 {
+		t.Fatalf("到期后应恢复全链: %v %v", chain, err)
+	}
+}
+
+func TestJudgeSettingsRoundtrip(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	cfg, err := s.judgeSettingsCached(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Model != "" || cfg.TimeoutMS != defaultJudgeTimeout.Milliseconds() {
+		t.Fatalf("默认设置错误: %+v", cfg)
+	}
+	if err := s.SaveJudgeSettings(ctx, " judge-x ", 4000); err != nil {
+		t.Fatal(err)
+	}
+	s.flushJudgeConfig() // 绕过 30s 内存缓存直接验证落库值
+	cfg, err = s.judgeSettingsCached(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Model != "judge-x" || cfg.TimeoutMS != 4000 {
+		t.Fatalf("保存后读取: %+v", cfg)
+	}
+	if err := s.SaveJudgeSettings(ctx, "judge", 100); err == nil {
+		t.Fatal("超时下限校验缺失")
+	}
+}
+
+func stubJudge(t *testing.T, s *Service, fn func(model string) (string, error)) *atomic.Int32 {
+	t.Helper()
+	var calls atomic.Int32
+	s.SetJudgeExecutor(func(_ context.Context, model string, _ []byte) ([]byte, int, error) {
+		calls.Add(1)
+		out, err := fn(model)
+		if err != nil {
+			return nil, 500, err
+		}
+		return []byte(`{"choices":[{"message":{"role":"assistant","content":"` + out + `"}}]}`), 200, nil
+	})
+	return &calls
+}
+
+func judgeEnv(s *Service, model string) *routelang.Env {
+	return s.BuildRouteEnv(ParseRequestMeta([]byte(`{"model":"` + model + `"}`)), model, true, "openai")
+}
+
+func TestAIJudgeEvalWithCache(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	if err := s.SaveJudgeSettings(ctx, "judge-model", 3000); err != nil {
+		t.Fatal(err)
+	}
+	s.flushJudgeConfig()
+	calls := stubJudge(t, s, func(string) (string, error) { return "hard", nil })
+
+	row := insertRoute(t, s, "smart", `when ai_judge(["simple", "hard"]) == "hard"
+  -> priority ["opus"]
+-> "mini"`)
+	prog, err := routelang.Compile(row.Rule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
+	env := judgeEnv(s, "smart")
+
+	chain, fellBack, err := s.ResolveChain(ctx, m, env, "帮我写个排序算法")
+	if err != nil || fellBack {
+		t.Fatalf("求值失败: %v fellBack=%v", err, fellBack)
+	}
+	if len(chain) != 1 || chain[0] != "opus" {
+		t.Fatalf("judge=hard 应命中 opus: %v", chain)
+	}
+	// 相同变量组合再次求值 → 缓存命中，不再发起调用。
+	env2 := judgeEnv(s, "smart")
+	if _, _, err := s.ResolveChain(ctx, m, env2, ""); err != nil {
+		t.Fatal(err)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("缓存应使命令为 1 次，实际 %d", n)
+	}
+}
+
+func TestAIJudgeFailureFallsBackWithAudit(t *testing.T) {
+	s, st := testService(t)
+	ctx := context.Background()
+	if err := s.SaveJudgeSettings(ctx, "judge-model", 500); err != nil {
+		t.Fatal(err)
+	}
+	s.flushJudgeConfig()
+	stubJudge(t, s, func(string) (string, error) { return "", errors.New("boom") })
+
+	row := insertRoute(t, s, "smart", `when ai_judge(["simple", "hard"]) == "hard"
+  -> "opus"
+-> "mini"`)
+	prog, err := routelang.Compile(row.Rule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
+
+	chain, fellBack, err := s.ResolveChain(ctx, m, judgeEnv(s, "smart"), "")
+	if !fellBack {
+		t.Fatalf("AI 失败应回落兜底: err=%v fellBack=%v", err, fellBack)
+	}
+	var aiFB *routelang.AIFallbackError
+	if !errors.As(err, &aiFB) {
+		t.Fatalf("应返回 AIFallbackError: %v", err)
+	}
+	if len(chain) != 1 || chain[0] != "mini" {
+		t.Fatalf("兜底链应为 [mini]: %v", chain)
+	}
+	events, aerr := st.ListAudit(ctx, 10, 0)
+	if aerr != nil {
+		t.Fatal(aerr)
+	}
+	found := false
+	for _, e := range events {
+		if e.Action == "route.ai_fallback" && e.EntityID == strconv.FormatInt(row.ID, 10) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("缺少 route.ai_fallback 审计事件")
+	}
+}
+
+func TestValidateRouteRuleBranches(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+
+	if _, _, _, err := s.ValidateRouteRule(ctx, 0, "bad/name", `-> "x"`, "target"); err == nil {
+		t.Fatal("别名含 / 应报错")
+	}
+	if _, _, _, err := s.ValidateRouteRule(ctx, 0, "a-high", `-> "x"`, "target"); err == nil {
+		t.Fatal("别名带思考后缀应报错")
+	}
+	if _, _, _, err := s.ValidateRouteRule(ctx, 0, "r1", `when foo("a") == "b"
+-> "x"`, "target"); err == nil {
+		t.Fatal("未知函数应报错")
+	}
+	// ai_judge 需先配置评判模型。
+	if _, _, _, err := s.ValidateRouteRule(ctx, 0, "r1", `when ai_judge(["a"]) == "a"
+-> "x"`, "target"); err == nil {
+		t.Fatal("未配评判模型时使用 ai_judge 应报错")
+	}
+	if err := s.SaveJudgeSettings(ctx, "judge-model", 3000); err != nil {
+		t.Fatal(err)
+	}
+	s.flushJudgeConfig()
+	insertRoute(t, s, "loopA", `-> "zzz"`)
+	refs, usesAI, _, err := s.ValidateRouteRule(ctx, 0, "r2", `when ai_judge(["simple","hard"]) == "hard"
+  -> priority ["real-model-a", "real-model-b"]
+-> "fallback-model"`, "target")
+	if err != nil {
+		t.Fatalf("合法规则不应报错: %v", err)
+	}
+	if !usesAI || len(refs) != 3 {
+		t.Fatalf("usesAI=%v refs=%v", usesAI, refs)
+	}
+	if _, _, _, err = s.ValidateRouteRule(ctx, 0, "r3", `when ai_judge(["simple"]) == "simple"
+  -> "loopA"
+-> "fallback-model"`, "target"); err == nil {
+		t.Fatal("引用其他启用别名应报错")
+	}
+	if _, _, _, err = s.ValidateRouteRule(ctx, 0, "r4", `-> "r4-target"`, "target"); err != nil {
+		t.Fatalf("引用普通模型应通过: %v", err)
+	}
+	// 自引用（编辑自身时 excludeID 生效）。
+	self := insertRoute(t, s, "selfref", `-> "plain"`)
+	if _, _, _, err = s.ValidateRouteRule(ctx, self.ID, "selfref", `-> "selfref-other"`, "target"); err != nil {
+		t.Fatalf("排除自身后不应误报: %v", err)
+	}
+	if _, _, _, err = s.ValidateRouteRule(ctx, self.ID, "selfref", `-> "SELFREF"`, "target"); err == nil {
+		t.Fatal("自引用应报错")
+	}
+	// mode=alias 且无计价规则 → warning。
+	_, _, warn, err := s.ValidateRouteRule(ctx, 0, "aliasmode", `-> "x"`, "alias")
+	if err != nil || warn == "" {
+		t.Fatalf("mode=alias 应给 warning: err=%v warn=%q", err, warn)
+	}
+}
+
+func TestJudgeSingleFlightMergesConcurrentCalls(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	if err := s.SaveJudgeSettings(ctx, "judge-model", 3000); err != nil {
+		t.Fatal(err)
+	}
+	s.flushJudgeConfig()
+	release := make(chan struct{})
+	var calls atomic.Int32
+	s.SetJudgeExecutor(func(_ context.Context, _ string, _ []byte) ([]byte, int, error) {
+		calls.Add(1)
+		<-release
+		return []byte(`{"choices":[{"message":{"content":"hard"}}]}`), 200, nil
+	})
+	row := insertRoute(t, s, "sf", `when ai_judge(["simple","hard"]) == "hard"
+  -> "opus"
+-> "mini"`)
+	prog, _ := routelang.Compile(row.Rule)
+	m := RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _ = s.ResolveChain(ctx, m, judgeEnv(s, "sf"), "")
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("single-flight 应合并为 1 次调用，实际 %d", n)
+	}
+}
+
+func TestRequestDigestExtraction(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":[{"type":"text","text":"你好世界"}]}],"stream":true}`)
+	d := RequestDigest(body)
+	if len(d) == 0 {
+		t.Fatal("摘要不应为空")
+	}
+	if len(d) > 2000 {
+		t.Fatalf("摘要超限: %d", len(d))
+	}
+	long := make([]byte, 5000)
+	for i := range long {
+		long[i] = 'x'
+	}
+	capped := RequestDigest([]byte(`{"messages":[{"content":"` + string(long) + `"}]}`))
+	if len(capped) != 2000 {
+		t.Fatalf("长文本应封顶 2000，实际 %d", len(capped))
+	}
+}
+
+func TestPickOptionMatching(t *testing.T) {
+	opts := []string{"simple", "hard"}
+	cases := []struct {
+		text string
+		want string
+		ok   bool
+	}{
+		{"hard", "hard", true},
+		{"  Hard \n", "hard", true},
+		{"\"simple\"", "simple", true},
+		{"我认为这是 hard 级别", "hard", true},
+		{"simple or hard 都行", "", false},
+		{"unknown", "", false},
+	}
+	for _, c := range cases {
+		got, ok := pickOption(c.text, opts)
+		if got != c.want || ok != c.ok {
+			t.Fatalf("pickOption(%q) = (%q,%v), 期望 (%q,%v)", c.text, got, ok, c.want, c.ok)
+		}
 	}
 }

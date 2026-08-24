@@ -128,6 +128,7 @@ type rpcCapabilities struct {
 	ManagementAPI                 bool     `json:"management_api"`
 	RequestInterceptor            bool     `json:"request_interceptor"`
 	RequestLifecyclePlugin        bool     `json:"request_lifecycle_plugin"`
+	ModelRegistrar                bool     `json:"model_registrar"`
 }
 type rpcRegistration struct {
 	SchemaVersion uint32          `json:"schema_version"`
@@ -473,6 +474,10 @@ func callHost(method string, payload any) (json.RawMessage, error) {
 	return append(json.RawMessage(nil), env.Result...), nil
 }
 
+// hostCall 是宿主回调的可替换入口：生产恒为 callHost；路由 failover 的
+// 集成测试经它注入桩传输（见 main_routes_test.go）。
+var hostCall = callHost
+
 func current() (st *store.Store, svc *service.Service, api *httpapi.API, cfg config.Config) {
 	runtimeState.Lock()
 	defer runtimeState.Unlock()
@@ -510,6 +515,9 @@ func dispatch(method string, body []byte) ([]byte, error) {
 		return okEnvelope(managementRegistration())
 	case "management.handle":
 		return handleManagement(body)
+	case "model.register":
+		_, svc, _, _ := current()
+		return modelRegister(svc)
 	case "usage.handle":
 		return handleUsage(body)
 	case "request.intercept_before":
@@ -588,6 +596,13 @@ func configure(inline string) error {
 		return err
 	}
 	svc := service.New(st, cfg, ps)
+	// ai_judge 的宿主执行钩子：服务层不直接持有 C ABI 回调，经此注入。
+	// 评判调用以 openai 协议、无头信息直连 host.model.execute，非流式。
+	svc.SetJudgeExecutor(func(_ context.Context, model string, body []byte) ([]byte, int, error) {
+		judgeReq := rpcExecutorRequest{SourceFormat: "openai", Format: "openai"}
+		respBody, _, status, err := hostModelExecute("", judgeReq, model, body, false)
+		return respBody, status, err
+	})
 	// 租约被接管（多进程部署中出现第二个写者）时本实例降级只读，
 	// 经通知端点上报；回调在心跳协程里触发，须立即返回，故异步发送。
 	st.SetLeaseLostHandler(func() {
@@ -617,7 +632,7 @@ func configure(inline string) error {
 // ---------- 注册响应 ----------
 
 func pluginRegistration(schema uint32) rpcRegistration {
-	_, _, _, cfg := current()
+	st, _, _, cfg := current()
 	enabled := cfg.Quota.Enabled
 	formats := []string{
 		"openai", "chat-completions", "claude", "gemini",
@@ -634,6 +649,8 @@ func pluginRegistration(schema uint32) rpcRegistration {
 		caps.ExecutorOutputFormats = formats
 		caps.RequestInterceptor = true
 		caps.RequestLifecyclePlugin = true
+		// 能力位随宿主下次注册/reconfigure 刷新：新建首条路由后需等一次。
+		caps.ModelRegistrar = modelRegistrarEnabled(st)
 	}
 	return rpcRegistration{
 		SchemaVersion: schema,
@@ -690,6 +707,11 @@ func managementRegistration() rpcManagementRegistration {
 		{Method: "GET", Path: base + "/pricing/search", Description: "models.dev 计价搜索"},
 		{Method: "POST", Path: base + "/pricing/reset", Description: "清空计价规则（保留免费兜底）"},
 		{Method: "POST", Path: base + "/pricing/sync", Description: "models.dev 同步"},
+		{Method: "GET", Path: base + "/model-routes", Description: "模型路由（集合别名）列表与评判设置"},
+		{Method: "POST", Path: base + "/model-routes/save", Description: "新增/更新模型路由"},
+		{Method: "POST", Path: base + "/model-routes/delete", Description: "删除模型路由"},
+		{Method: "GET", Path: base + "/model-routes/judge", Description: "AI 评判设置读取"},
+		{Method: "POST", Path: base + "/model-routes/judge", Description: "AI 评判设置保存"},
 		{Method: "GET", Path: base + "/usage", Description: "请求明细"},
 		{Method: "GET", Path: base + "/usage/summary", Description: "用量汇总"},
 		{Method: "GET", Path: base + "/usage/dimension", Description: "维度分组"},
@@ -868,6 +890,18 @@ func execute(body []byte) ([]byte, error) {
 		return errorEnvelope("unauthorized", err.Error()), nil
 	}
 	request := requestBody(req)
+	startedAt := time.Now()
+
+	// 集合别名流量：failover 循环编排（见 main_routes.go）。
+	if re, failure := resolveRouting(ctx, svc, &key, req, request, false); re != nil || failure != nil {
+		if failure != nil {
+			return errorEnvelope(failure.code, failure.message), nil
+		}
+		stopHeartbeat := startReservationHeartbeat(svc, re.reservation.ID)
+		defer stopHeartbeat()
+		return executeRoutedLoop(ctx, re, req, request, startedAt)
+	}
+
 	plan, err := svc.BuildReservePlan(ctx, req.Model, request)
 	if err != nil {
 		if errors.Is(err, service.ErrModelDisabled) {
@@ -887,8 +921,7 @@ func execute(body []byte) ([]byte, error) {
 
 	// 登记认领：宿主随后的 usage.handle 由本次请求消费，不再被动入库。
 	claim := registerUsageClaim(key.KID, plan.Model, req.Model)
-	startedAt := time.Now()
-	hostBody, headers, status, errHost := hostModelExecute(req.HostCallbackID, req, request, false)
+	hostBody, headers, status, errHost := hostModelExecute(req.HostCallbackID, req, strings.TrimSpace(req.Model), request, false)
 	if errHost != nil {
 		// 未落库任何请求行：放弃认领，宿主若上报失败用量仍走被动统计。
 		claim.release(0)
@@ -949,6 +982,37 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 		return err
 	}
 	request := requestBody(req)
+	startedAt := time.Now()
+
+	// 集合别名流量：逐候选拨号，流建立后进入读泵（main_routes.go）。
+	if re, failure := resolveRouting(ctx, svc, &key, req, request, true); re != nil || failure != nil {
+		if failure != nil {
+			return errors.New(failure.message)
+		}
+		stopHeartbeat := startReservationHeartbeat(svc, re.reservation.ID)
+		defer stopHeartbeat()
+		for i := range re.chain {
+			stream, outcome, dialErr := dialHostStream(re, req, request, i)
+			switch outcome {
+			case dialTransfer:
+				continue
+			case dialFailed:
+				if statusErr, ok := dialErr.(errHostStatus); ok {
+					// HTTP 错误：落行结算（与直连语义一致），错误文本关流。
+					settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), int(statusErr), usageparse.Usage{}, targetWithSuffix(re.chain[i], re.match.Suffix), re.claim)
+					return dialErr
+				}
+				re.claim.release(0)
+				_, _ = svc.Release(ctx, re.reservation.ID)
+				return dialErr
+			default:
+				finalTgt := targetWithSuffix(re.chain[i], re.match.Suffix)
+				return pumpRoutedStream(re, req, startedAt, stream, finalTgt, pluginStreamID, closeStream)
+			}
+		}
+		return errors.New("路由候选链为空")
+	}
+
 	plan, err := svc.BuildReservePlan(ctx, req.Model, request)
 	if err != nil {
 		return err
@@ -962,7 +1026,6 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 
 	// 登记认领：宿主随后的 usage.handle 由本次请求消费，不再被动入库。
 	claim := registerUsageClaim(key.KID, plan.Model, req.Model)
-	startedAt := time.Now()
 	request = requestBodyWithStreamUsage(request, req.SourceFormat, req.Format)
 	raw, err := callHost("host.model.execute_stream", rpcHostModelExecutionRequest{
 		EntryProtocol:  service.FirstNonEmpty(req.SourceFormat, "openai"),
@@ -1206,11 +1269,11 @@ func startReservationHeartbeat(svc *service.Service, reservationID string) func(
 	return svc.TrackReservation(reservationID)
 }
 
-func hostModelExecute(hostCallbackID string, req rpcExecutorRequest, body []byte, stream bool) ([]byte, http.Header, int, error) {
-	raw, err := callHost("host.model.execute", rpcHostModelExecutionRequest{
+func hostModelExecute(hostCallbackID string, req rpcExecutorRequest, model string, body []byte, stream bool) ([]byte, http.Header, int, error) {
+	raw, err := hostCall("host.model.execute", rpcHostModelExecutionRequest{
 		EntryProtocol:  service.FirstNonEmpty(req.SourceFormat, "openai"),
 		ExitProtocol:   service.FirstNonEmpty(req.Format, req.SourceFormat, "openai"),
-		Model:          strings.TrimSpace(req.Model),
+		Model:          strings.TrimSpace(model),
 		Stream:         stream,
 		Body:           body,
 		Headers:        req.Headers,
@@ -1229,19 +1292,19 @@ func hostModelExecute(hostCallbackID string, req rpcExecutorRequest, body []byte
 }
 
 func emitPluginStreamChunk(streamID string, payload []byte) error {
-	_, err := callHost("host.stream.emit", rpcStreamEmitRequest{StreamID: streamID, Payload: payload})
+	_, err := hostCall("host.stream.emit", rpcStreamEmitRequest{StreamID: streamID, Payload: payload})
 	return err
 }
 
 func closePluginStream(streamID, errMsg string) {
-	_, _ = callHost("host.stream.close", rpcStreamCloseRequest{StreamID: streamID, Error: strings.TrimSpace(errMsg)})
+	_, _ = hostCall("host.stream.close", rpcStreamCloseRequest{StreamID: streamID, Error: strings.TrimSpace(errMsg)})
 }
 
 func closeHostModelStream(streamID string) error {
 	if strings.TrimSpace(streamID) == "" {
 		return nil
 	}
-	_, err := callHost("host.model.stream_close", rpcHostModelStreamCloseRequest{StreamID: streamID})
+	_, err := hostCall("host.model.stream_close", rpcHostModelStreamCloseRequest{StreamID: streamID})
 	return err
 }
 

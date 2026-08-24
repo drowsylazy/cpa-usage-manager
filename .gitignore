@@ -14,3 +14,8 @@ data/
 
 # 本地编辑器/预览配置（.claude/launch.json 只服务本机 devserver 预览）
 .claude/
+# 朜�构建输出盽�
+build/
+
+# MiMoCode 会话朜�配置
+.mimocode/

@@ -1,0 +1,403 @@
+// 模型路由的执行器侧实现：候选链 failover 循环、请求体改写与失败判定。
+// 服务层（internal/service/routes.go）负责别名匹配与链求值；这里只做转发编排。
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/drowsylazy/cpa-usage-manager/internal/config"
+	"github.com/drowsylazy/cpa-usage-manager/internal/service"
+	"github.com/drowsylazy/cpa-usage-manager/internal/store"
+	"github.com/drowsylazy/cpa-usage-manager/internal/usageparse"
+)
+
+// routedExecution 是一次命中集合别名的执行上下文：预占与认领在循环外
+// 建立一次，多个候选目标共用；中间失败的尝试只记审计，不入 requests 行。
+type routedExecution struct {
+	svc         *service.Service
+	match       service.RouteMatch
+	chain       []string
+	fellBack    bool
+	plan        service.ReservePlan
+	reservation store.Reservation
+	claim       *usageClaim
+}
+
+// routeFailure 是路由路径上预占/求值阶段的结构化失败：非流式入口转
+// RPC 信封，流式入口转 Go 错误（经 closeStream 送达客户端）。
+type routeFailure struct {
+	code    string
+	message string
+}
+
+// resolveRouting 在请求命中集合别名时完成 链求值 → 计价计划 → 预占 → 认领。
+// 返回值：(nil, nil) 未命中别名，调用方走直连老路；(re, nil) 已就绪；
+// (_, failure) 路由流量被拒（全冷却 / 校验拒绝 / 预占被拒）。
+func resolveRouting(ctx context.Context, svc *service.Service, key *store.PluginKey, req rpcExecutorRequest, request []byte, stream bool) (*routedExecution, *routeFailure) {
+	match, hit := svc.MatchRoute(ctx, req.Model)
+	if !hit {
+		return nil, nil
+	}
+	baseAlias, _ := service.StripThinkingSuffix(req.Model)
+	env := svc.BuildRouteEnv(service.ParseRequestMeta(request), req.Model, stream, req.SourceFormat)
+	chain, fellBack, cerr := svc.ResolveChain(ctx, match, env, service.RequestDigest(request))
+	if cerr != nil {
+		if errors.Is(cerr, service.ErrAllTargetsCooling) {
+			return nil, &routeFailure{"upstream_error", "模型集合 " + baseAlias + " 的候选目标全部冷却中，请稍后重试"}
+		}
+		return nil, &routeFailure{"upstream_error", "路由规则求值失败: " + cerr.Error()}
+	}
+	re := &routedExecution{svc: svc, match: match, chain: chain, fellBack: fellBack}
+
+	pricingName := baseAlias
+	if match.Route.PricingMode == "target" {
+		pricingName = chain[0]
+	}
+	plan, err := svc.BuildReservePlanWithPricing(ctx, baseAlias, request, pricingName)
+	if err != nil {
+		if errors.Is(err, service.ErrModelDisabled) {
+			return nil, &routeFailure{"model_disabled", err.Error()}
+		}
+		return nil, &routeFailure{"reserve_rejected", err.Error()}
+	}
+	re.plan = plan
+	resReq := service.ReservationRequest{
+		KeyID: key.KID, CallerID: key.CallerID, Model: plan.Model,
+		EstimatedTokens: plan.TokenEstimate, EstimatedImages: plan.ImageCount, Actor: "quota",
+	}
+	if plan.Priced && match.Route.PricingMode == "target" {
+		override := plan.Rule
+		resReq.PricingOverride = &override
+	}
+	reservation, err := svc.Reserve(ctx, resReq)
+	if err != nil {
+		if errors.Is(err, service.ErrModelNotAllowed) {
+			return nil, &routeFailure{"model_not_allowed", err.Error()}
+		}
+		return nil, &routeFailure{"limit_rejected", err.Error()}
+	}
+	re.reservation = reservation
+
+	// 认领集 = 别名（基名+原名）+ 全部引用目标的裸名与带后缀形态：
+	// 宿主上报的是实际执行的目标名（可能带思考后缀），取超集防双计入被动路径。
+	models := []string{plan.Model, req.Model, match.Route.Alias}
+	for _, ref := range match.Route.Refs {
+		models = append(models, ref)
+		if sfx := match.Suffix; sfx != "" && !service.HasThinkingSuffix(ref) {
+			models = append(models, ref+sfx)
+		}
+	}
+	re.claim = registerUsageClaim(key.KID, models...)
+	return re, nil
+}
+
+// targetWithSuffix 应用思考后缀规则：目标自带后缀则用目标的，否则附加原后缀。
+func targetWithSuffix(target, suffix string) string {
+	if suffix == "" || service.HasThinkingSuffix(target) {
+		return target
+	}
+	return target + suffix
+}
+
+// ---------- model.register（集合别名单独进 /v1/models）----------
+
+// rpcRegisteredModel 字段与宿主 ModelInfo 对齐（PascalCase、无 JSON tag）：
+// ID/Object/OwnedBy/DisplayName/Name/Description/UserDefined。
+type rpcRegisteredModel struct {
+	ID          string
+	Object      string
+	OwnedBy     string
+	DisplayName string
+	Name        string
+	Description string
+	UserDefined bool
+}
+
+type rpcModelRegisterResponse struct {
+	Provider string               `json:"provider"`
+	Models   []rpcRegisteredModel `json:"models"`
+}
+
+// modelRegistrarEnabled 报告是否应声明 model_registrar 能力位：
+// 配额接管开启且存在启用中的路由。旧宿主忽略该能力位，功能静默降级。
+func modelRegistrarEnabled(st *store.Store) bool {
+	if st == nil {
+		return false
+	}
+	rows, err := st.ListModelRoutes(context.Background())
+	if err != nil {
+		return false
+	}
+	for _, r := range rows {
+		if r.Enabled {
+			return true
+		}
+	}
+	return false
+}
+
+func modelRegister(svc *service.Service) ([]byte, error) {
+	resp := rpcModelRegisterResponse{Provider: config.PluginID, Models: []rpcRegisteredModel{}}
+	if svc == nil {
+		return okEnvelope(resp)
+	}
+	rows, err := svc.ListRoutesCompiled(context.Background())
+	if err != nil {
+		return okEnvelope(resp)
+	}
+	for _, r := range rows {
+		if !r.Enabled {
+			continue
+		}
+		resp.Models = append(resp.Models, rpcRegisteredModel{
+			ID:          r.Alias,
+			Object:      "model",
+			OwnedBy:     "cpa-usage-manager",
+			DisplayName: r.Alias,
+			Name:        r.Alias,
+			Description: fmt.Sprintf("集合别名 · %d 个目标", len(r.Refs)),
+			UserDefined: true,
+		})
+	}
+	return okEnvelope(resp)
+}
+
+// preparePayload 为别名流量改写请求体：顶层 model 置为目标真名，OpenAI 系
+// 流式注入 stream_options.include_usage。单次反序列化合并完成两项改写；
+// 直连流量不经此函数（零额外解析）。
+func preparePayload(body []byte, sourceFormat, outputFormat, targetModel string, stream bool) []byte {
+	format := strings.ToLower(service.FirstNonEmpty(outputFormat, sourceFormat))
+	openaiFamily := !strings.Contains(format, "claude") && !strings.Contains(format, "gemini")
+	var payload map[string]any
+	if len(body) == 0 || json.Unmarshal(body, &payload) != nil {
+		return body
+	}
+	payload["model"] = targetModel
+	if stream && openaiFamily {
+		options, ok := payload["stream_options"].(map[string]any)
+		if !ok {
+			options = make(map[string]any)
+			payload["stream_options"] = options
+		}
+		if _, exists := options["include_usage"]; !exists {
+			options["include_usage"] = true
+		}
+	}
+	updated, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return updated
+}
+
+// routeFailureEligible 判定一次尝试失败是否值得转移到下一候选。
+//
+// 可转：401/402/403/408/429、5xx、连接类传输错误；404 除 Responses 存储
+// 类文本（previous_response_id 引用不存在）外可转。不可转：400/422、
+// 取消/超时、其余无状态码错误。
+func routeFailureEligible(status int, errText string, err error) bool {
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return false
+		}
+	}
+	text := strings.ToLower(errText)
+	for _, frag := range []string{
+		"rate limit", "quota exceeded", "unauthorized", "forbidden",
+		"connection reset", "broken pipe", "no such host",
+		"bad gateway", "service unavailable", "gateway timeout", "overloaded",
+		"stream disconnected", "eof",
+	} {
+		if strings.Contains(text, frag) {
+			return true
+		}
+	}
+	switch {
+	case status == 404:
+		// Responses 存储引用类 404 换目标无意义。
+		return !strings.Contains(text, "previous response") &&
+			!strings.Contains(text, "response not found") &&
+			!strings.Contains(text, "resp_")
+	case status == 401, status == 402, status == 403, status == 408, status == 429:
+		return true
+	case status >= 500 && status < 600:
+		return true
+	}
+	return false
+}
+
+// auditRouteFailover 记录一次目标转移审计（中间尝试不入 requests 行，
+// 这里是唯一的故障轨迹）。
+func auditRouteFailover(svc *service.Service, routeID int64, alias, from, to string, status int, cause string) {
+	detail := map[string]any{"alias": alias, "from": from, "to": to, "status": status, "cause": cause}
+	_ = svc.Store().AppendAudit(context.Background(), store.AuditEvent{
+		Action: "route.failover", EntityType: "model_route",
+		EntityID: strconv.FormatInt(routeID, 10), Detail: detail,
+	})
+}
+
+func routeFailureCause(status int, err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return "status_" + strconv.Itoa(status)
+}
+
+// executeRoutedLoop 非流式 failover 主循环。成功或终局失败都结算一次并落单行；
+// 可转移失败冷却当前目标后换下一个。
+func executeRoutedLoop(ctx context.Context, re *routedExecution, req rpcExecutorRequest, request []byte, startedAt time.Time) ([]byte, error) {
+	svc := re.svc
+	route := re.match.Route
+	for i, tgt := range re.chain {
+		finalTgt := targetWithSuffix(tgt, re.match.Suffix)
+		payload := preparePayload(request, req.SourceFormat, req.Format, finalTgt, false)
+		hostBody, headers, status, errHost := hostModelExecute(req.HostCallbackID, req, finalTgt, payload, false)
+		upstream := service.FirstNonEmpty(usageparse.SniffModel(hostBody), finalTgt)
+		if errHost == nil && status < 400 {
+			parsed, _ := usageparse.Parse(hostBody)
+			settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), status, parsed, upstream, re.claim)
+			return okEnvelope(rpcExecutorResponse{Payload: hostBody, Headers: headers})
+		}
+		if i < len(re.chain)-1 && routeFailureEligible(status, routeFailureCause(status, errHost), errHost) {
+			svc.MarkRouteFail(route.ID, tgt, route.CooldownSeconds)
+			auditRouteFailover(svc, route.ID, route.Alias, tgt, re.chain[i+1], status, routeFailureCause(status, errHost))
+			continue
+		}
+		// 终局：沿用直连语义——传输层失败不落行释放预占；HTTP 错误体透传并落行。
+		if errHost != nil {
+			re.claim.release(0)
+			_, _ = svc.Release(ctx, re.reservation.ID)
+			return errorEnvelope("upstream_error", errHost.Error()), nil
+		}
+		parsed, _ := usageparse.Parse(hostBody)
+		settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), status, parsed, upstream, re.claim)
+		return okEnvelope(rpcExecutorResponse{Payload: hostBody, Headers: headers})
+	}
+	// 不可达：ResolveChain 保证链非空，末次迭代必为终局分支。
+	return errorEnvelope("upstream_error", "路由候选链为空"), nil
+}
+
+// dialOutcome 是单候选流式拨号的结果。
+type dialOutcome int
+
+const (
+	dialOK       dialOutcome = iota // 流已建立（StatusCode<400 且 StreamID 就绪）
+	dialTransfer                    // 可转移失败：已冷却标记+审计，换下一候选
+	dialFailed                      // 终局失败：调用方按既有语义收尾，err 为原因
+)
+
+// dialHostStream 对单个候选目标发起流式拨号。首字节尚未产出，这里是
+// 流式路径唯一可切换目标的窗口。
+func dialHostStream(re *routedExecution, req rpcExecutorRequest, request []byte, index int) (rpcHostModelStreamResponse, dialOutcome, error) {
+	tgt := re.chain[index]
+	finalTgt := targetWithSuffix(tgt, re.match.Suffix)
+	payload := preparePayload(request, req.SourceFormat, req.Format, finalTgt, true)
+	raw, err := hostCall("host.model.execute_stream", rpcHostModelExecutionRequest{
+		EntryProtocol:  service.FirstNonEmpty(req.SourceFormat, "openai"),
+		ExitProtocol:   service.FirstNonEmpty(req.Format, req.SourceFormat, "openai"),
+		Model:          finalTgt,
+		Stream:         true,
+		Body:           payload,
+		Headers:        req.Headers,
+		Query:          req.Query,
+		Alt:            req.Alt,
+		HostCallbackID: req.HostCallbackID,
+	})
+	var stream rpcHostModelStreamResponse
+	if err == nil {
+		err = json.Unmarshal(raw, &stream)
+	}
+	// 空 StreamID 只在「成功状态码」下才是协议异常；HTTP 错误响应本就没有流。
+	if err == nil && stream.StatusCode < 400 && stream.StreamID == "" {
+		err = errors.New("empty host stream id")
+	}
+	if err != nil {
+		if index < len(re.chain)-1 && routeFailureEligible(0, err.Error(), err) {
+			re.svc.MarkRouteFail(re.match.Route.ID, tgt, re.match.Route.CooldownSeconds)
+			auditRouteFailover(re.svc, re.match.Route.ID, re.match.Route.Alias, tgt, re.chain[index+1], 0, err.Error())
+			return stream, dialTransfer, nil
+		}
+		return stream, dialFailed, err
+	}
+	if stream.StatusCode >= 400 {
+		_ = closeHostModelStream(stream.StreamID)
+		if index < len(re.chain)-1 && routeFailureEligible(stream.StatusCode, "", nil) {
+			re.svc.MarkRouteFail(re.match.Route.ID, tgt, re.match.Route.CooldownSeconds)
+			auditRouteFailover(re.svc, re.match.Route.ID, re.match.Route.Alias, tgt, re.chain[index+1], stream.StatusCode, "")
+			return rpcHostModelStreamResponse{}, dialTransfer, nil
+		}
+		return stream, dialFailed, errHostStatus(stream.StatusCode)
+	}
+	return stream, dialOK, nil
+}
+
+type errHostStatus int
+
+func (e errHostStatus) Error() string { return "host model status " + strconv.Itoa(int(e)) }
+
+// pumpRoutedStream 是流建立后的读泵循环：逐块增量解析用量并向客户端发射。
+// 首字节已出后不再切换目标；所有收尾分支以 finalTgt 兜底 UpstreamModel。
+func pumpRoutedStream(re *routedExecution, req rpcExecutorRequest, startedAt time.Time, stream rpcHostModelStreamResponse, finalTgt, pluginStreamID string, closeStream func(string)) error {
+	svc := re.svc
+	defer func() { _ = closeHostModelStream(stream.StreamID) }()
+	acc := &usageparse.Accumulator{}
+	var firstChunkAt, completedAt time.Time
+	for {
+		chunkRaw, errRead := hostCall("host.model.stream_read", rpcHostModelStreamReadRequest{StreamID: stream.StreamID})
+		if errRead != nil {
+			completedAt = time.Now()
+			parsed, _ := acc.Result()
+			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), finalTgt), re.claim)
+			return errRead
+		}
+		var chunk rpcHostModelStreamReadResponse
+		if err := json.Unmarshal(chunkRaw, &chunk); err != nil {
+			completedAt = time.Now()
+			parsed, _ := acc.Result()
+			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), finalTgt), re.claim)
+			return err
+		}
+		if chunk.Error != "" {
+			completedAt = time.Now()
+			parsed, _ := acc.Result()
+			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), finalTgt), re.claim)
+			return errors.New(chunk.Error)
+		}
+		if len(chunk.Payload) > 0 {
+			acc.FeedChunk(chunk.Payload)
+			if firstChunkAt.IsZero() {
+				firstChunkAt = time.Now()
+			}
+			if err := emitPluginStreamChunk(pluginStreamID, chunk.Payload); err != nil {
+				completedAt = time.Now()
+				parsed, _ := acc.Result()
+				settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 499, parsed, service.FirstNonEmpty(acc.Model(), finalTgt), re.claim)
+				return err
+			}
+		}
+		if chunk.Done {
+			break
+		}
+	}
+	completedAt = time.Now()
+	parsed, _ := acc.Result()
+	closeStream("")
+	if parsed.IsZero() {
+		if rec, ok := re.claim.wait(svc.Config().Quota.Settlement.HostUsageWait.Std()); ok {
+			parsed = usageFromRecord(rec)
+			r := buildRequest(svc, re.reservation, req, re.plan.Meta, startedAt, firstChunkAt, completedAt, 200)
+			r.UpstreamModel = service.FirstNonEmpty(acc.Model(), finalTgt)
+			applyHostUsageToRequest(r, rec)
+			return finishSettle(svc, re.reservation, r, parsed, re.claim)
+		}
+	}
+	r := buildRequest(svc, re.reservation, req, re.plan.Meta, startedAt, firstChunkAt, completedAt, 200)
+	r.UpstreamModel = service.FirstNonEmpty(acc.Model(), finalTgt)
+	return finishSettle(svc, re.reservation, r, parsed, re.claim)
+}

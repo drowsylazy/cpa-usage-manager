@@ -157,6 +157,10 @@ type Store struct {
 	// pricingHookMu / onPricingChanged 是计价规则变更回调（服务层失效快照用）。
 	pricingHookMu    sync.Mutex
 	onPricingChanged func()
+
+	// routesHookMu / onRoutesChanged 是模型路由表变更回调（服务层失效路由快照用）。
+	routesHookMu    sync.Mutex
+	onRoutesChanged func()
 }
 
 // execHotTx 是写事务语句执行的统一收口（热路径语句都经它执行）。
