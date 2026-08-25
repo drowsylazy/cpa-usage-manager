@@ -3,6 +3,7 @@ package httpapi
 import (
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/drowsylazy/cpa-usage-manager/internal/service"
 	"github.com/drowsylazy/cpa-usage-manager/internal/store"
@@ -10,6 +11,26 @@ import (
 
 // 模型路由（集合别名）管理端点。规则脚本的编译校验在 service 层
 // （ValidateRouteRule），这里只做参数形态与落库。
+
+// decodeHTMLEntities 还原上游链路可能注入的 HTML 实体。规则语言的合法词表
+// 不含这些序列（& 仅以 && 运算符出现），而面板到插件的某一层一旦把引号/
+// 尖括号转义进存盘数据，规则将永久无法通过编译——保存期统一还原一次。
+// strings.NewReplacer 单趟匹配：&amp;lt; 只还原为 &lt;，不会二次展开。
+func decodeHTMLEntities(s string) string {
+	if !strings.Contains(s, "&") {
+		return s
+	}
+	return strings.NewReplacer(
+		"&amp;", "&",
+		"&lt;", "<",
+		"&gt;", ">",
+		"&quot;", "\"",
+		"&#34;", "\"",
+		"&#38;", "&",
+		"&#39;", "'",
+		"&apos;", "'",
+	).Replace(s)
+}
 
 func (a *API) modelRoutes(w http.ResponseWriter, r *http.Request) {
 	items, err := a.svc.ListRoutesCompiled(r.Context())
@@ -52,6 +73,8 @@ func (a *API) modelRouteSave(w http.ResponseWriter, r *http.Request) {
 	if in.Enabled != nil {
 		enabled = *in.Enabled
 	}
+	in.Alias = decodeHTMLEntities(in.Alias)
+	in.Rule = decodeHTMLEntities(in.Rule)
 	ctx := r.Context()
 	refs, _, warning, verr := a.svc.ValidateRouteRule(ctx, in.ID, in.Alias, in.Rule, in.PricingMode)
 	if verr != nil {

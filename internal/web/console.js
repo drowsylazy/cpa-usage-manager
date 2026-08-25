@@ -2564,10 +2564,25 @@ const TIPS_routeRule = 'when 条件 -> 候选链；候选链为 "模型"、prior
   + 'ai_judge(["simple","hard"]) 返回其中一项，可与 == 连用做智能分级（需先配置评判模型）。\n'
   + '# 开头是注释。';
 
+// unescapeEntities 把上游链路可能注入的 HTML 实体还原为原文（textarea 内层
+// 解码法，安全无脚本执行）。与后端保存期 decodeHTMLEntities 配对：存盘已归一，
+// 这里兜住「响应途中再被转义」的显示侧。
+function unescapeEntities(s) {
+  if (!s || s.indexOf('&') < 0) return s;
+  const ta = document.createElement('textarea');
+  ta.innerHTML = s;
+  return ta.value;
+}
+
 loaders.routes = async () => {
   const r = await api('/model-routes');
-  routeCache.items = r.items || [];
+  routeCache.items = (r.items || []).map(it => ({
+    ...it,
+    alias: unescapeEntities(it.alias),
+    rule: unescapeEntities(it.rule),
+  }));
   routeCache.judge = r.judge || routeCache.judge;
+  if (routeCache.judge) routeCache.judge.model = unescapeEntities(routeCache.judge.model);
   renderRouteJudgeState();
   renderRouteCards();
   stamp();

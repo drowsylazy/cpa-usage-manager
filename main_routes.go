@@ -138,23 +138,10 @@ type rpcModelRegisterResponse struct {
 	Models   []rpcRegisteredModel `json:"models"`
 }
 
-// modelRegistrarEnabled 报告是否应声明 model_registrar 能力位：
-// 配额接管开启且存在启用中的路由。旧宿主忽略该能力位，功能静默降级。
-func modelRegistrarEnabled(st *store.Store) bool {
-	if st == nil {
-		return false
-	}
-	rows, err := st.ListModelRoutes(context.Background())
-	if err != nil {
-		return false
-	}
-	for _, r := range rows {
-		if r.Enabled {
-			return true
-		}
-	}
-	return false
-}
+// modelRegistrarEnabled 已删除：model_registrar 能力位改为恒声明
+// （quota.enabled 时），避免「宿主启动时无路由 → 能力位 false → 建路由后
+// 必须等一次 reconfigure」的坑；model.register 对空列表返回空 models，
+// 宿主 RegisterModels 自动跳过。
 
 func modelRegister(svc *service.Service) ([]byte, error) {
 	resp := rpcModelRegisterResponse{Provider: config.PluginID, Models: []rpcRegisteredModel{}}

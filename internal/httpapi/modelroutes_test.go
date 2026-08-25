@@ -134,3 +134,43 @@ func TestModelRouteRoutes(t *testing.T) {
 		t.Fatalf("删除不存在路由应 400: %d", w.Code)
 	}
 }
+
+// TestModelRouteEntityDecode 验证保存期 HTML 实体还原：被中间层转义的规则
+// 落库为原文、可正常编译，回显不再带实体。
+func TestModelRouteEntityDecode(t *testing.T) {
+	a := newTestAPI(t)
+	if w := do(t, a, "POST", base+"/model-routes/judge", `{"model":"judge-x","timeout_ms":4000}`); w.Code != 200 {
+		t.Fatalf("judge 设置失败: %d", w.Code)
+	}
+	escaped := `when ai_judge([&#34;simple&#34;, &#34;hard&#34;]) == &#34;hard&#34;
+  -&gt; &#34;openrouter/ox-alpha&#34;
+-&gt; &#34;orcarouter/deepseek-v4-flash&#34;`
+	w := do(t, a, "POST", base+"/model-routes/save",
+		fmt.Sprintf(`{"alias":"esc","rule":%q,"cooldown_seconds":30,"pricing_mode":"target"}`, escaped))
+	var saved struct {
+		OK bool `json:"ok"`
+	}
+	decodeJSON(t, w, &saved)
+	if !saved.OK {
+		t.Fatalf("转义规则经还原后应可保存: %s", w.Body)
+	}
+	w = do(t, a, "GET", base+"/model-routes", "")
+	var list struct {
+		Items []struct {
+			Alias string `json:"alias"`
+			Rule  string `json:"rule"`
+			Refs  []string `json:"refs"`
+		} `json:"items"`
+	}
+	decodeJSON(t, w, &list)
+	if len(list.Items) != 1 {
+		t.Fatalf("应有 1 条路由: %+v", list.Items)
+	}
+	want := "when ai_judge([\"simple\", \"hard\"]) == \"hard\"\n  -> \"openrouter/ox-alpha\"\n-> \"orcarouter/deepseek-v4-flash\""
+	if list.Items[0].Rule != want {
+		t.Fatalf("落库应为原文: %q", list.Items[0].Rule)
+	}
+	if len(list.Items[0].Refs) != 2 || list.Items[0].Refs[0] != "openrouter/ox-alpha" {
+		t.Fatalf("refs 应含斜杠目标: %v", list.Items[0].Refs)
+	}
+}

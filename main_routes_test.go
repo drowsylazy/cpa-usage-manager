@@ -355,14 +355,6 @@ func TestModelRegisterContract(t *testing.T) {
 	if _, err := st.InsertModelRoute(ctx, store.ModelRoute{Alias: "off", Rule: "-> \"c\"", CooldownSeconds: 60, PricingMode: "target", Enabled: false}); err != nil {
 		t.Fatal(err)
 	}
-	if !modelRegistrarEnabled(st) {
-		t.Fatal("存在启用路由时应声明能力位")
-	}
-	// 空库实例不声明。
-	_, st2 := routeTestEnv(t)
-	if modelRegistrarEnabled(st2) {
-		t.Fatal("无启用路由不应声明能力位")
-	}
 
 	raw, err := modelRegister(svc)
 	if err != nil {

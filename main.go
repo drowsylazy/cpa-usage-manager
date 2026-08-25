@@ -632,7 +632,7 @@ func configure(inline string) error {
 // ---------- 注册响应 ----------
 
 func pluginRegistration(schema uint32) rpcRegistration {
-	st, _, _, cfg := current()
+	_, _, _, cfg := current()
 	enabled := cfg.Quota.Enabled
 	formats := []string{
 		"openai", "chat-completions", "claude", "gemini",
@@ -649,8 +649,11 @@ func pluginRegistration(schema uint32) rpcRegistration {
 		caps.ExecutorOutputFormats = formats
 		caps.RequestInterceptor = true
 		caps.RequestLifecyclePlugin = true
-		// 能力位随宿主下次注册/reconfigure 刷新：新建首条路由后需等一次。
-		caps.ModelRegistrar = modelRegistrarEnabled(st)
+		// 恒声明 model_registrar（空模型列表宿主自动跳过）：若按「存在启用路由」
+		// 条件声明，宿主启动时还没有路由的话能力位=false，之后必须等一次
+		// reconfigure 才会被当作 registrar——这是「别名没进 /v1/models」的
+		// 实际踩坑路径。注册本身仍只返回启用中的别名。
+		caps.ModelRegistrar = true
 	}
 	return rpcRegistration{
 		SchemaVersion: schema,
