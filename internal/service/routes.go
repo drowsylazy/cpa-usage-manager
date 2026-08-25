@@ -227,22 +227,14 @@ func (s *Service) ResolveChain(ctx context.Context, m RouteMatch, env *routelang
 		if digestFn == nil {
 			digestFn = func() (string, error) { return "", nil }
 		}
-		var once sync.Once
-		var judgeErr error
-		env.AI = func(cctx context.Context, options []string) (string, error) {
-			once.Do(func() { _, judgeErr = s.judgeSettingsCached(cctx) })
-			if judgeErr != nil {
-				return "", judgeErr
-			}
-			digest, _ := digestFn()
-			return s.aiJudge(cctx, env.Vars, digest, options)
-		}
+		s.injectJudge(env, digestFn)
 	}
 	chain, fellBack, err := m.Route.Prog.Eval(ctx, env)
 	if err != nil && chain == nil {
 		return nil, false, err
 	}
-	if fellBack {
+	if fellBack && m.Route.ID != 0 {
+		// ID=0 是规则测试的临时路由，不落审计。
 		_ = s.st.AppendAudit(ctx, store.AuditEvent{
 			Action:     "route.ai_fallback",
 			EntityType: "model_route",
@@ -283,10 +275,120 @@ func (s *Service) BuildRouteEnv(meta RequestMeta, rawModel string, stream bool, 
 	}
 }
 
+// injectJudge 把 ai_judge 的真实执行闭包挂到求值环境上：首次调用先确认
+// 评判模型已配置，再以惰性摘要走 aiJudge（带 10 分钟结果缓存）。供
+// ResolveChain 与规则干跑测试共用。
+func (s *Service) injectJudge(env *routelang.Env, digestFn func() (string, error)) {
+	var once sync.Once
+	var judgeErr error
+	env.AI = func(cctx context.Context, options []string) (string, error) {
+		once.Do(func() { _, judgeErr = s.judgeSettingsCached(cctx) })
+		if judgeErr != nil {
+			return "", judgeErr
+		}
+		digest, _ := digestFn()
+		return s.aiJudge(cctx, env.Vars, digest, options)
+	}
+}
+
 // HasThinkingSuffix 报告模型名是否携带思考强度后缀。
 func HasThinkingSuffix(model string) bool {
 	_, sfx := StripThinkingSuffix(model)
 	return sfx != ""
+}
+
+// ---------- 规则干跑测试 ----------
+
+// TestRouteRequest 是面板「测试此规则」的输入。alias/rule 取编辑器当前
+// 内容（rule 优先于已保存版本，支持未保存草稿）；prompt 合成为最小对话体，
+// 供 body_len/input_tokens 与 ai_judge 摘要使用。
+type TestRouteRequest struct {
+	ID     int64  `json:"id"`     // 编辑中的路由 ID；0=未保存草稿（不做冷却过滤）
+	Alias  string `json:"alias"`
+	Rule   string `json:"rule"`
+	Model  string `json:"model"`  // 模拟请求模型名；空=用 alias
+	Stream bool   `json:"stream"`
+	Source string `json:"source"` // 空=openai
+	Prompt string `json:"prompt"`
+	RunAI  bool   `json:"run_ai"` // 真实执行 ai_judge（消耗评判模型额度）；否则按回落兜底处理
+}
+
+// CooldownSkip 是干跑中因冷却被摘除的目标。
+type CooldownSkip struct {
+	Target string    `json:"target"`
+	Until  time.Time `json:"until"`
+}
+
+// TestRouteResult 是干跑结果。Chain 为冷却过滤后的有序候选链（首=将请求的
+// 目标）；Error 为编译/求值错误文本（此时无链）。AISkipped 表示规则含
+// ai_judge 但本次未执行——求值按 AI 失败处理，结果来自兜底分支。
+type TestRouteResult struct {
+	Chain     []string       `json:"chain,omitempty"`
+	Skipped   []CooldownSkip `json:"skipped,omitempty"`
+	FellBack  bool           `json:"fell_back,omitempty"`
+	AISkipped bool           `json:"ai_skipped,omitempty"`
+	Vars      map[string]any `json:"vars"`
+	Error     string         `json:"error,omitempty"`
+}
+
+// TestRoute 干跑一条规则脚本：不预占、不改冷却、不落审计、不请求目标模型。
+// RunAI 为真且规则含 ai_judge 时真实调用评判模型（经宿主转发与计费）；
+// 否则 env.AI 保持 nil，求值器按 AI 失败自动回落兜底分支，零外部副作用。
+func (s *Service) TestRoute(ctx context.Context, in TestRouteRequest) TestRouteResult {
+	res := TestRouteResult{Vars: map[string]any{}}
+	prog, err := routelang.Compile(in.Rule)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	var body []byte
+	if strings.TrimSpace(in.Prompt) != "" {
+		body, _ = json.Marshal(map[string]any{
+			"messages": []map[string]string{{"role": "user", "content": in.Prompt}},
+		})
+	}
+	rawModel := FirstNonEmpty(strings.TrimSpace(in.Model), in.Alias)
+	env := s.BuildRouteEnv(ParseRequestMeta(body), rawModel, in.Stream, FirstNonEmpty(strings.TrimSpace(in.Source), "openai"))
+	if prog.UsesAI() && in.RunAI {
+		digest := RequestDigest(body)
+		s.injectJudge(env, func() (string, error) { return digest, nil })
+	} else if prog.UsesAI() {
+		res.AISkipped = true
+	}
+	chain, fellBack, evalErr := prog.Eval(ctx, env)
+	if evalErr != nil && chain == nil {
+		res.Error = evalErr.Error()
+		return res
+	}
+	res.FellBack = fellBack
+	// 冷却过滤只读现网状态：ID>0 时按真实路由键摘除冷却目标并报告；
+	// 草稿（ID=0）没有冷却历史，原样返回整链。
+	filtered := chain
+	if in.ID > 0 && len(chain) > 0 {
+		now := time.Now()
+		s.coolMu.Lock()
+		out := make([]string, 0, len(chain))
+		for _, tgt := range chain {
+			until, ok := s.cooldowns[cooldownKey(in.ID, tgt)]
+			if !ok {
+				out = append(out, tgt)
+				continue
+			}
+			if now.After(until) {
+				delete(s.cooldowns, cooldownKey(in.ID, tgt))
+				out = append(out, tgt)
+				continue
+			}
+			res.Skipped = append(res.Skipped, CooldownSkip{Target: tgt, Until: until})
+		}
+		s.coolMu.Unlock()
+		filtered = out
+	}
+	res.Chain = filtered
+	for k, v := range env.Vars {
+		res.Vars[k] = v
+	}
+	return res
 }
 
 // ValidateRouteRule 在保存期校验路由配置，返回静态引用集与告警。

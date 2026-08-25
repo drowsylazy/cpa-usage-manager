@@ -715,6 +715,7 @@ func managementRegistration() rpcManagementRegistration {
 		{Method: "POST", Path: base + "/model-routes/delete", Description: "删除模型路由"},
 		{Method: "GET", Path: base + "/model-routes/judge", Description: "AI 评判设置读取"},
 		{Method: "POST", Path: base + "/model-routes/judge", Description: "AI 评判设置保存"},
+		{Method: "POST", Path: base + "/model-routes/test", Description: "路由规则干跑测试（不请求目标模型）"},
 		{Method: "GET", Path: base + "/usage", Description: "请求明细"},
 		{Method: "GET", Path: base + "/usage/summary", Description: "用量汇总"},
 		{Method: "GET", Path: base + "/usage/dimension", Description: "维度分组"},

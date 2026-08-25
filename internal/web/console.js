@@ -2558,11 +2558,9 @@ $('fx-refresh').addEventListener('click', async () => {
 // ---------- 模型集合（路由别名） ----------
 // 集合别名 = 一条规则脚本 + 有序目标链；保存期服务端编译校验并回填 refs。
 const routeCache = { items: [], judge: { model: '', timeout_ms: 8000 }, modelsLoaded: false };
-const TIPS_routeRule = 'when 条件 -> 候选链；候选链为 "模型"、priority ["a","b"]（声明序即回退序）'
-  + '或 weighted {"a":3,"b":1}（加权随机，选中者排首）。最后必须有一条无条件兜底分支（-> ...）。\n'
-  + '变量：input_tokens / body_len / model / stream / thinking_effort / source。'
-  + 'ai_judge(["simple","hard"]) 返回其中一项，可与 == 连用做智能分级（需先配置评判模型）。\n'
-  + '# 开头是注释。';
+// ROUTE_DOC_URL 规则语言的完整手册（仓库 docs/routing.md 的 GitHub 页面）。
+const ROUTE_DOC_URL = 'https://github.com/drowsylazy/cpa-usage-manager/blob/main/docs/routing.md';
+const TIPS_routeRule = 'when 条件 -> 候选链，自上而下第一条命中生效；末行必须是无条件兜底分支。变量、运算符与示例见「规则手册」链接。';
 
 // unescapeEntities 把上游链路可能注入的 HTML 实体还原为原文（textarea 内层
 // 解码法，安全无脚本执行）。与后端保存期 decodeHTMLEntities 配对：存盘已归一，
@@ -2637,7 +2635,9 @@ function routeFormBody(r) {
     + '</div>'
     + fieldRow(labelWithTip('规则脚本', TIPS_routeRule),
       '<textarea id="rt-rule" class="mono-area" spellcheck="false" placeholder=\'-> "gpt-4o-mini"\'>'
-      + esc(r ? r.rule : '') + '</textarea>');
+      + esc(r ? r.rule : '') + '</textarea>')
+    + '<div class="btn-row"><button type="button" class="btn small" data-rt-test="' + (r ? r.id : 0) + '">测试此规则…</button>'
+    + '<a class="doc-link" href="' + ROUTE_DOC_URL + '" target="_blank" rel="noopener">规则手册 ↗</a></div>';
 }
 function collectRouteForm() {
   return {
@@ -2648,19 +2648,24 @@ function collectRouteForm() {
     rule: $('rt-rule').value,
   };
 }
+// routeSaveOnOk 生成集合表单的保存闭包。抽出来是为了「测试规则」视图切换：
+// 离开编辑器去测试时暂存表单快照，回来后重建同一份保存闭包。
+function routeSaveOnOk(id) {
+  return async () => {
+    const body = id ? { id, actor: 'console', ...collectRouteForm() } : { actor: 'console', ...collectRouteForm() };
+    const res = await post('/model-routes/save', body);
+    if (res.warning) toast(res.warning, 'err');
+    toast(id ? '集合已更新' : '集合已创建', 'ok');
+    loaders.routes().catch(() => {});
+  };
+}
 $('route-add').addEventListener('click', () => {
   loadRouteModelList();
   openSheet({
     title: '新建模型集合', okText: '保存',
     body: routeFormBody(null),
     note: TIPS_routeRule,
-    onOk: async () => {
-      const body = collectRouteForm();
-      const res = await post('/model-routes/save', { ...body, actor: 'console' });
-      if (res.warning) toast(res.warning, 'err');
-      toast('集合已创建', 'ok');
-      loaders.routes().catch(() => {});
-    },
+    onOk: routeSaveOnOk(0),
   });
 });
 $('route-rows').addEventListener('click', e => {
@@ -2673,13 +2678,7 @@ $('route-rows').addEventListener('click', e => {
       title: '编辑集合 · ' + r.alias, okText: '保存',
       body: routeFormBody(r),
       note: TIPS_routeRule,
-      onOk: async () => {
-        const body = { id: r.id, actor: 'console', ...collectRouteForm() };
-        const res = await post('/model-routes/save', body);
-        if (res.warning) toast(res.warning, 'err');
-        toast('集合已更新', 'ok');
-        loaders.routes().catch(() => {});
-      },
+      onOk: routeSaveOnOk(r.id),
     });
     return;
   }
@@ -2729,6 +2728,122 @@ $('route-judge-btn').addEventListener('click', () => {
       toast('评判设置已保存', 'ok');
     },
   });
+});
+
+// ---------- 规则干跑测试 ----------
+// 编辑器内做视图切换而非叠加第二个对话框：规则草稿尚未保存，快照后整块
+// 换入测试面板，返回时按快照还原表单与保存闭包，任何路径都不丢编辑内容。
+
+// routeEditSnapshot 是进入测试视图时的编辑器状态；null 表示不在测试视图。
+let routeEditSnapshot = null;
+
+function enterRouteTestView(id) {
+  const snap = collectRouteForm();
+  routeEditSnapshot = { id, snap, title: $('sheet-title').textContent };
+  const judgeReady = !!(routeCache.judge && routeCache.judge.model);
+  const usesAI = (snap.rule || '').indexOf('ai_judge') >= 0;
+  $('sheet-title').textContent = '测试规则 · ' + (snap.alias || '(未命名)');
+  $('sheet-body').innerHTML =
+    '<div class="btn-row" style="margin-bottom:8px"><button type="button" class="btn small" id="rt-test-back">← 返回编辑</button></div>'
+    + '<pre class="rt-rule">' + (snap.rule ? esc(snap.rule) : '(空规则)') + '</pre>'
+    + fieldRow(labelWithTip('提示词',
+        '合成一条 user 消息参与干跑：body_len / input_tokens 按它计算，含 ai_judge 的规则用它做摘要。'),
+      '<textarea id="rt-test-prompt" class="mono-area" rows="4" style="min-height:96px" placeholder="输入一段用户提示词，模拟一次真实请求"></textarea>')
+    + '<div class="form-grid">'
+    + fieldRow('请求模型名', '<input id="rt-test-model" value="' + esc(snap.alias) + '" spellcheck="false">')
+    + fieldRow('入口格式', '<select id="rt-test-source"><option value="openai">openai</option><option value="claude">claude</option><option value="gemini">gemini</option><option value="chat-completions">chat-completions</option></select>')
+    + '</div>'
+    + '<div class="btn-row rt-test-opts">'
+    + '<label class="rt-opt"><input type="checkbox" id="rt-test-stream"> 流式请求</label>'
+    + (usesAI
+        ? '<label class="rt-opt"><input type="checkbox" id="rt-test-ai"' + (judgeReady ? '' : ' disabled') + '> 执行 ai_judge（真实调用评判模型）' + (judgeReady ? '' : ' —— 需先配置评判模型') + '</label>'
+        : '')
+    + '</div>'
+    + '<p class="note">点右下角「运行测试」。求值为纯干跑：不请求目标模型、不产生计费与统计。</p>'
+    + '<div id="rt-test-out"></div>';
+  const ok = $('sheet-ok');
+  ok.textContent = '运行测试';
+  sheetOk = async () => {
+    try { await runRouteTest(); }
+    finally { ok.disabled = false; }
+    return false; // 保持对话框打开，结果就地展示
+  };
+  const promptBox = $('rt-test-prompt');
+  if (promptBox) promptBox.focus();
+}
+
+function exitRouteTestView() {
+  const s = routeEditSnapshot;
+  if (!s) return;
+  routeEditSnapshot = null;
+  $('sheet-title').textContent = s.title;
+  $('sheet-body').innerHTML = routeFormBody({ ...s.snap, id: s.id });
+  const ok = $('sheet-ok');
+  ok.textContent = '保存';
+  ok.className = 'btn primary';
+  ok.disabled = false;
+  sheetOk = routeSaveOnOk(s.id);
+  loadRouteModelList();
+  const rule = $('rt-rule');
+  if (rule) rule.focus();
+}
+
+async function runRouteTest() {
+  const s = routeEditSnapshot;
+  if (!s) return;
+  return post('/model-routes/test', {
+    id: s.id,
+    alias: s.snap.alias,
+    rule: s.snap.rule,
+    model: $('rt-test-model').value.trim(),
+    stream: $('rt-test-stream').checked,
+    source: $('rt-test-source').value,
+    prompt: $('rt-test-prompt').value,
+    run_ai: !!($('rt-test-ai') && $('rt-test-ai').checked),
+  }).then(renderRouteTestOut.bind(null, $('rt-test-out')));
+}
+
+// renderRouteTestOut 展示干跑结论：最终目标突出显示，回退链、被冷却摘除的
+// 目标与本次使用的变量值一并给出，便于核对规则分支是否按预期命中。
+function renderRouteTestOut(box, r) {
+  let html = '';
+  if (r.error) {
+    box.innerHTML = '<div class="rt-test-msg err"><b>未能求值</b>\n' + esc(unescapeEntities(r.error)) + '</div>';
+    return;
+  }
+  const chain = (r.chain || []).map(m => esc(unescapeEntities(m)));
+  if (!chain.length) {
+    html += '<div class="rt-test-msg warn">所有候选目标都在冷却中——实际请求将收到「全部冷却」错误，稍后再试或调短冷却秒数。</div>';
+  } else {
+    html += '<div class="rt-test-hit"><span>最终目标</span><code>' + chain[0] + '</code></div>';
+    if (chain.length > 1) html += '<p class="note">回退链：' + chain.join(' → ') + '</p>';
+  }
+  for (const sk of r.skipped || []) {
+    html += '<p class="note">已跳过冷却中的目标 <b>' + esc(unescapeEntities(sk.target)) + '</b>（至 ' + fmtDT(sk.until, true) + '）</p>';
+  }
+  if (r.fell_back) {
+    html += '<p class="note">结果来自兜底分支'
+      + (r.ai_skipped ? '（本次未执行 ai_judge；勾选「执行 ai_judge」可真实评判）' : '（ai_judge 执行失败）')
+      + '</p>';
+  } else if (r.ai_skipped) {
+    html += '<p class="note">条件分支里含 ai_judge 的未参与本次判定（未勾选执行）。</p>';
+  }
+  const v = r.vars || {};
+  html += '<p class="rt-test-vars">input_tokens=' + esc(String(v.input_tokens ?? '-'))
+    + ' · body_len=' + esc(String(v.body_len ?? '-'))
+    + ' · model=' + esc(unescapeEntities(String(v.model ?? '')))
+    + ' · stream=' + (v.stream ? 'true' : 'false')
+    + ' · thinking_effort=' + esc(String(v.thinking_effort || '(空)'))
+    + ' · source=' + esc(unescapeEntities(String(v.source || '')))
+    + '</p>';
+  box.innerHTML = html;
+}
+$('sheet-body').addEventListener('click', e => {
+  if (e.target.closest('[data-rt-test]')) {
+    enterRouteTestView(parseInt(e.target.closest('[data-rt-test]').dataset.rtTest, 10));
+    return;
+  }
+  if (e.target.closest('#rt-test-back')) exitRouteTestView();
 });
 
 // ---------- 认证额度 ----------

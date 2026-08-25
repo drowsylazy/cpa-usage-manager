@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -511,4 +513,75 @@ func TestRouteSnapshotSingleFlight(t *testing.T) {
 		t.Fatalf("惊群应被合并为一次重载，实际 %d 次", got)
 	}
 	_ = st
+}
+
+// TestTestRouteDryRun 覆盖规则干跑：编译错误、变量口径（提示词合成体进
+// input_tokens/body_len）、条件命中、冷却摘除（仅真实 ID）与 ai_judge 跳过回落。
+func TestTestRouteDryRun(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+
+	// 编译错误：Error 带行列号，无链。
+	res := s.TestRoute(ctx, TestRouteRequest{Alias: "auto", Rule: "-> priority [\"a\",\n-> \"b\""})
+	if res.Error == "" || len(res.Chain) != 0 || !strings.Contains(res.Error, "第 2 行") {
+		t.Fatalf("编译错误应带定位且无链: %+v", res)
+	}
+
+	// 变量口径：prompt 合成为 messages 体，body_len/input_tokens 与真实请求同式。
+	prompt := "你好世界"
+	synth, _ := json.Marshal(map[string]any{"messages": []map[string]string{{"role": "user", "content": prompt}}})
+	rule := "when input_tokens <= 100000 && source == \"gemini\"\n  -> priority [\"a\", \"b\"]\n-> \"c\""
+	res = s.TestRoute(ctx, TestRouteRequest{Alias: "auto", Rule: rule, Prompt: prompt, Source: "gemini", Model: "auto-high"})
+	if res.Error != "" {
+		t.Fatalf("求值失败: %s", res.Error)
+	}
+	if len(res.Chain) != 2 || res.Chain[0] != "a" || res.Chain[1] != "b" || res.FellBack || res.AISkipped {
+		t.Fatalf("应命中第一分支整链: %+v", res)
+	}
+	wantIn := int64(len(synth))/2 + 1
+	if res.Vars["input_tokens"] != wantIn || res.Vars["body_len"] != int64(len(synth)) {
+		t.Fatalf("input_tokens/body_len 口径错误: want %d/%d got %v/%v",
+			wantIn, len(synth), res.Vars["input_tokens"], res.Vars["body_len"])
+	}
+	// model 变量取模拟请求名剥思考后缀。
+	if res.Vars["model"] != "auto" || res.Vars["source"] != "gemini" {
+		t.Fatalf("model/source 变量错误: %v %v", res.Vars["model"], res.Vars["source"])
+	}
+
+	// 条件不命中走兜底；空 prompt 时 body_len=0、input_tokens=1。
+	res = s.TestRoute(ctx, TestRouteRequest{Alias: "t2", Rule: "when input_tokens > 100\n  -> \"big\"\n-> \"small\""})
+	if res.Error != "" || len(res.Chain) != 1 || res.Chain[0] != "small" {
+		t.Fatalf("应走兜底分支: %+v", res)
+	}
+	if res.Vars["input_tokens"] != int64(1) || res.Vars["body_len"] != int64(0) {
+		t.Fatalf("空提示词口径应为 0/1: %v", res.Vars)
+	}
+
+	// 冷却过滤只对已保存路由（ID>0）生效，并报告被摘除目标。
+	row := insertRoute(t, s, "cd", `-> priority ["X", "Y"]`)
+	s.MarkRouteFail(row.ID, "X", 60)
+	res = s.TestRoute(ctx, TestRouteRequest{ID: row.ID, Alias: "cd", Rule: row.Rule})
+	if res.Error != "" || len(res.Chain) != 1 || res.Chain[0] != "Y" {
+		t.Fatalf("冷却目标应被摘除: %+v", res)
+	}
+	if len(res.Skipped) != 1 || res.Skipped[0].Target != "X" || res.Skipped[0].Until.IsZero() {
+		t.Fatalf("应报告被跳过的冷却目标: %+v", res.Skipped)
+	}
+	// 同一规则按草稿（ID=0）干跑不做冷却过滤——草稿没有冷却历史。
+	res = s.TestRoute(ctx, TestRouteRequest{Alias: "cd", Rule: row.Rule})
+	if len(res.Chain) != 2 || len(res.Skipped) != 0 {
+		t.Fatalf("草稿干跑不应受冷却影响: %+v", res)
+	}
+
+	// ai_judge 默认跳过：按 AI 失败回落兜底分支，零外部副作用。
+	aiRule := "when ai_judge([\"simple\"]) == \"simple\"\n  -> \"smart\"\n-> \"dumb\""
+	res = s.TestRoute(ctx, TestRouteRequest{Alias: "j", Rule: aiRule})
+	if !res.AISkipped || !res.FellBack || len(res.Chain) != 1 || res.Chain[0] != "dumb" {
+		t.Fatalf("未勾选 run_ai 应跳过并回落: %+v", res)
+	}
+	// 勾选但评判模型未配置：同样回落（aiJudge 先报配置缺失），不算「跳过」。
+	res = s.TestRoute(ctx, TestRouteRequest{Alias: "j", Rule: aiRule, RunAI: true})
+	if res.AISkipped || !res.FellBack || len(res.Chain) != 1 || res.Chain[0] != "dumb" {
+		t.Fatalf("run_ai 但未配置评判模型应回落: %+v", res)
+	}
 }

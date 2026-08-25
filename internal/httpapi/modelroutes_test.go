@@ -174,3 +174,50 @@ func TestModelRouteEntityDecode(t *testing.T) {
 		t.Fatalf("refs 应含斜杠目标: %v", list.Items[0].Refs)
 	}
 }
+
+// TestModelRouteTestEndpoint 干跑端点：查询语义，编译/求值错误随 200 走
+// error 字段；规则经实体还原后参与编译；结果回传候选链与变量快照。
+func TestModelRouteTestEndpoint(t *testing.T) {
+	a := newTestAPI(t)
+
+	w := do(t, a, "POST", base+"/model-routes/test", `{"alias":"auto","rule":"when"}`)
+	if w.Code != 200 {
+		t.Fatalf("干跑坏规则应 200，得到 %d", w.Code)
+	}
+	var bad struct {
+		Error string `json:"error"`
+		Vars  map[string]any
+	}
+	decodeJSON(t, w, &bad)
+	if !strings.Contains(bad.Error, "第 1 行") || bad.Vars == nil {
+		t.Fatalf("错误应带定位且 vars 恒在: %+v", bad)
+	}
+
+	w = do(t, a, "POST", base+"/model-routes/test",
+		`{"id":0,"alias":"auto","rule":"-&gt; priority [&quot;a&quot;,&quot;b&quot;]","model":"AUTO-HIGH","source":"gemini","prompt":"hi","run_ai":false}`)
+	var out struct {
+		Chain     []string       `json:"chain"`
+		Skipped   []struct {
+			Target string `json:"target"`
+		} `json:"skipped"`
+		FellBack  bool           `json:"fell_back"`
+		AISkipped bool           `json:"ai_skipped"`
+		Vars      map[string]any `json:"vars"`
+		Error     string         `json:"error"`
+	}
+	decodeJSON(t, w, &out)
+	if out.Error != "" || len(out.Chain) != 2 || out.Chain[0] != "a" || out.Chain[1] != "b" {
+		t.Fatalf("干跑应还原实体并回传整链: %+v", out)
+	}
+	if out.AISkipped || out.FellBack || len(out.Skipped) != 0 {
+		t.Fatalf("简单干跑不应有 AI/冷却痕迹: %+v", out)
+	}
+	if out.Vars["model"] != "AUTO" || out.Vars["source"] != "gemini" {
+		t.Fatalf("变量快照错误: %v", out.Vars)
+	}
+
+	// 非法 JSON 体 → 400。
+	if w = do(t, a, "POST", base+"/model-routes/test", `{`); w.Code != 400 {
+		t.Fatalf("畸形请求体应 400: %d", w.Code)
+	}
+}

@@ -93,6 +93,7 @@ func (a *API) register() {
 	a.route("/model-routes/save", a.modelRouteSave)
 	a.route("/model-routes/delete", a.modelRouteDelete)
 	a.route("/model-routes/judge", a.modelRouteJudge)
+	a.route("/model-routes/test", a.modelRouteTest)
 
 	a.route("/usage", a.usage)
 	a.route("/usage/summary", a.usageSummary)

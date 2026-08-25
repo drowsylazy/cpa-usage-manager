@@ -33,7 +33,7 @@ gcc -O2 -o abi-smoke.exe scripts/abi-smoke.c
 health / overview / callers / callers/enabled
 keys / keys/issue / keys/update / keys/rotate / keys/reveal / keys/revoke / keys/delete
 pricing / pricing/delete / pricing/sync
-model-routes / model-routes/save / model-routes/delete / model-routes/judge
+model-routes / model-routes/save / model-routes/delete / model-routes/judge / model-routes/test
 usage / usage/summary / usage/dimension / requests / trends / costs / balance
 audit / auth-quotas / preferences / exchange-rate
 export/csv / export/png / backup / restore / reset / maintain
@@ -45,7 +45,7 @@ export/csv / export/png / backup / restore / reset / maintain
 
 ## 模型路由（集合别名）
 
-面板「模型集合」页签定义集合别名（如 `auto`），用自研规则脚本把别名映射到有序目标链：
+面板「模型集合」页签定义集合别名（如 `auto`），用自研规则脚本把别名映射到有序目标链（完整语法、变量口径与运行时行为见 [docs/routing.md](docs/routing.md)）：
 
 ```
 # 注释

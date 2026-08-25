@@ -146,3 +146,18 @@ func (a *API) modelRouteJudge(w http.ResponseWriter, r *http.Request) {
 	judge, _ := a.svc.GetJudgeSettings(r.Context())
 	jsonOut(w, judge, 200)
 }
+
+// modelRouteTest 干跑一条规则脚本：只求值候选链，不请求目标模型。
+// 与 save 同样对 alias/rule 做实体还原，保证编辑器里未保存的草稿按
+// 存盘后的形态参与编译。
+func (a *API) modelRouteTest(w http.ResponseWriter, r *http.Request) {
+	var in service.TestRouteRequest
+	if e := decode(r, &in); e != nil {
+		jsonOut(w, map[string]string{"error": e.Error()}, 400)
+		return
+	}
+	in.Alias = decodeHTMLEntities(in.Alias)
+	in.Rule = decodeHTMLEntities(in.Rule)
+	noStore(w)
+	jsonOut(w, a.svc.TestRoute(r.Context(), in), 200)
+}

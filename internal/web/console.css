@@ -448,6 +448,8 @@ table.data td.cell-clip{max-width:340px;overflow:hidden;text-overflow:ellipsis}
   display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));
   gap:12px;padding:16px 20px;
 }
+/* 空状态横跨整行，在卡片内水平居中（auto-fill 网格默认只占第一列） */
+.ky-grid > .empty{grid-column:1/-1;padding:56px 16px}
 .ky-card{
   display:flex;flex-direction:column;gap:9px;min-width:0;
   padding:14px 15px;border-radius:var(--r-panel);
@@ -933,3 +935,26 @@ table.data th .info{vertical-align:0}
   font-family:var(--mono);font-size:12px;line-height:1.6;
   min-height:190px;resize:vertical;white-space:pre;tab-size:2;
 }
+/* ── 规则干跑测试（编辑器内视图切换） ─────────────────────── */
+#rt-test-out{display:grid;gap:8px;margin-top:6px}
+.rt-test-hit{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.rt-test-hit > span{font-size:12px;color:var(--fg3)}
+.rt-test-hit code{
+  font-family:var(--mono);font-size:15px;font-weight:700;color:var(--signal);
+  word-break:break-all;
+}
+.rt-test-msg{padding:9px 12px;border-radius:8px;font-size:12px;line-height:1.55}
+.rt-test-msg.err{background:var(--alarm-soft);color:var(--alarm);white-space:pre-wrap}
+.rt-test-msg.warn{background:var(--warn-soft);color:var(--warn)}
+.rt-test-opts{gap:14px;margin-top:-2px}
+.rt-opt{
+  display:inline-flex;align-items:center;gap:6px;
+  font-size:12px;color:var(--fg2);cursor:pointer;
+}
+.rt-opt input{accent-color:var(--signal)}
+.rt-test-vars{
+  font-family:var(--mono);font-size:11px;color:var(--fg4);
+  word-break:break-word;line-height:1.7;
+}
+.doc-link{font-size:12px;color:var(--signal);text-decoration:none;white-space:nowrap}
+.doc-link:hover{text-decoration:underline}
