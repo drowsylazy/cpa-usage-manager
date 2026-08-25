@@ -433,21 +433,69 @@ func (s *Service) RouteReport(ctx context.Context, f UsageFilter) ([]RouteRow, e
 	if err != nil {
 		return nil, fmt.Errorf("聚合上游路由失败: %w", err)
 	}
-	// 回退行（raw==''，展示名实为别名）的归并：把该别名下未捕获真名的请求
-	// 按各显式真名行**已捕获**的量加权分摊（requests 按请求占比、token 按 token
-	// 占比，最大余数法保整数守恒），别名不再单独成行；该别名完全没有显式真名时
-	// 才保留为独立行。权重取原始快照，多个别名分摊到同一真名行时互不干扰。
+	// 渠道前缀归一：显式真名行按裸名（去「渠道/」前缀，小写比对）合并——
+	// 同一上游模型经渠道引用拨号（嗅探失败时落库的是拨号名）与宿主直报
+	// 会裂成两行，这里先并成一行再走回退分摊；展示名取请求量最大的裸名形态。
 	type agg struct {
 		row RouteRow
 		raw string // 原始 upstream_model；空 = 回退行
 		req int64  // 已捕获原始值，作分摊权重
 		tok int64
 	}
-	rows2 := make([]agg, len(aggs))
-	for i, a := range aggs {
-		rows2[i] = agg{row: a.row, raw: a.raw, req: a.row.Requests, tok: a.row.TotalTokens}
+	bareKey := func(s string) string {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if i := strings.LastIndex(s, "/"); i >= 0 && i+1 < len(s) {
+			s = s[i+1:]
+		}
+		return s
+	}
+	bareName := func(s string) string {
+		if i := strings.LastIndex(s, "/"); i >= 0 && i+1 < len(s) {
+			return s[i+1:]
+		}
+		return s
+	}
+	hasModel := func(list []string, s string) bool {
+		for _, v := range list {
+			if v == s {
+				return true
+			}
+		}
+		return false
+	}
+	rows2 := make([]agg, 0, len(aggs))
+	idx := make(map[string]int) // 裸名 → 显式真名行下标
+	for _, a := range aggs {
+		if a.raw == "" {
+			rows2 = append(rows2, agg{row: a.row, req: a.row.Requests, tok: a.row.TotalTokens})
+			continue
+		}
+		a.row.UpstreamModel = bareName(a.row.UpstreamModel)
+		key := bareKey(a.raw)
+		if j, ok := idx[key]; ok {
+			m := &rows2[j]
+			if a.row.Requests > m.req {
+				m.row.UpstreamModel = a.row.UpstreamModel
+			}
+			m.row.Requests += a.row.Requests
+			m.row.TotalTokens += a.row.TotalTokens
+			for _, name := range a.row.Models {
+				if !hasModel(m.row.Models, name) {
+					m.row.Models = append(m.row.Models, name)
+				}
+			}
+			m.req += a.row.Requests
+			m.tok += a.row.TotalTokens
+			continue
+		}
+		idx[key] = len(rows2)
+		rows2 = append(rows2, agg{row: a.row, raw: a.raw, req: a.row.Requests, tok: a.row.TotalTokens})
 	}
 	targets := make(map[string][]int) // 别名 → 显式真名行下标
+	// 回退行（raw==''，展示名实为别名）的归并：把该别名下未捕获真名的请求
+	// 按各显式真名行**已捕获**的量加权分摊（requests 按请求占比、token 按 token
+	// 占比，最大余数法保整数守恒），别名不再单独成行；该别名完全没有显式真名时
+	// 才保留为独立行。权重取原始快照，多个别名分摊到同一真名行时互不干扰。
 	for i := range rows2 {
 		if rows2[i].raw == "" {
 			continue

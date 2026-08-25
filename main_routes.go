@@ -122,6 +122,16 @@ func targetWithSuffix(target, suffix string) string {
 	return target + suffix
 }
 
+// bareTargetName 剥离候选目标的「渠道/」前缀。上游落库口径是真实上游模型
+// 名：响应嗅探失败时回退到裸名，与非流式嗅探结果、宿主直报的裸名同构，
+// 上游路由聚合不再因前缀裂成两行（orcarouter/x 与 x 是同一上游模型）。
+func bareTargetName(target string) string {
+	if i := strings.LastIndex(target, "/"); i >= 0 && i+1 < len(target) {
+		return target[i+1:]
+	}
+	return target
+}
+
 // ---------- model.register（集合别名单独进 /v1/models）----------
 
 // rpcRegisteredModel 字段与宿主 ModelInfo 对齐（PascalCase、无 JSON tag）：
@@ -285,7 +295,7 @@ func executeRoutedLoop(ctx context.Context, re *routedExecution, req rpcExecutor
 		finalTgt := targetWithSuffix(tgt, re.match.Suffix)
 		payload := rw.build(finalTgt)
 		hostBody, headers, status, errHost := hostModelExecute(req.HostCallbackID, req, finalTgt, payload, false)
-		upstream := service.FirstNonEmpty(usageparse.SniffModel(hostBody), finalTgt)
+		upstream := service.FirstNonEmpty(usageparse.SniffModel(hostBody), bareTargetName(finalTgt))
 		if errHost == nil && status < 400 {
 			parsed, _ := usageparse.Parse(hostBody)
 			settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), status, parsed, upstream, re.claim)
@@ -373,6 +383,8 @@ func (e errHostStatus) Error() string { return "host model status " + strconv.It
 func pumpRoutedStream(re *routedExecution, req rpcExecutorRequest, startedAt time.Time, stream rpcHostModelStreamResponse, finalTgt, pluginStreamID string, closeStream func(string)) error {
 	svc := re.svc
 	defer func() { _ = closeHostModelStream(stream.StreamID) }()
+	// 嗅探失败的回退名剥渠道前缀（见 bareTargetName）。
+	upstreamFallback := bareTargetName(finalTgt)
 	acc := &usageparse.Accumulator{}
 	var firstChunkAt, completedAt time.Time
 	for {
@@ -380,20 +392,20 @@ func pumpRoutedStream(re *routedExecution, req rpcExecutorRequest, startedAt tim
 		if errRead != nil {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), finalTgt), re.claim)
+			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), re.claim)
 			return errRead
 		}
 		var chunk rpcHostModelStreamReadResponse
 		if err := json.Unmarshal(chunkRaw, &chunk); err != nil {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), finalTgt), re.claim)
+			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), re.claim)
 			return err
 		}
 		if chunk.Error != "" {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), finalTgt), re.claim)
+			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), re.claim)
 			return errors.New(chunk.Error)
 		}
 		if len(chunk.Payload) > 0 {
@@ -404,7 +416,7 @@ func pumpRoutedStream(re *routedExecution, req rpcExecutorRequest, startedAt tim
 			if err := emitPluginStreamChunk(pluginStreamID, chunk.Payload); err != nil {
 				completedAt = time.Now()
 				parsed, _ := acc.Result()
-				settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 499, parsed, service.FirstNonEmpty(acc.Model(), finalTgt), re.claim)
+				settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 499, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), re.claim)
 				return err
 			}
 		}
@@ -419,12 +431,12 @@ func pumpRoutedStream(re *routedExecution, req rpcExecutorRequest, startedAt tim
 		if rec, ok := re.claim.wait(svc.Config().Quota.Settlement.HostUsageWait.Std()); ok {
 			parsed = usageFromRecord(rec)
 			r := buildRequest(svc, re.reservation, req, re.plan.Meta, startedAt, firstChunkAt, completedAt, 200)
-			r.UpstreamModel = service.FirstNonEmpty(acc.Model(), finalTgt)
+			r.UpstreamModel = service.FirstNonEmpty(acc.Model(), upstreamFallback)
 			applyHostUsageToRequest(r, rec)
 			return finishSettle(svc, re.reservation, r, parsed, re.claim)
 		}
 	}
 	r := buildRequest(svc, re.reservation, req, re.plan.Meta, startedAt, firstChunkAt, completedAt, 200)
-	r.UpstreamModel = service.FirstNonEmpty(acc.Model(), finalTgt)
+	r.UpstreamModel = service.FirstNonEmpty(acc.Model(), upstreamFallback)
 	return finishSettle(svc, re.reservation, r, parsed, re.claim)
 }

@@ -90,3 +90,33 @@ func TestAnalyticsSummaryRequestsTrendsBalance(t *testing.T) {
 		t.Fatalf("余额异常: %+v %v", b, err)
 	}
 }
+
+// TestRouteReportBareNameMerge 验证上游路由聚合的渠道前缀归一：同一别名下
+// 嗅探成功的裸名行与嗅探失败落库的「渠道/模型」行合并为一行，展示名取裸名。
+func TestRouteReportBareNameMerge(t *testing.T) {
+	s, st := testService(t)
+	ctx := context.Background()
+	ts := time.Date(2026, 8, 20, 10, 3, 0, 0, time.UTC)
+	for _, r := range []store.Request{
+		{ID: "a", TS: ts, Model: "swellrouter/free", UpstreamModel: "deepseek-v4-flash", Result: store.ResultOK, InputTokens: 100, TotalTokens: 100},
+		{ID: "b", TS: ts.Add(time.Second), Model: "swellrouter/free", UpstreamModel: "deepseek-v4-flash", Result: store.ResultOK, InputTokens: 60, TotalTokens: 60},
+		{ID: "c", TS: ts.Add(2 * time.Second), Model: "swellrouter/free", UpstreamModel: "orcarouter/deepseek-v4-flash", Result: store.ResultOK, InputTokens: 40, TotalTokens: 40},
+	} {
+		if err := st.RecordUsage(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := s.RouteReport(ctx, UsageFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("应合并为一行: %+v", rows)
+	}
+	if rows[0].UpstreamModel != "deepseek-v4-flash" {
+		t.Fatalf("展示名应为裸名: %q", rows[0].UpstreamModel)
+	}
+	if rows[0].Requests != 3 || rows[0].TotalTokens != 200 {
+		t.Fatalf("聚合错误: req=%d tok=%d", rows[0].Requests, rows[0].TotalTokens)
+	}
+}

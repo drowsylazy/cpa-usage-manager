@@ -344,6 +344,21 @@ func TestStreamDialFailover(t *testing.T) {
 	}
 }
 
+// TestBareTargetName 锁定渠道前缀剥离：嗅探失败时的上游兜底名与宿主直报
+// 的裸名同构（orcarouter/x 与 x 是同一上游模型）。
+func TestBareTargetName(t *testing.T) {
+	cases := [][2]string{
+		{"orcarouter/deepseek-v4-flash", "deepseek-v4-flash"},
+		{"deepseek-v4-flash", "deepseek-v4-flash"},
+		{"a/b/c", "c"},
+	}
+	for _, c := range cases {
+		if got := bareTargetName(c[0]); got != c[1] {
+			t.Fatalf("bareTargetName(%q) = %q, 期望 %q", c[0], got, c[1])
+		}
+	}
+}
+
 // TestModelRegisterContract 锁定与宿主的 model.register 契约：
 // 响应形状（provider/models）与 ModelInfo 字段名（PascalCase 无 tag）。
 func TestModelRegisterContract(t *testing.T) {
