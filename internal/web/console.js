@@ -1935,7 +1935,10 @@ const REQ_COLS = [
   { id: 'ts', label: '时间', sort: 'ts', fixed: true, cell: x => '<td class="cell-mono">' + fmtDT(x.ts, true) + '</td>' },
   {
     id: 'key', label: '密钥', cell: x => '<td class="cell-mono" title="' + esc(x.key_id || '') + '">'
-      + esc(keyLabelOf(x.key_id) || x.key_id || '-') + '</td>',
+      + esc(keyLabelOf(x.key_id) || x.key_id || '-')
+      // ai_judge 子调用归属到触发它的插件 Key，加徽标与该 Key 的正常流量区分
+      + (x.source === 'ai_judge' ? ' <span class="pill trace mono" title="AI 评判子调用（路由规则的 ai_judge）">ai_judge</span>' : '')
+      + '</td>',
   },
   {
     id: 'model', label: '模型', sort: 'model', cell: x => '<td class="cell-mono cell-clip" title="' + esc(x.model) + '">'

@@ -187,6 +187,8 @@ type Service struct {
 	judgeFlMu   sync.Mutex
 	judgeFlights map[string]*judgeFlight
 	judgeLRU     *judgeLRU
+	// 评判子调用归属：宿主被动回调据此把无主行记到触发请求的 Key 名下。
+	judgeTrk judgeTracker
 }
 
 // pricingSnapshot 是一份不可变的计价规则快照。

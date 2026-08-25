@@ -55,7 +55,10 @@ func resolveRouting(ctx context.Context, svc *service.Service, key *store.Plugin
 	if match.Route.Prog.UsesAI() {
 		digestFn = sync.OnceValues(func() (string, error) { return service.RequestDigest(request), nil })
 	}
-	chain, fellBack, cerr := svc.ResolveChain(ctx, match, env, digestFn)
+	// 评判子调用归属到触发请求的插件 Key：宿主随后的被动用量回调据此
+	// 改记密钥，不再以无主「-」行出现在明细里。
+	attr := &service.JudgeAttribution{KID: key.KID, CallerID: key.CallerID}
+	chain, fellBack, cerr := svc.ResolveChain(ctx, match, env, digestFn, attr)
 	if cerr != nil {
 		if errors.Is(cerr, service.ErrAllTargetsCooling) {
 			return nil, &routeFailure{"upstream_error", "模型集合 " + baseAlias + " 的候选目标全部冷却中，请稍后重试"}

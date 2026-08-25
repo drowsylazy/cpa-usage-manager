@@ -109,7 +109,7 @@ func TestResolveChainCooldownFilterOrder(t *testing.T) {
 	m := RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
 	env := &routelang.Env{Vars: map[string]any{"input_tokens": int64(1), "body_len": int64(2), "model": "auto", "stream": false, "thinking_effort": "", "source": "openai"}}
 
-	chain, fellBack, err := s.ResolveChain(ctx, m, env, nil)
+	chain, fellBack, err := s.ResolveChain(ctx, m, env, nil, nil)
 	if err != nil || fellBack {
 		t.Fatalf("首次求值失败: %v fellBack=%v", err, fellBack)
 	}
@@ -118,7 +118,7 @@ func TestResolveChainCooldownFilterOrder(t *testing.T) {
 	}
 	// 冷却 b：过滤保序摘除。
 	s.MarkRouteFail(row.ID, "B", row.CooldownSeconds)
-	chain, _, err = s.ResolveChain(ctx, m, env, nil)
+	chain, _, err = s.ResolveChain(ctx, m, env, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestResolveChainCooldownFilterOrder(t *testing.T) {
 	// 全冷却 → 哨兵。
 	s.MarkRouteFail(row.ID, "a", row.CooldownSeconds)
 	s.MarkRouteFail(row.ID, "c", row.CooldownSeconds)
-	if _, _, err := s.ResolveChain(ctx, m, env, nil); !errors.Is(err, ErrAllTargetsCooling) {
+	if _, _, err := s.ResolveChain(ctx, m, env, nil, nil); !errors.Is(err, ErrAllTargetsCooling) {
 		t.Fatalf("全冷却应返回哨兵: %v", err)
 	}
 	// 到期自然恢复：把截止时刻拨回过去（同包内直接操作状态器，避免真实睡眠）。
@@ -137,7 +137,7 @@ func TestResolveChainCooldownFilterOrder(t *testing.T) {
 		s.cooldowns[k] = time.Now().Add(-time.Second)
 	}
 	s.coolMu.Unlock()
-	chain, _, err = s.ResolveChain(ctx, m, env, nil)
+	chain, _, err = s.ResolveChain(ctx, m, env, nil, nil)
 	if err != nil || len(chain) != 3 {
 		t.Fatalf("到期后应恢复全链: %v %v", chain, err)
 	}
@@ -207,7 +207,7 @@ func TestAIJudgeEvalWithCache(t *testing.T) {
 	env := judgeEnv(s, "smart")
 
 	digestFn := sync.OnceValues(func() (string, error) { return "帮我写个排序算法", nil })
-	chain, fellBack, err := s.ResolveChain(ctx, m, env, digestFn)
+	chain, fellBack, err := s.ResolveChain(ctx, m, env, digestFn, nil)
 	if err != nil || fellBack {
 		t.Fatalf("求值失败: %v fellBack=%v", err, fellBack)
 	}
@@ -216,7 +216,7 @@ func TestAIJudgeEvalWithCache(t *testing.T) {
 	}
 	// 相同变量组合再次求值 → 缓存命中，不再发起调用。
 	env2 := judgeEnv(s, "smart")
-	if _, _, err := s.ResolveChain(ctx, m, env2, nil); err != nil {
+	if _, _, err := s.ResolveChain(ctx, m, env2, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if n := calls.Load(); n != 1 {
@@ -242,7 +242,7 @@ func TestAIJudgeFailureFallsBackWithAudit(t *testing.T) {
 	}
 	m := RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
 
-	chain, fellBack, err := s.ResolveChain(ctx, m, judgeEnv(s, "smart"), nil)
+	chain, fellBack, err := s.ResolveChain(ctx, m, judgeEnv(s, "smart"), nil, nil)
 	if !fellBack {
 		t.Fatalf("AI 失败应回落兜底: err=%v fellBack=%v", err, fellBack)
 	}
@@ -385,7 +385,7 @@ func TestJudgeSingleFlightMergesConcurrentCalls(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _, _ = s.ResolveChain(ctx, m, judgeEnv(s, "sf"), nil)
+			_, _, _ = s.ResolveChain(ctx, m, judgeEnv(s, "sf"), nil, nil)
 		}()
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -453,7 +453,7 @@ func TestResolveChainDigestLazy(t *testing.T) {
 	}
 	m := RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
 	env := &routelang.Env{Vars: map[string]any{"input_tokens": int64(1), "body_len": int64(2), "model": "plain", "stream": false, "thinking_effort": "", "source": "openai"}}
-	if _, _, err := s.ResolveChain(ctx, m, env, digestFn); err != nil {
+	if _, _, err := s.ResolveChain(ctx, m, env, digestFn, nil); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 0 {
@@ -473,7 +473,7 @@ func TestResolveChainDigestLazy(t *testing.T) {
 		t.Fatal(err)
 	}
 	m2 := RouteMatch{Route: CompiledRoute{ModelRoute: row2, Prog: prog2}}
-	if _, _, err := s.ResolveChain(ctx, m2, judgeEnv(s, "smart"), digestFn); err != nil {
+	if _, _, err := s.ResolveChain(ctx, m2, judgeEnv(s, "smart"), digestFn, nil); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 1 {
@@ -583,5 +583,39 @@ func TestTestRouteDryRun(t *testing.T) {
 	res = s.TestRoute(ctx, TestRouteRequest{Alias: "j", Rule: aiRule, RunAI: true})
 	if res.AISkipped || !res.FellBack || len(res.Chain) != 1 || res.Chain[0] != "dumb" {
 		t.Fatalf("run_ai 但未配置评判模型应回落: %+v", res)
+	}
+}
+
+// TestJudgeAttribution 验证评判子调用的归属窗口：调用中与宽限期内按裸名
+// 匹配归属到触发 Key，模型不符或窗口过期不归属。
+func TestJudgeAttribution(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	if err := s.SaveJudgeSettings(ctx, "chan/judge-x", 4000); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := s.AttributeJudgeUsage("judge-x"); ok {
+		t.Fatal("无在途调用不应归属")
+	}
+	s.judgeBegin(JudgeAttribution{KID: "kid1", CallerID: "caller1"})
+	attr, ok := s.AttributeJudgeUsage("provider/CHAN/JUDGE-X")
+	if !ok || attr.KID != "kid1" || attr.CallerID != "caller1" {
+		t.Fatalf("调用中应按裸名归属: ok=%v attr=%+v", ok, attr)
+	}
+	if _, ok := s.AttributeJudgeUsage("other-model"); ok {
+		t.Fatal("非评判模型不应归属")
+	}
+	s.judgeEnd()
+	if _, ok := s.AttributeJudgeUsage("judge-x"); !ok {
+		t.Fatal("宽限期内应继续归属")
+	}
+	old := judgeAttrWindow
+	judgeAttrWindow = -time.Second
+	t.Cleanup(func() { judgeAttrWindow = old })
+	s.judgeBegin(JudgeAttribution{KID: "kid2"})
+	s.judgeEnd()
+	if _, ok := s.AttributeJudgeUsage("judge-x"); ok {
+		t.Fatal("窗口过期后不应归属")
 	}
 }

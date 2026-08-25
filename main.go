@@ -1823,6 +1823,28 @@ func handleUsage(body []byte) ([]byte, error) {
 	}
 
 	// 认领未命中（宽限期已过、跨进程回调、或纯统计模式）：回落到库内启发式判重。
+
+	// ai_judge 子调用的回调没有密钥身份（插件以自身名义直连宿主，不带
+	// 密钥头）：命中评判归属窗口时改记到触发请求的 Key 名下，来源固定
+	// 标记为 ai_judge——否则明细里出现无主「-」行，还会被下方判重启发式误伤。
+	if attr, ok := svc.AttributeJudgeUsage(u.Model); ok {
+		req := usageRecordToRequest(st, u)
+		req.KeyID = attr.KID
+		req.CallerID = attr.CallerID
+		req.Source = "ai_judge"
+		if req.CallerID == "" {
+			req.CallerID = store.DefaultCallerID
+		}
+		if cost, _, perr := svc.Price(req.Model, usageFromRecord(u)); perr == nil {
+			req.CostMicroUSD = cost
+		}
+		// 身份已确定，不带判重候选直接落库。
+		if err := st.RecordPassiveUsage(ctx, req, store.PassiveDedupeHint{Near: req.TS}); err != nil {
+			warnf("记录 ai_judge 用量失败: %v", err)
+		}
+		return okEnvelope(map[string]any{})
+	}
+
 	if cfg.Quota.Enabled {
 		models := modelCandidates(u.Model, u.Alias)
 		if kid, isCum := service.ParseKeyID(u.APIKey); isCum {
