@@ -95,7 +95,20 @@ function toast(msg, kind) {
   const el = document.createElement('div');
   el.className = 'toast' + (kind ? ' ' + kind : '');
   el.textContent = msg;
-  $('toasts').appendChild(el);
+  // 模态 dialog 在 top layer，页面其余部分（含全局 #toasts）都被其 ::backdrop
+  // 压在模糊层下面——toast 必须挂进当前打开的 dialog 才能露出。容器按需
+  // 创建、随 dialog 存活复用；无 dialog 时回退到全局容器。
+  const dialogs = document.querySelectorAll('dialog[open]');
+  const host = dialogs.length ? dialogs[dialogs.length - 1] : document.body;
+  let box = host.querySelector(':scope > .toasts');
+  if (!box) {
+    box = document.createElement('div');
+    box.className = 'toasts';
+    box.setAttribute('role', 'status');
+    box.setAttribute('aria-live', 'polite');
+    host.appendChild(box);
+  }
+  box.appendChild(el);
   const kill = () => el.remove();
   el.addEventListener('click', kill);
   setTimeout(kill, kind === 'err' ? 6000 : 3500);
