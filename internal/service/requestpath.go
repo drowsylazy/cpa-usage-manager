@@ -237,17 +237,22 @@ func (m RequestMeta) imageCount() int64 {
 // 锁定决策：预占使用保守上限（输入按 body 字符数/2+1，输出取 max_tokens 或
 // default_output_reserve，均封顶 max_token_estimate），由 Reserve 按规则算出金额。
 func (s *Service) BuildReservePlan(ctx context.Context, model string, body []byte) (ReservePlan, error) {
-	return s.buildPlan(ctx, model, body, model)
+	return s.buildPlanFromMeta(ctx, model, ParseRequestMeta(body), model)
 }
 
 // BuildReservePlanWithPricing 是别名路由的变体：计价按 pricingModel 匹配，
 // plan.Model 仍为 model（集合别名，维度统计锚点）。
 func (s *Service) BuildReservePlanWithPricing(ctx context.Context, model string, body []byte, pricingModel string) (ReservePlan, error) {
-	return s.buildPlan(ctx, model, body, pricingModel)
+	return s.buildPlanFromMeta(ctx, model, ParseRequestMeta(body), pricingModel)
 }
 
-func (s *Service) buildPlan(ctx context.Context, model string, body []byte, pricingModel string) (ReservePlan, error) {
-	meta := ParseRequestMeta(body)
+// BuildReservePlanFromMeta 接受调用方已解析好的元数据：路由路径在执行器入口
+// 只解析一次请求体，这里不再重复 O(body) 扫描。
+func (s *Service) BuildReservePlanFromMeta(ctx context.Context, model string, meta RequestMeta, pricingModel string) (ReservePlan, error) {
+	return s.buildPlanFromMeta(ctx, model, meta, pricingModel)
+}
+
+func (s *Service) buildPlanFromMeta(ctx context.Context, model string, meta RequestMeta, pricingModel string) (ReservePlan, error) {
 	model = FirstNonEmpty(model, meta.Model)
 	rule, priced, err := s.matchPricing(ctx, pricingModel)
 	if err != nil {

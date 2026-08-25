@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/drowsylazy/cpa-usage-manager/internal/config"
@@ -39,14 +40,22 @@ type routeFailure struct {
 // resolveRouting 在请求命中集合别名时完成 链求值 → 计价计划 → 预占 → 认领。
 // 返回值：(nil, nil) 未命中别名，调用方走直连老路；(re, nil) 已就绪；
 // (_, failure) 路由流量被拒（全冷却 / 校验拒绝 / 预占被拒）。
+//
+// 请求体只解析一次（与直连路径同基线）：ParseRequestMeta 的结果贯穿
+// 环境变量与预占计划；摘要文本仅在规则含 ai_judge 时惰性构建。
 func resolveRouting(ctx context.Context, svc *service.Service, key *store.PluginKey, req rpcExecutorRequest, request []byte, stream bool) (*routedExecution, *routeFailure) {
 	match, hit := svc.MatchRoute(ctx, req.Model)
 	if !hit {
 		return nil, nil
 	}
 	baseAlias, _ := service.StripThinkingSuffix(req.Model)
-	env := svc.BuildRouteEnv(service.ParseRequestMeta(request), req.Model, stream, req.SourceFormat)
-	chain, fellBack, cerr := svc.ResolveChain(ctx, match, env, service.RequestDigest(request))
+	meta := service.ParseRequestMeta(request)
+	env := svc.BuildRouteEnv(meta, req.Model, stream, req.SourceFormat)
+	var digestFn func() (string, error)
+	if match.Route.Prog.UsesAI() {
+		digestFn = sync.OnceValues(func() (string, error) { return service.RequestDigest(request), nil })
+	}
+	chain, fellBack, cerr := svc.ResolveChain(ctx, match, env, digestFn)
 	if cerr != nil {
 		if errors.Is(cerr, service.ErrAllTargetsCooling) {
 			return nil, &routeFailure{"upstream_error", "模型集合 " + baseAlias + " 的候选目标全部冷却中，请稍后重试"}
@@ -59,7 +68,7 @@ func resolveRouting(ctx context.Context, svc *service.Service, key *store.Plugin
 	if match.Route.PricingMode == "target" {
 		pricingName = chain[0]
 	}
-	plan, err := svc.BuildReservePlanWithPricing(ctx, baseAlias, request, pricingName)
+	plan, err := svc.BuildReservePlanFromMeta(ctx, baseAlias, meta, pricingName)
 	if err != nil {
 		if errors.Is(err, service.ErrModelDisabled) {
 			return nil, &routeFailure{"model_disabled", err.Error()}
@@ -168,32 +177,54 @@ func modelRegister(svc *service.Service) ([]byte, error) {
 	return okEnvelope(resp)
 }
 
-// preparePayload 为别名流量改写请求体：顶层 model 置为目标真名，OpenAI 系
-// 流式注入 stream_options.include_usage。单次反序列化合并完成两项改写；
-// 直连流量不经此函数（零额外解析）。
-func preparePayload(body []byte, sourceFormat, outputFormat, targetModel string, stream bool) []byte {
+// bodyRewriter 把「格式判定 + 整包解析」提到候选循环外：解析一次，
+// 每个候选只改 model 字段后重新序列化。failover N 个目标从 N 次往返
+// 降为 1 次解析 + N 次序列化；非 JSON 体原样透传（ok=false）。
+type bodyRewriter struct {
+	raw       []byte
+	stream    bool
+	openaiFam bool
+	ok        bool
+	m         map[string]any
+}
+
+func newBodyRewriter(raw []byte, sourceFormat, outputFormat string, stream bool) *bodyRewriter {
+	b := &bodyRewriter{raw: raw, stream: stream}
 	format := strings.ToLower(service.FirstNonEmpty(outputFormat, sourceFormat))
-	openaiFamily := !strings.Contains(format, "claude") && !strings.Contains(format, "gemini")
-	var payload map[string]any
-	if len(body) == 0 || json.Unmarshal(body, &payload) != nil {
-		return body
+	b.openaiFam = !strings.Contains(format, "claude") && !strings.Contains(format, "gemini")
+	if len(raw) == 0 || json.Unmarshal(raw, &b.m) != nil {
+		return b
 	}
-	payload["model"] = targetModel
-	if stream && openaiFamily {
-		options, ok := payload["stream_options"].(map[string]any)
+	b.ok = true
+	return b
+}
+
+// build 返回目标为 targetModel 的请求体（共享底层 map，按候选逐次改写）。
+func (b *bodyRewriter) build(targetModel string) []byte {
+	if b == nil || !b.ok {
+		return b.raw
+	}
+	b.m["model"] = targetModel
+	if b.stream && b.openaiFam {
+		options, ok := b.m["stream_options"].(map[string]any)
 		if !ok {
 			options = make(map[string]any)
-			payload["stream_options"] = options
+			b.m["stream_options"] = options
 		}
 		if _, exists := options["include_usage"]; !exists {
 			options["include_usage"] = true
 		}
 	}
-	updated, err := json.Marshal(payload)
+	updated, err := json.Marshal(b.m)
 	if err != nil {
-		return body
+		return b.raw
 	}
 	return updated
+}
+
+// preparePayload 单发场景的便捷封装。
+func preparePayload(body []byte, sourceFormat, outputFormat, targetModel string, stream bool) []byte {
+	return newBodyRewriter(body, sourceFormat, outputFormat, stream).build(targetModel)
 }
 
 // routeFailureEligible 判定一次尝试失败是否值得转移到下一候选。
@@ -254,9 +285,10 @@ func routeFailureCause(status int, err error) string {
 func executeRoutedLoop(ctx context.Context, re *routedExecution, req rpcExecutorRequest, request []byte, startedAt time.Time) ([]byte, error) {
 	svc := re.svc
 	route := re.match.Route
+	rw := newBodyRewriter(request, req.SourceFormat, req.Format, false)
 	for i, tgt := range re.chain {
 		finalTgt := targetWithSuffix(tgt, re.match.Suffix)
-		payload := preparePayload(request, req.SourceFormat, req.Format, finalTgt, false)
+		payload := rw.build(finalTgt)
 		hostBody, headers, status, errHost := hostModelExecute(req.HostCallbackID, req, finalTgt, payload, false)
 		upstream := service.FirstNonEmpty(usageparse.SniffModel(hostBody), finalTgt)
 		if errHost == nil && status < 400 {
@@ -293,11 +325,11 @@ const (
 )
 
 // dialHostStream 对单个候选目标发起流式拨号。首字节尚未产出，这里是
-// 流式路径唯一可切换目标的窗口。
-func dialHostStream(re *routedExecution, req rpcExecutorRequest, request []byte, index int) (rpcHostModelStreamResponse, dialOutcome, error) {
+// 流式路径唯一可切换目标的窗口。rw 由调用方在循环外解析一次。
+func dialHostStream(re *routedExecution, req rpcExecutorRequest, rw *bodyRewriter, index int) (rpcHostModelStreamResponse, dialOutcome, error) {
 	tgt := re.chain[index]
 	finalTgt := targetWithSuffix(tgt, re.match.Suffix)
-	payload := preparePayload(request, req.SourceFormat, req.Format, finalTgt, true)
+	payload := rw.build(finalTgt)
 	raw, err := hostCall("host.model.execute_stream", rpcHostModelExecutionRequest{
 		EntryProtocol:  service.FirstNonEmpty(req.SourceFormat, "openai"),
 		ExitProtocol:   service.FirstNonEmpty(req.Format, req.SourceFormat, "openai"),

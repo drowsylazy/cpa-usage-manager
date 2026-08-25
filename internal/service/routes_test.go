@@ -106,7 +106,7 @@ func TestResolveChainCooldownFilterOrder(t *testing.T) {
 	m := RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
 	env := &routelang.Env{Vars: map[string]any{"input_tokens": int64(1), "body_len": int64(2), "model": "auto", "stream": false, "thinking_effort": "", "source": "openai"}}
 
-	chain, fellBack, err := s.ResolveChain(ctx, m, env, "")
+	chain, fellBack, err := s.ResolveChain(ctx, m, env, nil)
 	if err != nil || fellBack {
 		t.Fatalf("首次求值失败: %v fellBack=%v", err, fellBack)
 	}
@@ -115,7 +115,7 @@ func TestResolveChainCooldownFilterOrder(t *testing.T) {
 	}
 	// 冷却 b：过滤保序摘除。
 	s.MarkRouteFail(row.ID, "B", row.CooldownSeconds)
-	chain, _, err = s.ResolveChain(ctx, m, env, "")
+	chain, _, err = s.ResolveChain(ctx, m, env, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestResolveChainCooldownFilterOrder(t *testing.T) {
 	// 全冷却 → 哨兵。
 	s.MarkRouteFail(row.ID, "a", row.CooldownSeconds)
 	s.MarkRouteFail(row.ID, "c", row.CooldownSeconds)
-	if _, _, err := s.ResolveChain(ctx, m, env, ""); !errors.Is(err, ErrAllTargetsCooling) {
+	if _, _, err := s.ResolveChain(ctx, m, env, nil); !errors.Is(err, ErrAllTargetsCooling) {
 		t.Fatalf("全冷却应返回哨兵: %v", err)
 	}
 	// 到期自然恢复：把截止时刻拨回过去（同包内直接操作状态器，避免真实睡眠）。
@@ -134,7 +134,7 @@ func TestResolveChainCooldownFilterOrder(t *testing.T) {
 		s.cooldowns[k] = time.Now().Add(-time.Second)
 	}
 	s.coolMu.Unlock()
-	chain, _, err = s.ResolveChain(ctx, m, env, "")
+	chain, _, err = s.ResolveChain(ctx, m, env, nil)
 	if err != nil || len(chain) != 3 {
 		t.Fatalf("到期后应恢复全链: %v %v", chain, err)
 	}
@@ -203,7 +203,8 @@ func TestAIJudgeEvalWithCache(t *testing.T) {
 	m := RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
 	env := judgeEnv(s, "smart")
 
-	chain, fellBack, err := s.ResolveChain(ctx, m, env, "帮我写个排序算法")
+	digestFn := sync.OnceValues(func() (string, error) { return "帮我写个排序算法", nil })
+	chain, fellBack, err := s.ResolveChain(ctx, m, env, digestFn)
 	if err != nil || fellBack {
 		t.Fatalf("求值失败: %v fellBack=%v", err, fellBack)
 	}
@@ -212,7 +213,7 @@ func TestAIJudgeEvalWithCache(t *testing.T) {
 	}
 	// 相同变量组合再次求值 → 缓存命中，不再发起调用。
 	env2 := judgeEnv(s, "smart")
-	if _, _, err := s.ResolveChain(ctx, m, env2, ""); err != nil {
+	if _, _, err := s.ResolveChain(ctx, m, env2, nil); err != nil {
 		t.Fatal(err)
 	}
 	if n := calls.Load(); n != 1 {
@@ -238,7 +239,7 @@ func TestAIJudgeFailureFallsBackWithAudit(t *testing.T) {
 	}
 	m := RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
 
-	chain, fellBack, err := s.ResolveChain(ctx, m, judgeEnv(s, "smart"), "")
+	chain, fellBack, err := s.ResolveChain(ctx, m, judgeEnv(s, "smart"), nil)
 	if !fellBack {
 		t.Fatalf("AI 失败应回落兜底: err=%v fellBack=%v", err, fellBack)
 	}
@@ -345,7 +346,7 @@ func TestJudgeSingleFlightMergesConcurrentCalls(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _, _ = s.ResolveChain(ctx, m, judgeEnv(s, "sf"), "")
+			_, _, _ = s.ResolveChain(ctx, m, judgeEnv(s, "sf"), nil)
 		}()
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -395,4 +396,82 @@ func TestPickOptionMatching(t *testing.T) {
 			t.Fatalf("pickOption(%q) = (%q,%v), 期望 (%q,%v)", c.text, got, ok, c.want, c.ok)
 		}
 	}
+}
+
+// TestResolveChainDigestLazy 验证摘要惰性化：不含 ai_judge 的规则不触发
+// digestFn（热路径免整包解析）；含 ai_judge 的规则恰好调用一次。
+func TestResolveChainDigestLazy(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+
+	calls := 0
+	digestFn := func() (string, error) { calls++; return "digest-text", nil }
+
+	row := insertRoute(t, s, "plain", `-> priority ["a", "b"]`)
+	prog, err := routelang.Compile(row.Rule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
+	env := &routelang.Env{Vars: map[string]any{"input_tokens": int64(1), "body_len": int64(2), "model": "plain", "stream": false, "thinking_effort": "", "source": "openai"}}
+	if _, _, err := s.ResolveChain(ctx, m, env, digestFn); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("非 ai_judge 规则不应解析请求体，实际 %d 次", calls)
+	}
+
+	if err := s.SaveJudgeSettings(ctx, "judge-model", 3000); err != nil {
+		t.Fatal(err)
+	}
+	s.flushJudgeConfig()
+	stubJudge(t, s, func(string) (string, error) { return "hard", nil })
+	row2 := insertRoute(t, s, "smart", `when ai_judge(["simple","hard"]) == "hard"
+  -> "opus"
+-> "mini"`)
+	prog2, err := routelang.Compile(row2.Rule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2 := RouteMatch{Route: CompiledRoute{ModelRoute: row2, Prog: prog2}}
+	if _, _, err := s.ResolveChain(ctx, m2, judgeEnv(s, "smart"), digestFn); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("含 ai_judge 的规则应恰好解析一次，实际 %d 次", calls)
+	}
+}
+
+// TestRouteSnapshotSingleFlight 验证 TTL 失效瞬间的并发重载只放行一个构建者。
+func TestRouteSnapshotSingleFlight(t *testing.T) {
+	s, st := testService(t)
+	ctx := context.Background()
+	insertRoute(t, s, "auto", `-> "x"`)
+	s.invalidateRoutes()
+
+	var calls atomic.Int32
+	orig := listRoutesFn
+	listRoutesFn = func(ctx context.Context, st *store.Store) ([]store.ModelRoute, error) {
+		calls.Add(1)
+		time.Sleep(20 * time.Millisecond) // 拉长重载窗口，放大竞态
+		return orig(ctx, st)
+	}
+	t.Cleanup(func() { listRoutesFn = orig })
+
+	const n = 50
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, ok := s.MatchRoute(ctx, "auto"); !ok {
+				t.Error("并发重载后应命中")
+			}
+		}()
+	}
+	wg.Wait()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("惊群应被合并为一次重载，实际 %d 次", got)
+	}
+	_ = st
 }

@@ -308,8 +308,9 @@ func TestStreamDialFailover(t *testing.T) {
 	startedAt := time.Now()
 	var dialed rpcHostModelStreamResponse
 	attempts := 0
+	rw := newBodyRewriter(request, req.SourceFormat, req.Format, true)
 	for i := range re.chain {
-		stream, outcome, dialErr := dialHostStream(re, req, request, i)
+		stream, outcome, dialErr := dialHostStream(re, req, rw, i)
 		attempts++
 		switch outcome {
 		case dialTransfer:

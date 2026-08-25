@@ -17,7 +17,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
 	"sort"
 	"strconv"
 	"strings"
@@ -84,13 +83,26 @@ func StripThinkingSuffix(model string) (base, suffix string) {
 // invalidateRoutes 失效内存快照；由 Store 写回调触发。
 func (s *Service) invalidateRoutes() { s.routeSnap.Store(nil) }
 
+// listRoutesFn 是快照重载的取数桩点：测试替换它以统计重载次数。
+var listRoutesFn = func(ctx context.Context, st *store.Store) ([]store.ModelRoute, error) {
+	return st.ListModelRoutes(ctx)
+}
+
 // routeSnapshot 返回当前路由快照，过期时从存储重载。
 // 编译失败的行跳过（保存期已校验；此处容忍跨进程写入的坏行，不影响其他集合）。
+//
+// TTL 过期瞬间所有在途请求都会走重载——用 double-checked locking 合并：
+// 拿锁后复核 TTL，命中则直接复用他人刚建好的快照，避免 N×(SELECT+Compile) 惊群。
 func (s *Service) routeSnapshot(ctx context.Context) (*routeSnapshot, error) {
 	if snap := s.routeSnap.Load(); snap != nil && time.Since(snap.at) < routeSnapshotTTL {
 		return snap, nil
 	}
-	rows, err := s.st.ListModelRoutes(ctx)
+	s.routeReloadMu.Lock()
+	defer s.routeReloadMu.Unlock()
+	if snap := s.routeSnap.Load(); snap != nil && time.Since(snap.at) < routeSnapshotTTL {
+		return snap, nil
+	}
+	rows, err := listRoutesFn(ctx, s.st)
 	if err != nil {
 		return nil, err
 	}
@@ -206,15 +218,25 @@ func (s *Service) filterCooldown(routeID int64, chain []string) []string {
 // ResolveChain 求值路由规则得到有序候选链，再过滤冷却目标。
 // fellBack 为真表示 ai_judge 失败已自动回落兜底分支（此处落审计事件）；
 // 除 ErrAllTargetsCooling 外的错误表示规则运行期异常（变量缺失等），无链返回。
-func (s *Service) ResolveChain(ctx context.Context, m RouteMatch, env *routelang.Env, digest string) ([]string, bool, error) {
-	var once sync.Once
-	env.AI = func(cctx context.Context, options []string) (string, error) {
-		var err error
-		once.Do(func() { _, err = s.judgeSettingsCached(cctx) })
-		if err != nil {
-			return "", err
+//
+// digestFn 惰性提供请求摘要（ai_judge 的提示词素材）：Go 实参急切求值，
+// 若按值传入，不含 ai_judge 的规则也要白付一次整包解析——因此只在
+// UsesAI 时由调用方构造闭包（配合 sync.OnceValues），且首次调用才真正解析。
+func (s *Service) ResolveChain(ctx context.Context, m RouteMatch, env *routelang.Env, digestFn func() (string, error)) ([]string, bool, error) {
+	if m.Route.Prog.UsesAI() {
+		if digestFn == nil {
+			digestFn = func() (string, error) { return "", nil }
 		}
-		return s.aiJudge(cctx, env.Vars, digest, options)
+		var once sync.Once
+		var judgeErr error
+		env.AI = func(cctx context.Context, options []string) (string, error) {
+			once.Do(func() { _, judgeErr = s.judgeSettingsCached(cctx) })
+			if judgeErr != nil {
+				return "", judgeErr
+			}
+			digest, _ := digestFn()
+			return s.aiJudge(cctx, env.Vars, digest, options)
+		}
 	}
 	chain, fellBack, err := m.Route.Prog.Eval(ctx, env)
 	if err != nil && chain == nil {
@@ -258,7 +280,6 @@ func (s *Service) BuildRouteEnv(meta RequestMeta, rawModel string, stream bool, 
 			"thinking_effort": meta.ResolvedThinking,
 			"source":          source,
 		},
-		Rand: rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 

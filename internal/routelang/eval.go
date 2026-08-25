@@ -3,7 +3,7 @@ package routelang
 import (
 	"context"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"sort"
 )
 
@@ -207,12 +207,9 @@ func evalChain(c astChain, env *Env) ([]string, error) {
 		for _, e := range n.entries {
 			total += e.weight
 		}
-		pick := 0.0
-		if env != nil && env.Rand != nil {
-			pick = env.Rand.Float64() * total
-		} else {
-			pick = rand.Float64() * total
-		}
+		// math/rand/v2 包级源：per-thread ChaCha8，无锁零分配。
+		// 不用 math/rand.New(NewSource)——构造开销是单次抽样的 ~44 倍。
+		pick := rand.Float64() * total
 		var picked string
 		acc := 0.0
 		for _, e := range n.entries {

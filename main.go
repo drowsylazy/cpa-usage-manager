@@ -991,8 +991,9 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 		}
 		stopHeartbeat := startReservationHeartbeat(svc, re.reservation.ID)
 		defer stopHeartbeat()
+		rw := newBodyRewriter(request, req.SourceFormat, req.Format, true)
 		for i := range re.chain {
-			stream, outcome, dialErr := dialHostStream(re, req, request, i)
+			stream, outcome, dialErr := dialHostStream(re, req, rw, i)
 			switch outcome {
 			case dialTransfer:
 				continue

@@ -21,6 +21,9 @@ type HoldReservationParams struct {
 	ReservedTokens                             int64
 	ExpiresAt, Now                             time.Time
 	SweepStaleBefore                           time.Time
+	// Audit 非空时在预占成功的同一写事务尾追加审计事件（省一次独立写事务）。
+	// 审计失败只吞错不回滚预占。
+	Audit *AuditEvent
 }
 
 // HoldReservation 写入 held 预占；idempotency_key 已存在时返回原记录且不重复扣占。
@@ -185,7 +188,15 @@ func (s *Store) HoldReservation(ctx context.Context, p HoldReservationParams) (R
 		if isUniqueViolation(err) && p.IdempotencyKey != "" {
 			return fmt.Errorf("预占幂等键冲突: %w", ErrConflict)
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		if p.Audit != nil {
+			// 审计失败不回滚预占：与旧「事务外吞错 AppendAudit」语义一致，
+			// 资金扣占不能因留痕失败而丢失。
+			_ = appendAuditTx(ctx, s, tx, *p.Audit)
+		}
+		return nil
 	})
 	if err != nil {
 		return Reservation{}, false, fmt.Errorf("写入预占失败: %w", err)

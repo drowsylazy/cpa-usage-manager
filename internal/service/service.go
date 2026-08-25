@@ -174,8 +174,11 @@ type Service struct {
 	// 模型路由：快照（atomic + TTL，routes.go）、目标冷却状态器、ai_judge
 	// 的设置缓存 / LRU 结果缓存 / single-flight 与宿主执行钩子。
 	routeSnap atomic.Pointer[routeSnapshot]
-	coolMu    sync.Mutex
-	cooldowns map[string]time.Time
+	// routeReloadMu / pricingReloadMu 合并 TTL 过期瞬间的并发重载（惊群防护）。
+	routeReloadMu    sync.Mutex
+	pricingReloadMu  sync.Mutex
+	coolMu           sync.Mutex
+	cooldowns        map[string]time.Time
 
 	judgeCfgMu  sync.Mutex
 	judgeConf   judgeSettings
@@ -448,10 +451,14 @@ func (s *Service) Reserve(ctx context.Context, r ReservationRequest) (store.Rese
 	if now.Unix()-last >= int64(sweepInterval.Seconds()) && s.lastSweepAt.CompareAndSwap(last, now.Unix()) {
 		sweepBefore = now.Add(-s.cfg.Quota.Stream.StaleReservationTimeout.Std())
 	}
-	res, _, err := s.st.HoldReservation(ctx, store.HoldReservationParams{ID: uuid.NewString(), KeyID: r.KeyID, CallerID: r.CallerID, Model: r.Model, IdempotencyKey: r.IdempotencyKey, HeldMicroUSD: cost, ReservedTokens: r.EstimatedTokens, ExpiresAt: r.ExpiresAt, Now: now, SweepStaleBefore: sweepBefore})
-	if err == nil {
-		_ = s.st.AppendAudit(ctx, store.AuditEvent{Actor: r.Actor, Action: "quota.reserve", EntityType: "reservation", EntityID: res.ID, Detail: map[string]any{"key_id": r.KeyID, "cost_micro_usd": cost}})
-	}
+	// 审计并入预占同一写事务：每请求写事务 3→2；审计失败不回滚扣占。
+	holdID := uuid.NewString()
+	res, _, err := s.st.HoldReservation(ctx, store.HoldReservationParams{
+		ID: holdID, KeyID: r.KeyID, CallerID: r.CallerID, Model: r.Model,
+		IdempotencyKey: r.IdempotencyKey, HeldMicroUSD: cost, ReservedTokens: r.EstimatedTokens,
+		ExpiresAt: r.ExpiresAt, Now: now, SweepStaleBefore: sweepBefore,
+		Audit: &store.AuditEvent{Actor: r.Actor, Action: "quota.reserve", EntityType: "reservation", EntityID: holdID, Detail: map[string]any{"key_id": r.KeyID, "cost_micro_usd": cost}},
+	})
 	return res, err
 }
 func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req *store.Request) (store.Reservation, error) {
@@ -622,7 +629,13 @@ func (s *Service) matchPricing(ctx context.Context, model string) (store.Pricing
 // pricingRules 返回按匹配顺序排列的启用规则快照：命中内存快照时零 DB 往返，
 // 过期（或被写回调失效）时重新加载。ListPricingRules 的 SQL 已按
 // priority DESC, id ASC 排序，与匹配顺序一致，无需再排。
+// 重载经 double-checked locking 合并：TTL 过期瞬间只放行一个构建者。
 func (s *Service) pricingRules(ctx context.Context) ([]store.PricingRule, error) {
+	if snap := s.pricingSnap.Load(); snap != nil && time.Since(snap.at) < pricingCacheTTL {
+		return snap.rules, nil
+	}
+	s.pricingReloadMu.Lock()
+	defer s.pricingReloadMu.Unlock()
 	if snap := s.pricingSnap.Load(); snap != nil && time.Since(snap.at) < pricingCacheTTL {
 		return snap.rules, nil
 	}

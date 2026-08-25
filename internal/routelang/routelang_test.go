@@ -3,7 +3,6 @@ package routelang
 import (
 	"context"
 	"errors"
-	"math/rand"
 	"strings"
 	"testing"
 )
@@ -167,9 +166,8 @@ when ai_judge(["simple", "hard"]) == "hard"
 func TestEvalWeightedFollowersByWeightDesc(t *testing.T) {
 	src := "when input_tokens >= 0\n  -> weighted { \"a\": 1, \"b\": 5, \"c\": 2 }\n-> \"z\"\n"
 	counts := map[string]int{}
-	rng := rand.New(rand.NewSource(42))
 	for i := 0; i < 2000; i++ {
-		chain, _, err := evalOf(t, src, &Env{Vars: map[string]any{"input_tokens": int64(1)}, Rand: rng})
+		chain, _, err := evalOf(t, src, &Env{Vars: map[string]any{"input_tokens": int64(1)}})
 		if err != nil {
 			t.Fatal(err)
 		}

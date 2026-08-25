@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
 	"strings"
 )
 
@@ -67,8 +66,6 @@ type Env struct {
 	// Vars 是开放给脚本的变量集：
 	// input_tokens/body_len(int64)、model/thinking_effort/source(string)、stream(bool)。
 	Vars map[string]any
-	// Rand 用于 weighted 加权随机；nil 时使用包级随机源。
-	Rand *rand.Rand
 	// AI 是 ai_judge 的宿主实现（service 层注入 judge 调用）；nil 时调用即运行期错误。
 	AI func(ctx context.Context, options []string) (string, error)
 }
