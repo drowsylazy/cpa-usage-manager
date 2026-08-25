@@ -11,6 +11,7 @@ import (
 
 	"github.com/drowsylazy/cpa-usage-manager/internal/routelang"
 	"github.com/drowsylazy/cpa-usage-manager/internal/store"
+	"github.com/drowsylazy/cpa-usage-manager/internal/usageparse"
 )
 
 func insertRoute(t *testing.T, s *Service, alias, rule string) store.ModelRoute {
@@ -269,8 +270,9 @@ func TestValidateRouteRuleBranches(t *testing.T) {
 	s, _ := testService(t)
 	ctx := context.Background()
 
-	if _, _, _, err := s.ValidateRouteRule(ctx, 0, "bad/name", `-> "x"`, "target"); err == nil {
-		t.Fatal("别名含 / 应报错")
+	// 斜杠别名允许（撞真实命名由下方专项检查拦截）。
+	if _, _, _, err := s.ValidateRouteRule(ctx, 0, "grp/name", `-> "x"`, "target"); err != nil {
+		t.Fatalf("斜杠别名应放行: %v", err)
 	}
 	if _, _, _, err := s.ValidateRouteRule(ctx, 0, "a-high", `-> "x"`, "target"); err == nil {
 		t.Fatal("别名带思考后缀应报错")
@@ -318,6 +320,41 @@ func TestValidateRouteRuleBranches(t *testing.T) {
 	_, _, warn, err := s.ValidateRouteRule(ctx, 0, "aliasmode", `-> "x"`, "alias")
 	if err != nil || warn == "" {
 		t.Fatalf("mode=alias 应给 warning: err=%v warn=%q", err, warn)
+	}
+	// 撞真实命名之一：别名命中其他启用路由的引用目标。
+	if _, _, _, err = s.ValidateRouteRule(ctx, 0, "zzz", `-> "x"`, "target"); err == nil {
+		t.Fatal("别名撞其他路由的引用目标应报错")
+	}
+	// 撞真实命名之二：别名命中历史请求出现过的模型名（含 upstream_model）。
+	issued, err := s.IssueKey(ctx, IssueRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Reserve(ctx, ReservationRequest{KeyID: issued.KID, Model: "hist-real-model", EstimatedTokens: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := usageparse.Usage{}
+	u.InputTokens = 1
+	if _, err := s.Settle(ctx, res.ID, u, &store.Request{ID: "req-hist", Model: "hist-real-model", UpstreamModel: "hist-upstream-model"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"hist-real-model", "Hist-Upstream-Model"} {
+		if _, _, _, err = s.ValidateRouteRule(ctx, 0, name, `-> "x"`, "target"); err == nil {
+			t.Fatalf("别名 %q 撞历史真实模型名应报错", name)
+		}
+	}
+	// 已有别名自身的历史流量不构成撞名（路由行的 model 列就是别名）。
+	routed := insertRoute(t, s, "routed-alias", `-> "rt-target"`)
+	res2, err := s.Reserve(ctx, ReservationRequest{KeyID: issued.KID, Model: "routed-alias", EstimatedTokens: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Settle(ctx, res2.ID, u, &store.Request{ID: "req-routed", UpstreamModel: "rt-target"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err = s.ValidateRouteRule(ctx, routed.ID, "routed-alias", `-> "rt-target"`, "target"); err != nil {
+		t.Fatalf("编辑已有别名不应被自身历史流量误伤: %v", err)
 	}
 }
 

@@ -291,7 +291,11 @@ func HasThinkingSuffix(model string) bool {
 
 // ValidateRouteRule 在保存期校验路由配置，返回静态引用集与告警。
 // 校验：语法（行列号定位）、alias 形态与唯一性、ai_judge 需已配评判模型、
-// 引用模型不得命中任何启用别名（含自引用）；mode=alias 且别名无计价规则时给 warning。
+// 引用模型不得命中任何启用别名（含自引用）、别名不得撞真实模型命名
+// （其他启用路由的引用目标 / 历史请求出现过的模型名，含 upstream_model）；
+// mode=alias 且别名无计价规则时给 warning。
+// 斜杠别名允许：认领登记侧已排除其别名形态（见 main_routes resolveRouting），
+// 撞名风险改由本校验在保存期显式拦截。
 func (s *Service) ValidateRouteRule(ctx context.Context, excludeID int64, alias, rule, pricingMode string) (refs []string, usesAI bool, warning string, err error) {
 	base, _ := StripThinkingSuffix(alias)
 	if alias == "" || base != alias {
@@ -299,9 +303,6 @@ func (s *Service) ValidateRouteRule(ctx context.Context, excludeID int64, alias,
 	}
 	if len(alias) > 128 {
 		return nil, false, "", errors.New("service: 别名长度不能超过 128")
-	}
-	if strings.Contains(alias, "/") {
-		return nil, false, "", errors.New(`service: 别名不能包含 "/"`)
 	}
 	prog, cerr := routelang.Compile(rule)
 	if cerr != nil {
@@ -333,6 +334,50 @@ func (s *Service) ValidateRouteRule(ctx context.Context, excludeID int64, alias,
 	}
 	if refSet[strings.ToLower(alias)] {
 		return nil, false, "", fmt.Errorf("service: 规则引用了自身别名 %q（禁止自引用），请直接引用目标模型", alias)
+	}
+	// 撞真实命名之一：别名命中其他启用路由的引用目标——该名字已被当作
+	// 具体目标使用，建同名别名会劫持它的流量与统计。
+	for _, r := range rows {
+		if !r.Enabled || r.ID == excludeID {
+			continue
+		}
+		p2, cerr2 := routelang.Compile(r.Rule)
+		if cerr2 != nil {
+			continue // 坏行已在快照层容忍；此处跳过不阻塞保存
+		}
+		for _, ref := range p2.ReferencedModels() {
+			if strings.EqualFold(ref, alias) {
+				return nil, false, "", fmt.Errorf("service: 别名 %q 与集合「%s」的引用目标相撞——该名字已是路由目标，强行接管会劫持其流量", alias, r.Alias)
+			}
+		}
+	}
+	// 撞真实命名之二：别名命中历史请求出现过的模型名（model/upstream_model）。
+	// 其他路由的别名从历史里排除——路由行的 model 列就是别名自身；
+	// 编辑已有路由时，其创建之后的同名历史是自己的路由流量，同样不算撞名
+	// （创建之前的同名历史无法区分，保守放行）。
+	observed, oerr := s.st.DistinctObservedModels(ctx, 2000)
+	if oerr != nil {
+		return nil, false, "", oerr
+	}
+	aliasLower := strings.ToLower(alias)
+	otherAlias := make(map[string]bool, len(rows))
+	ownCreatedAt := time.Time{}
+	for _, r := range rows {
+		if r.ID == excludeID {
+			ownCreatedAt = r.CreatedAt
+			continue
+		}
+		otherAlias[strings.ToLower(r.Alias)] = true
+	}
+	for _, name := range observed {
+		lower := strings.ToLower(name)
+		if lower != aliasLower || otherAlias[lower] {
+			continue
+		}
+		if !ownCreatedAt.IsZero() {
+			continue
+		}
+		return nil, false, "", fmt.Errorf("service: 别名 %q 与历史请求中的真实模型名相撞——禁止强行接管，请换一个名字或直接引用该模型", alias)
 	}
 	for _, r := range rows {
 		if !r.Enabled || r.ID == excludeID {

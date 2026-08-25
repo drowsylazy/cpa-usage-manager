@@ -410,3 +410,66 @@ func TestModelRegisterContract(t *testing.T) {
 		t.Fatal("Description 不应为空")
 	}
 }
+
+// bucketHasClaim 报告某模型桶里是否有该 Key 的在途认领（测试检查用）。
+func bucketHasClaim(kid, model string) bool {
+	b := claimBucketFor(normalizeModelKey(model))
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, c := range b.claims {
+		if c.keyID == kid && c.registered {
+			return true
+		}
+	}
+	return false
+}
+
+// TestSlashAliasClaimExclusion 验证斜杠别名不把别名形态登记进认领桶：
+// 「grp/auto」归一后落在裸名 auto 的桶，若登记会与真实模型 auto 的直连流量互相误吞；
+// refs 的登记不受影响。普通别名维持原行为。
+func TestSlashAliasClaimExclusion(t *testing.T) {
+	svc, st := routeTestEnv(t)
+	ctx := context.Background()
+	if _, err := st.UpsertPricingRule(ctx, store.PricingRule{MatchKind: store.MatchExact, Pattern: "t9", Priority: 10, Enabled: true, Source: store.PricingSourceManual}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.InsertModelRoute(ctx, store.ModelRoute{Alias: "grp/auto", Rule: `-> "t9"`, CooldownSeconds: 60, PricingMode: "target", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	issued, err := svc.IssueKey(ctx, service.IssueRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyRec, err := st.GetKey(ctx, issued.KID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := rpcExecutorRequest{Model: "grp/auto", SourceFormat: "openai", Format: "openai"}
+	request := []byte(`{"model":"grp/auto","messages":[{"role":"user","content":"hi"}]}`)
+	re, failure := resolveRouting(ctx, svc, &keyRec, req, request, false)
+	if re == nil || failure != nil {
+		t.Fatalf("路由解析失败: %+v %+v", re, failure)
+	}
+	if !bucketHasClaim(issued.KID, "t9") {
+		t.Fatal("refs 应照常登记进认领桶")
+	}
+	if bucketHasClaim(issued.KID, "grp/auto") {
+		t.Fatal("斜杠别名不应登记别名形态（裸名归一会撞桶）")
+	}
+	re.claim.release(0)
+
+	// 普通别名：别名形态仍登记。
+	if _, err := st.InsertModelRoute(ctx, store.ModelRoute{Alias: "plain2", Rule: `-> "t9"`, CooldownSeconds: 60, PricingMode: "target", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	req2 := rpcExecutorRequest{Model: "plain2", SourceFormat: "openai", Format: "openai"}
+	request2 := []byte(`{"model":"plain2","messages":[{"role":"user","content":"hi"}]}`)
+	re2, failure2 := resolveRouting(ctx, svc, &keyRec, req2, request2, false)
+	if re2 == nil || failure2 != nil {
+		t.Fatalf("路由解析失败: %+v %+v", re2, failure2)
+	}
+	defer re2.claim.release(0)
+	if !bucketHasClaim(issued.KID, "plain2") || !bucketHasClaim(issued.KID, "t9") {
+		t.Fatal("普通别名的别名形态与 refs 都应登记")
+	}
+}

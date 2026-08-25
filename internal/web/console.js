@@ -2599,7 +2599,7 @@ async function loadRouteModelList() {
 }
 function routeFormBody(r) {
   return '<div class="form-grid">'
-    + fieldRow('别名', '<input id="rt-alias" list="route-model-list" value="' + (r ? esc(r.alias) : '') + '" placeholder="如 auto" spellcheck="false" maxlength="128">')
+    + fieldRow('别名', '<input id="rt-alias" list="route-model-list" value="' + (r ? esc(r.alias) : '') + '" placeholder="如 auto 或 grp/name（可含 /，撞真实模型名会被拒绝）" spellcheck="false" maxlength="128">')
     + fieldRow('状态', '<select id="rt-enabled"><option value="true"' + (!r || r.enabled ? ' selected' : '') + '>启用</option>'
       + '<option value="false"' + (r && !r.enabled ? ' selected' : '') + '>停用</option></select>')
     + fieldRow('计价模式', '<select id="rt-mode"><option value="target"' + (!r || r.pricing_mode !== 'alias' ? ' selected' : '') + '>按实际目标计价</option>'

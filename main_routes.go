@@ -93,9 +93,14 @@ func resolveRouting(ctx context.Context, svc *service.Service, key *store.Plugin
 	}
 	re.reservation = reservation
 
-	// 认领集 = 别名（基名+原名）+ 全部引用目标的裸名与带后缀形态：
-	// 宿主上报的是实际执行的目标名（可能带思考后缀），取超集防双计入被动路径。
-	models := []string{plan.Model, req.Model, match.Route.Alias}
+	// 认领集 = 全部引用目标的裸名与带后缀形态（宿主上报的是实际执行的目标名）。
+	// 斜杠别名不登记别名形态：认领桶按裸名归一（去渠道前缀），「grp/auto」会落进
+	// 裸名 auto 的桶，与同 Key 对真实模型 auto 的直连流量互相误吞；而别名请求的
+	// 上报匹配实际依赖 refs，别名形态只是防御性冗余。撞真实命名已在保存期拦截。
+	models := make([]string, 0, len(match.Route.Refs)*2+3)
+	if !strings.Contains(match.Route.Alias, "/") {
+		models = append(models, plan.Model, req.Model, match.Route.Alias)
+	}
 	for _, ref := range match.Route.Refs {
 		models = append(models, ref)
 		if sfx := match.Suffix; sfx != "" && !service.HasThinkingSuffix(ref) {

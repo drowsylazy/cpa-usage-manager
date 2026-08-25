@@ -142,6 +142,40 @@ func (s *Store) GetRequest(ctx context.Context, id string) (Request, error) {
 	return r, nil
 }
 
+// DistinctObservedModels 返回历史请求中出现过的全部模型名（NOCASE 去重，
+// 含 model 与 upstream_model 两列——路由流量的真实目标只出现在后者）。
+// 供路由保存期「别名不得撞真实模型名」校验；低频管理操作，容忍全表扫描。
+func (s *Store) DistinctObservedModels(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	var out []string
+	err := s.Read(ctx, func(q Querier) error {
+		rows, err := q.QueryContext(ctx,
+			`SELECT m FROM (
+				 SELECT model AS m FROM requests WHERE model <> ''
+				 UNION
+				 SELECT upstream_model AS m FROM requests WHERE upstream_model IS NOT NULL AND upstream_model <> ''
+			 ) GROUP BY m COLLATE NOCASE ORDER BY m LIMIT ?`, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				return err
+			}
+			out = append(out, name)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("读取历史模型名失败: %w", err)
+	}
+	return out, nil
+}
+
 // 双写判重容差。宿主 usage.handle 与执行器结算描述同一次上游调用：
 // 两者观测到的时刻相差不超过一次回调往返，延迟读数相差仅几毫秒。
 const (
