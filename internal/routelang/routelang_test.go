@@ -179,7 +179,16 @@ func TestEvalWeightedFollowersByWeightDesc(t *testing.T) {
 			t.Fatalf("落选者应按权重降序跟随: %v", chain)
 		}
 	}
-	if counts["b"]*3 > counts["a"]*20 || counts["a"]*10 > counts["b"]*2 {
+	// 粗检（全局随机源无确定性，容差须容纳统计涨落：a 的 σ≈13/2000）：
+	// 只拦截实现性错误——权重被忽略（均分）、倒置或恒选首项。
+	// 期望 b(5) > c(2) > a(1)，且 a ≈ b/5。
+	if !(counts["b"] > counts["c"] && counts["c"] > counts["a"]) {
+		t.Fatalf("加权分布应保持 b>c>a 的序: %v", counts)
+	}
+	if counts["b"] <= counts["a"]+counts["c"] {
+		t.Fatalf("权重 5 应占多数: %v", counts)
+	}
+	if counts["a"]*2 >= counts["b"] || counts["a"]*20 <= counts["b"] {
 		t.Fatalf("加权分布异常偏离 5:1: %v", counts)
 	}
 }
