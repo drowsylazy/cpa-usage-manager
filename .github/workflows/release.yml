@@ -20,7 +20,7 @@ jobs:
           GOARCH: amd64
           CGO_ENABLED: "1"
           CC: gcc
-        run: go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o cpa-usage-manager.so .
+        run: go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${GITHUB_REF_NAME#v}" -o cpa-usage-manager.so .
       - name: ABI smoke
         run: |
           gcc -O2 -Wall -Wextra -o /tmp/abi-smoke scripts/abi-smoke.c -ldl
@@ -29,7 +29,7 @@ jobs:
         run: |
           ver="${GITHUB_REF_NAME#v}"
           archive="cpa-usage-manager_${ver}_linux_amd64.zip"
-          zip -j "$archive" cpa-usage-manager.so
+          zip -9 -j "$archive" cpa-usage-manager.so
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
         with:
@@ -51,12 +51,12 @@ jobs:
           GOARCH: arm64
           CGO_ENABLED: "1"
           CC: aarch64-linux-gnu-gcc
-        run: go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o cpa-usage-manager.so .
+        run: go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${GITHUB_REF_NAME#v}" -o cpa-usage-manager.so .
       - name: Package
         run: |
           ver="${GITHUB_REF_NAME#v}"
           archive="cpa-usage-manager_${ver}_linux_arm64.zip"
-          zip -j "$archive" cpa-usage-manager.so
+          zip -9 -j "$archive" cpa-usage-manager.so
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
         with:
@@ -90,14 +90,24 @@ jobs:
         run: |
           $ver = $env:GITHUB_REF_NAME
           if ($ver.StartsWith("v")) { $ver = $ver.Substring(1) }
-          go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=$ver" -o cpa-usage-manager.dll .
+          go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=$ver" -o cpa-usage-manager.dll .
       - name: Package
         shell: pwsh
         run: |
           $ver = $env:GITHUB_REF_NAME
           if ($ver.StartsWith("v")) { $ver = $ver.Substring(1) }
           $archive = "cpa-usage-manager_${ver}_windows_amd64.zip"
-          Compress-Archive -Path cpa-usage-manager.dll -DestinationPath $archive
+          # Compress-Archive 压缩档位不可控，改用 .NET ZipArchive 的 Optimal（Deflate 最高档）。
+          Add-Type -AssemblyName System.IO.Compression
+          $dll = Resolve-Path cpa-usage-manager.dll
+          $fs = [IO.File]::Open((Join-Path (Get-Location) $archive), [IO.FileMode]::Create)
+          $zip = New-Object IO.Compression.ZipArchive($fs, [IO.Compression.ZipArchiveMode]::Create)
+          try {
+            $entry = $zip.CreateEntry('cpa-usage-manager.dll', [IO.Compression.CompressionLevel]::Optimal)
+            $entry.LastWriteTime = (Get-Item $dll).LastWriteTime
+            $src = [IO.File]::OpenRead($dll)
+            try { $dst = $entry.Open(); $src.CopyTo($dst); $dst.Dispose() } finally { $src.Dispose() }
+          } finally { $zip.Dispose(); $fs.Dispose() }
           Add-Content -Path $env:GITHUB_ENV -Value "ARCHIVE=$archive"
       - uses: actions/upload-artifact@v4
         with:
@@ -117,12 +127,12 @@ jobs:
           GOARCH: arm64
           CGO_ENABLED: "1"
           CC: clang
-        run: go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o cpa-usage-manager.dylib .
+        run: go build -buildmode=c-shared -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${GITHUB_REF_NAME#v}" -o cpa-usage-manager.dylib .
       - name: Package
         run: |
           ver="${GITHUB_REF_NAME#v}"
           archive="cpa-usage-manager_${ver}_darwin_arm64.zip"
-          zip -j "$archive" cpa-usage-manager.dylib
+          zip -9 -j "$archive" cpa-usage-manager.dylib
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
         with:

@@ -25,7 +25,6 @@ import (
 	"github.com/drowsylazy/cpa-usage-manager/internal/money"
 	"github.com/drowsylazy/cpa-usage-manager/internal/store"
 	"github.com/drowsylazy/cpa-usage-manager/internal/usageparse"
-	"github.com/google/uuid"
 )
 
 var (
@@ -480,7 +479,7 @@ func (s *Service) Reserve(ctx context.Context, r ReservationRequest) (store.Rese
 		sweepBefore = now.Add(-s.cfg.Quota.Stream.StaleReservationTimeout.Std())
 	}
 	// 审计并入预占同一写事务：每请求写事务 3→2；审计失败不回滚扣占。
-	holdID := uuid.NewString()
+	holdID := NewUUID()
 	res, _, err := s.st.HoldReservation(ctx, store.HoldReservationParams{
 		ID: holdID, KeyID: r.KeyID, CallerID: r.CallerID, Model: r.Model,
 		IdempotencyKey: r.IdempotencyKey, HeldMicroUSD: cost, ReservedTokens: r.EstimatedTokens,
@@ -744,6 +743,11 @@ func fingerprint(v string) string {
 	return hex.EncodeToString(h[:])[:16]
 }
 func randomID(n int) string { b := make([]byte, n); _, _ = rand.Read(b); return hex.EncodeToString(b) }
+
+// NewUUID 生成请求/预占 ID：16 字节 crypto/rand 的十六进制串（32 字符）。
+// 此前用 github.com/google/uuid，仅为这一个调用引入整个依赖；格式只是
+// 唯一标识，无兼容性约束（库内 ID 均为不透明字符串）。
+func NewUUID() string { b := make([]byte, 16); _, _ = rand.Read(b); return hex.EncodeToString(b) }
 func randomSecret(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)

@@ -55,7 +55,6 @@ import (
 	"github.com/drowsylazy/cpa-usage-manager/internal/service"
 	"github.com/drowsylazy/cpa-usage-manager/internal/store"
 	"github.com/drowsylazy/cpa-usage-manager/internal/usageparse"
-	"github.com/google/uuid"
 )
 
 var runtimeState struct {
@@ -1247,7 +1246,7 @@ func backfillFromHostUsage(svc *service.Service, requestID string, rec rpcUsageR
 
 func buildRequest(svc *service.Service, reservation store.Reservation, req rpcExecutorRequest, meta service.RequestMeta, startedAt, firstChunkAt, completedAt time.Time, status int) *store.Request {
 	r := &store.Request{
-		ID:                uuid.NewString(),
+		ID:                service.NewUUID(),
 		TS:                startedAt,
 		KeyID:             reservation.KeyID,
 		CallerID:          reservation.CallerID,
@@ -2187,7 +2186,7 @@ func modelCandidates(model, alias string) []string {
 
 func usageRecordToRequest(st *store.Store, u rpcUsageRecord) store.Request {
 	req := store.Request{
-		ID: uuid.NewString(),
+		ID: service.NewUUID(),
 		TS: u.RequestedAt,
 		// 模型展示口径统一用别名：宿主上报的 Model 是上游实际路由名
 		// （如 OpenRouter 把 openrouter/ox-alpha 回报为 stealth/ox-alpha），
