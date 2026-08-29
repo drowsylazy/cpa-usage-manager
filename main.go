@@ -776,7 +776,6 @@ func managementRegistration() rpcManagementRegistration {
 		{Method: "GET", Path: base + "/balance", Description: "Key 余额"},
 		{Method: "GET", Path: base + "/routes", Description: "上游路由分布"},
 		{Method: "GET", Path: base + "/audit", Description: "审计事件"},
-		{Method: "GET", Path: base + "/auth-quotas", Description: "OAuth 额度快照"},
 		{Method: "GET", Path: base + "/preferences", Description: "面板偏好读取"},
 		{Method: "POST", Path: base + "/preferences", Description: "面板偏好保存"},
 		{Method: "GET", Path: base + "/exchange-rate", Description: "汇率读取"},

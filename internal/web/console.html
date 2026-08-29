@@ -84,7 +84,6 @@
     <button role="tab" id="tab-usage" class="tab" data-tab="usage">用量</button>
     <button role="tab" id="tab-pricing" class="tab" data-tab="pricing">价格</button>
     <button role="tab" id="tab-routes" class="tab" data-tab="routes">模型集合</button>
-    <button role="tab" id="tab-auth" class="tab" data-tab="auth">认证额度</button>
     <button role="tab" id="tab-system" class="tab" data-tab="system">系统<span class="tab-dot alarm" data-badge="system" hidden></span></button>
     <span class="tabs-meta mono" id="stamp"></span>
   </nav>
@@ -270,16 +269,6 @@
     </div>
     <div class="ky-grid" id="route-rows" role="list" aria-label="模型集合列表"></div>
     <datalist id="route-model-list"></datalist>
-  </article>
-</section>
-
-<!-- ── 认证额度 ─────────────────────────────────────────────────── -->
-<section class="view" id="view-auth" role="tabpanel" aria-labelledby="tab-auth" hidden>
-  <article class="panel">
-    <div class="panel-head">
-      <div><h2 class="panel-title">上游认证额度</h2><p class="panel-sub">OAuth 快照与本地观测增量，不缓存</p></div>
-    </div>
-    <div class="panel-body" id="auth-body"></div>
   </article>
 </section>
 

@@ -8,7 +8,7 @@ import (
 
 // SchemaVersion 是本代码期望的数据库 schema 版本。
 // 打开库时若发现库版本更高，说明是被更新版插件写过的库，拒绝降级使用。
-const SchemaVersion = 12
+const SchemaVersion = 13
 
 // migration 是一次版本化迁移。
 type migration struct {
@@ -425,6 +425,18 @@ var migrations = []migration{
 			// 跨币种聚合使用。历史行均为 USD 口径，缺省列即可。
 			`ALTER TABLE requests ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'`,
 			`ALTER TABLE requests ADD COLUMN cost_native_micro INTEGER NOT NULL DEFAULT 0`,
+		},
+	},
+	{
+		version: 13,
+		name:    "drop_dead_auth_quota_tables",
+		stmts: []string{
+			// ---- 移除从未接入数据源的认证额度快照表 ----
+			// auth_quota_snapshots / auth_quota_window_baselines 自 v0.1 引入以来
+			// 没有任何写入方（宿主无对应回调，面板认证额度页签永远为空）。
+			// 整体删除表与全链路死代码。
+			`DROP TABLE IF EXISTS auth_quota_window_baselines`,
+			`DROP TABLE IF EXISTS auth_quota_snapshots`,
 		},
 	},
 }

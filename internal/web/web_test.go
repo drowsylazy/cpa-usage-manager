@@ -18,9 +18,9 @@ func TestConsoleHTML(t *testing.T) {
 
 	// 必须包含各页签与关键能力元素。
 	expected := []string{
-		"CPA 用量管理", "概览", "密钥", "用量", "价格", "认证额度", "系统",
+		"CPA 用量管理", "概览", "密钥", "用量", "价格", "系统",
 		"cpa-management-key", "gate-key", "trend-chart",
-		"key-rows", "dim-body", "pricing-rows", "auth-body",
+		"key-rows", "dim-body", "pricing-rows",
 		"backup-btn", "restore-btn", "reset-btn",
 		"/v0/management/plugins/cpa-usage-manager",
 	}

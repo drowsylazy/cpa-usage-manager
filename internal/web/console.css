@@ -726,14 +726,6 @@ table.data td.cell-clip{max-width:340px;overflow:hidden;text-overflow:ellipsis}
 .seg button:hover{color:var(--fg)}
 .seg button.on{background:var(--sunken);color:var(--fg)}
 
-/* ── 认证额度卡 ───────────────────────────────────────────────── */
-.auth-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
-.auth-card{padding:13px 14px;border:1px solid var(--line);border-radius:10px;background:var(--sunken);display:grid;gap:10px}
-.auth-card-top{display:flex;align-items:center;gap:8px}
-.auth-card-top .who{display:grid;gap:1px;min-width:0}
-.auth-card-top .prov{font-size:12.5px;font-weight:650}
-.auth-card-top .aid{font-family:var(--mono);font-size:11px;color:var(--fg3);overflow:hidden;text-overflow:ellipsis}
-
 /* ── 抽屉 / 弹窗 ─────────────────────────────────────────────── */
 .sheet{
   padding:0;border:1px solid var(--line2);border-radius:14px;background:var(--bezel);color:var(--fg);

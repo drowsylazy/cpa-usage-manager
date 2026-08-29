@@ -20,7 +20,6 @@
 - 周期额度按自然周期滚动（日/周一起点周一/月），默认 UTC；`quota.cycle_offset_minutes` 可整体偏移到本地日历（480=UTC+8，日限额本地零点归零）；并发按在途未结请求计数
 - 明文仅签发时返回一次；数据库只存 HMAC 哈希 + 可恢复的 AES-GCM 密文 + pepper ID + 指纹
 - pepper 体系（环境变量 / `key-peppers` 文件 / 自动生成，支持轮换）
-- OAuth 认证额度快照 + 本地用量预测
 - 审计事件仅作内部留痕（关键写操作的 `audit_events` 行）；**面向用户的审计功能（审计页、审计导出/归档）已弃用，不再扩展**（2026-08 决策）
 
 ### 1.2 用量统计
@@ -131,10 +130,10 @@ usage.handle(record)
 | `requests` | id, key_id, caller_id, model, provider, source, auth_*, tier, result, ts, input/output/reasoning/cached/cache_read/cache_creation_tokens, total_tokens, latency_ms, ttft_ms, generation_ms, tps, thinking_intensity, cost_micro_usd, reservation_id | 逐请求记录 |
 | `usage_rollups` | bucket_minute, model, key_id, caller_id, provider, source, auth_type, tier, result, req_count, fail_count, in/out/reasoning/cached/cache_read/cache_creation_tokens, latency_sum, ttft_sum, generation_sum, tps_sum, cost_micro_usd | 分钟聚合，面板快速加载 |
 | `audit_events` | ts, actor, action, entity_type, entity_id, detail_json | 审计 |
-| `auth_quota_snapshots` | provider, auth_id, snapshot_json, fetched_at, status | OAuth 额度快照 |
-| `auth_quota_window_baselines` | provider, auth_id, window_id, cycle_key, observed/baseline | 用量预测基线 |
 | `preferences` | k, v | 面板偏好 |
 | `meta` | k, v | 汇率缓存、models.dev 同步元数据 |
+
+> v13 已移除 `auth_quota_snapshots` / `auth_quota_window_baselines`：两表自引入以来没有任何写入方（宿主无对应回调），「认证额度」页签整体下线。
 
 ### 3.2 关键语义
 
@@ -219,7 +218,6 @@ trends                  GET   聚合趋势（按 分钟/时/日/周/月）
 costs                   GET   费用统计与价格覆盖率（含未计价模型 Top N）
 balance                 GET   查询 Key 剩余额度
 audit                   GET   审计事件（仅内部留痕读回；审计功能已弃用扩展）
-auth-quotas             GET   OAuth 认证额度快照 + 本地预测（no-store）
 preferences             GET/POST  面板偏好（前端 ui_ 前缀键跨设备同步）
 exchange-rate           GET   USD/CNY 汇率（缓存）
 notify*                 GET/POST  通知端点/设置/测试（shoutrrr）
@@ -319,7 +317,6 @@ response_compression_min_bytes: 1024
 │           逐请求明细（分页/列偏好）、费用与价格覆盖率       │
 │ 价格      计价规则管理（exact/glob/regexp+优先级）+          │
 │           models.dev 同步 + 汇率                           │
-│ 认证额度  OAuth 快照 + 本地预测（no-store）                 │
 │ 审计      事件流                                           │
 │ 系统      备份/恢复/重置统计/导出 CSV/PNG                  │
 └───────────────────────────────────────────────────────────┘

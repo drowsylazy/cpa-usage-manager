@@ -19,6 +19,10 @@
 
 ## Discovered durable knowledge
 
+- **2026-08 数据表精简（schema v13）**：
+  - **requests 列清单单一来源**：`store.RequestColumns` + `store.ScanRequest` 导出，service 层禁止手抄副本——曾两次实锤副本漂移：service 内联清单漏 currency/cost_native（v12 引入即丢字段），store 的 requestColumns 竟一直缺 `upstream_model`（v5 加列只改了 service 副本，GetRequest 从未返回过 UpstreamModel）。改列必须只动 requestColumns+scanRequest 一处。
+  - **认证额度功能整体移除（v13 DROP）**：auth_quota_snapshots / auth_quota_window_baselines 自 v0.1 起无任何写入方（宿主无推送回调），页签永远为空。已删 store/authquota.go、service.AuthQuotas、/auth-quotas 端点与双注册、面板 tab-auth/view-auth/loader 与 auth-* CSS；snapshotTables 同步移除（旧备份含这两表会被 schema 版本强校验拒绝，属既有约定）。设计文档曾把「OAuth 认证额度快照」列为 P0 特性但从未接线——以后接类似宿主推送特性时，先确认宿主侧真的有回调再建表。
+
 - **2026-08 请求原生币种入账 + 顶栏改进（schema v12，用户明确要求）**：
   - **requests 行原生币种入账**：v12 加 `currency` + `cost_native_micro`（CNY 规则存 micro-CNY 原生金额，这是权威入账记录）；`cost_micro_usd` 保留为按规则**锁定汇率**折算的美元等值——额度扣减（plugin_keys 累计器与限额恒 USD）与跨币种聚合（rollups）必须单一口径，¥/$ 无法直接相加，这条不能按用户直觉去掉。costForRule 改返回 (usd, native)；`PriceNative` 供被动路径（main.go 两处 usage.handle 分支）取币种。scanRequest 对 USD 行 CostNativeMicro==0 时回填 = CostMicroUSD（兼容旧行）。
   - **CSV 导出契约**：requests CSV 头变为 `cost, currency, cost_usd, priced`（cost=原生金额，currency 指明币种，cost_usd=美元等值）。

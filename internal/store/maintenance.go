@@ -23,8 +23,6 @@ var snapshotTables = []string{
 	"requests",
 	"usage_rollups",
 	"audit_events",
-	"auth_quota_snapshots",
-	"auth_quota_window_baselines",
 	"model_routes",
 	"notify_endpoints",
 	"report_configs",

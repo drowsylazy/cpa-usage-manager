@@ -3100,32 +3100,6 @@ $('sheet-body').addEventListener('click', e => {
   if (e.target.closest('#rt-test-back')) exitRouteTestView();
 });
 
-// ---------- 认证额度 ----------
-loaders.auth = async () => {
-  const r = await api('/auth-quotas');
-  const items = r.items || [];
-  $('auth-body').innerHTML = items.length
-    ? '<div class="auth-grid">' + items.map(a => {
-      const pill = a.status === 'ok' ? 'live' : a.status === 'error' ? 'alarm' : '';
-      const snap = a.snapshot ? Object.entries(a.snapshot)
-        .filter(([, v]) => v !== null && typeof v !== 'object')
-        .map(([k, v]) => kv(esc(k), esc(String(v)))).join('') : '';
-      const wins = (a.windows || []).map(w => '<div class="kv-row"><dt>'
-        + '<span class="pill mono">' + esc(w.window_id) + '</span></dt>'
-        + '<dd>观测 ' + fmtInt(w.observed) + ' · 增量 ' + fmtInt(w.delta) + '</dd></div>').join('');
-      return '<div class="auth-card"><div class="auth-card-top">'
-        + '<span class="pill ' + pill + '">' + esc(a.status || 'unknown') + '</span>'
-        + '<div class="who"><span class="prov">' + esc(a.provider) + '</span>'
-        + '<span class="aid">' + esc(a.auth_id) + '</span></div></div>'
-        + (snap ? '<div class="kv">' + snap + '</div>' : '')
-        + (wins ? '<div class="kv">' + wins + '</div>' : '')
-        + '<p class="note">抓取于 ' + (a.fetched_at ? fmtDT(a.fetched_at, true) : '-') + '</p></div>';
-    }).join('') + '</div>'
-    : '<div class="empty"><p class="empty-title">暂无上游认证额度</p>'
-    + '<p class="empty-hint">宿主侧产生 OAuth 用量观测后会出现在这里</p></div>';
-  stamp();
-};
-
 // ---------- 系统 ----------
 loaders.system = async () => {
   const h = await api('/health');

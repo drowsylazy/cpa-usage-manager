@@ -107,7 +107,6 @@ func (a *API) register() {
 	a.route("/routes", a.routes)
 
 	a.route("/audit", a.audit)
-	a.route("/auth-quotas", a.authQuotas)
 	a.route("/preferences", a.preferences)
 	a.route("/exchange-rate", a.exchangeRate)
 
@@ -840,7 +839,7 @@ func (a *API) balance(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, v, 200)
 }
 
-// ---------- audit / auth-quotas / preferences / fx ----------
+// ---------- audit / preferences / fx ----------
 
 func (a *API) audit(w http.ResponseWriter, r *http.Request) {
 	v, e := a.st.ListAudit(r.Context(), atoi(r.URL.Query().Get("limit")), atoi(r.URL.Query().Get("offset")))
@@ -849,15 +848,6 @@ func (a *API) audit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOut(w, v, 200)
-}
-func (a *API) authQuotas(w http.ResponseWriter, r *http.Request) {
-	v, e := a.svc.AuthQuotas(r.Context())
-	if e != nil {
-		jsonOut(w, map[string]string{"error": e.Error()}, 500)
-		return
-	}
-	noStore(w)
-	jsonOut(w, map[string]any{"items": v}, 200)
 }
 func (a *API) preferences(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {

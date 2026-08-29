@@ -233,10 +233,6 @@ func TestPricingAndUsageRoutes(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("audit=%d", w.Code)
 	}
-	w = do(t, a, "GET", base+"/auth-quotas", "")
-	if w.Code != 200 || w.Header().Get("Cache-Control") != "no-store" {
-		t.Fatalf("auth-quotas=%d headers=%v", w.Code, w.Header())
-	}
 }
 
 func TestPreferencesExchangeAndExports(t *testing.T) {
