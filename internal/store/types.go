@@ -113,6 +113,13 @@ type PluginKey struct {
 	WeeklyTokensUsed  int64 `json:"weekly_tokens_used"`
 	MonthlyTokensUsed int64 `json:"monthly_tokens_used"`
 
+	// 请求次数上限（日/月）；nil 表示不限。与金额/Token 并列生效，
+	// 计数器同样复用 *CycleKey 跨期归零（每成功结算一笔请求 +1）。
+	DailyRequestsLimit   *int64 `json:"daily_requests_limit,omitempty"`
+	MonthlyRequestsLimit *int64 `json:"monthly_requests_limit,omitempty"`
+	DailyRequestsUsed    int64  `json:"daily_requests_used"`
+	MonthlyRequestsUsed  int64  `json:"monthly_requests_used"`
+
 	CreatedAt  time.Time  `json:"created_at"`
 	UpdatedAt  time.Time  `json:"updated_at"`
 	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
@@ -157,6 +164,14 @@ func spentForCycle(storedKey, currentKey string, spent money.Micro) money.Micro 
 // tokensForCycle 与 spentForCycle 同语义，用于 token 累计器：
 // 存储的周期标识与当前周期不同说明已跨期，累计值作废按 0 计。
 func tokensForCycle(storedKey, currentKey string, used int64) int64 {
+	if storedKey != currentKey {
+		return 0
+	}
+	return used
+}
+
+// requestsForCycle 与 tokensForCycle 同语义，用于请求次数累计器。
+func requestsForCycle(storedKey, currentKey string, used int64) int64 {
 	if storedKey != currentKey {
 		return 0
 	}

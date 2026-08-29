@@ -615,6 +615,8 @@ func notifyCaps(k store.PluginKey, now time.Time, heldUSD, heldTok int64) []ntCa
 	addTok("tok_daily", "Token 日限额", k.DailyTokenLimit, cycle(k.DailyCycleKey, cy.Daily, k.DailyTokensUsed)+heldTok)
 	addTok("tok_weekly", "Token 周限额", k.WeeklyTokenLimit, cycle(k.WeeklyCycleKey, cy.Weekly, k.WeeklyTokensUsed)+heldTok)
 	addTok("tok_monthly", "Token 月限额", k.MonthlyTokenLimit, cycle(k.MonthlyCycleKey, cy.Monthly, k.MonthlyTokensUsed)+heldTok)
+	addTok("req_daily", "请求次数日限额", k.DailyRequestsLimit, cycle(k.DailyCycleKey, cy.Daily, k.DailyRequestsUsed))
+	addTok("req_monthly", "请求次数月限额", k.MonthlyRequestsLimit, cycle(k.MonthlyCycleKey, cy.Monthly, k.MonthlyRequestsUsed))
 	return out
 }
 

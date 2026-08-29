@@ -87,9 +87,9 @@ func (s *Store) HoldReservation(ctx context.Context, p HoldReservationParams) (R
 		}
 		dailyStart, weeklyStart, monthlyStart := CycleStart(p.Now)
 
-		// 并发计数、held 金额四档、held token 四档合并为同一条聚合语句：
-		// 三次独立扫描压缩成一次，缩短 writeMu 临界区。
-		loadAgg := func() (concurrent int64, held [4]int64, heldTok [4]int64, err error) {
+		// 并发计数、held 金额四档、held token 四档与周期内 held 请求数合并为
+		// 同一条聚合语句：多次独立扫描压缩成一次，缩短 writeMu 临界区。
+		loadAgg := func() (concurrent int64, held [4]int64, heldTok [4]int64, heldReq [2]int64, err error) {
 			q := `SELECT COUNT(*),
 					COALESCE(SUM(held_micro_usd),0),
 					COALESCE(SUM(CASE WHEN created_at >= ? THEN held_micro_usd ELSE 0 END),0),
@@ -98,17 +98,21 @@ func (s *Store) HoldReservation(ctx context.Context, p HoldReservationParams) (R
 					COALESCE(SUM(reserved_tokens),0),
 					COALESCE(SUM(CASE WHEN created_at >= ? THEN reserved_tokens ELSE 0 END),0),
 					COALESCE(SUM(CASE WHEN created_at >= ? THEN reserved_tokens ELSE 0 END),0),
-					COALESCE(SUM(CASE WHEN created_at >= ? THEN reserved_tokens ELSE 0 END),0)
+					COALESCE(SUM(CASE WHEN created_at >= ? THEN reserved_tokens ELSE 0 END),0),
+					COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END),0),
+					COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END),0)
 				FROM reservations WHERE status='held' AND ` + scopeWhere
 			err = tx.QueryRowContext(ctx, q,
 				dailyStart.UnixMilli(), weeklyStart.UnixMilli(), monthlyStart.UnixMilli(),
 				dailyStart.UnixMilli(), weeklyStart.UnixMilli(), monthlyStart.UnixMilli(),
+				dailyStart.UnixMilli(), monthlyStart.UnixMilli(),
 				scopeArg).Scan(&concurrent, &held[0], &held[1], &held[2], &held[3],
-				&heldTok[0], &heldTok[1], &heldTok[2], &heldTok[3])
+				&heldTok[0], &heldTok[1], &heldTok[2], &heldTok[3],
+				&heldReq[0], &heldReq[1])
 			return
 		}
 		recheck := func() error {
-			concurrent, held, heldTok, err := loadAgg()
+			concurrent, held, heldTok, heldReq, err := loadAgg()
 			if err != nil {
 				return err
 			}
@@ -121,17 +125,20 @@ func (s *Store) HoldReservation(ctx context.Context, p HoldReservationParams) (R
 			usedTokDaily := tokensForCycle(k.DailyCycleKey, cy.Daily, k.DailyTokensUsed)
 			usedTokWeekly := tokensForCycle(k.WeeklyCycleKey, cy.Weekly, k.WeeklyTokensUsed)
 			usedTokMonthly := tokensForCycle(k.MonthlyCycleKey, cy.Monthly, k.MonthlyTokensUsed)
+			usedReqDaily := requestsForCycle(k.DailyCycleKey, cy.Daily, k.DailyRequestsUsed)
+			usedReqMonthly := requestsForCycle(k.MonthlyCycleKey, cy.Monthly, k.MonthlyRequestsUsed)
 			if k.CallerScope == CallerScopeCaller {
 				// caller 归属：已结算口径取该归属全部 Key 的累计，
-				// 金额四档与 token 四档合并为一条查询（原为两条）。
-				var sT, sD, sW, sM, uT, uD, uW, uM int64
-				if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(spent_micro_usd),0), COALESCE(SUM(CASE WHEN daily_cycle_key=? THEN daily_spent_micro_usd ELSE 0 END),0), COALESCE(SUM(CASE WHEN weekly_cycle_key=? THEN weekly_spent_micro_usd ELSE 0 END),0), COALESCE(SUM(CASE WHEN monthly_cycle_key=? THEN monthly_spent_micro_usd ELSE 0 END),0), COALESCE(SUM(tokens_used),0), COALESCE(SUM(CASE WHEN daily_cycle_key=? THEN daily_tokens_used ELSE 0 END),0), COALESCE(SUM(CASE WHEN weekly_cycle_key=? THEN weekly_tokens_used ELSE 0 END),0), COALESCE(SUM(CASE WHEN monthly_cycle_key=? THEN monthly_tokens_used ELSE 0 END),0) FROM plugin_keys WHERE caller_id=?`,
-					cy.Daily, cy.Weekly, cy.Monthly, cy.Daily, cy.Weekly, cy.Monthly, k.CallerID).
-					Scan(&sT, &sD, &sW, &sM, &uT, &uD, &uW, &uM); err != nil {
+				// 金额/token/请求次数合并为一条查询（原为两条）。
+				var sT, sD, sW, sM, uT, uD, uW, uM, rD, rM int64
+				if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(spent_micro_usd),0), COALESCE(SUM(CASE WHEN daily_cycle_key=? THEN daily_spent_micro_usd ELSE 0 END),0), COALESCE(SUM(CASE WHEN weekly_cycle_key=? THEN weekly_spent_micro_usd ELSE 0 END),0), COALESCE(SUM(CASE WHEN monthly_cycle_key=? THEN monthly_spent_micro_usd ELSE 0 END),0), COALESCE(SUM(tokens_used),0), COALESCE(SUM(CASE WHEN daily_cycle_key=? THEN daily_tokens_used ELSE 0 END),0), COALESCE(SUM(CASE WHEN weekly_cycle_key=? THEN weekly_tokens_used ELSE 0 END),0), COALESCE(SUM(CASE WHEN monthly_cycle_key=? THEN monthly_tokens_used ELSE 0 END),0), COALESCE(SUM(CASE WHEN daily_cycle_key=? THEN daily_requests_used ELSE 0 END),0), COALESCE(SUM(CASE WHEN monthly_cycle_key=? THEN monthly_requests_used ELSE 0 END),0) FROM plugin_keys WHERE caller_id=?`,
+					cy.Daily, cy.Weekly, cy.Monthly, cy.Daily, cy.Weekly, cy.Monthly, cy.Daily, cy.Monthly, k.CallerID).
+					Scan(&sT, &sD, &sW, &sM, &uT, &uD, &uW, &uM, &rD, &rM); err != nil {
 					return err
 				}
 				settledTotal, settledDaily, settledWeekly, settledMonthly = sT, sD, sW, sM
 				usedTokTotal, usedTokDaily, usedTokWeekly, usedTokMonthly = uT, uD, uW, uM
+				usedReqDaily, usedReqMonthly = rD, rM
 			}
 			amount := int64(p.HeldMicroUSD)
 			checks := []struct {
@@ -157,6 +164,21 @@ func (s *Store) HoldReservation(ctx context.Context, p HoldReservationParams) (R
 				}{{"total_tokens", k.TokenLimit, usedTokTotal + heldTok[0]}, {"daily_tokens", k.DailyTokenLimit, usedTokDaily + heldTok[1]}, {"weekly_tokens", k.WeeklyTokenLimit, usedTokWeekly + heldTok[2]}, {"monthly_tokens", k.MonthlyTokenLimit, usedTokMonthly + heldTok[3]}}
 				for _, c := range tokChecks {
 					if c.limit != nil && (tokAmount > *c.limit || c.used > *c.limit-tokAmount) {
+						return fmt.Errorf("%w: %s", ErrQuotaExceeded, c.name)
+					}
+				}
+			}
+			// ---- 请求次数限额：日/月两档，每笔请求固定 +1；与金额/Token
+			// 并列生效（任一触顶即拒绝），未配置时不付任何额外代价。
+			if k.DailyRequestsLimit != nil || k.MonthlyRequestsLimit != nil {
+				reqAmount := int64(1)
+				reqChecks := []struct {
+					name  string
+					limit *int64
+					used  int64
+				}{{"daily_requests", k.DailyRequestsLimit, usedReqDaily + heldReq[0]}, {"monthly_requests", k.MonthlyRequestsLimit, usedReqMonthly + heldReq[1]}}
+				for _, c := range reqChecks {
+					if c.limit != nil && (reqAmount > *c.limit || c.used > *c.limit-reqAmount) {
 						return fmt.Errorf("%w: %s", ErrQuotaExceeded, c.name)
 					}
 				}
@@ -295,19 +317,21 @@ func (s *Store) SettleReservation(ctx context.Context, id string, cost money.Mic
 			return err
 		}
 		cy := CyclesFor(now)
-		// 金额与 token 累计器在同一条 UPDATE 内推进：周期标识只判一次，
-		// 两种口径的归零点因此严格一致（不会出现金额已跨期而 token 未跨期）。
-		if _, err = s.execHotTx(ctx, tx, `UPDATE plugin_keys SET spent_micro_usd=spent_micro_usd+?, tokens_used=tokens_used+?, daily_cycle_key=CASE WHEN daily_cycle_key<>? THEN ? ELSE daily_cycle_key END, daily_spent_micro_usd=CASE WHEN daily_cycle_key<>? THEN ? ELSE daily_spent_micro_usd+? END, daily_tokens_used=CASE WHEN daily_cycle_key<>? THEN ? ELSE daily_tokens_used+? END, weekly_cycle_key=CASE WHEN weekly_cycle_key<>? THEN ? ELSE weekly_cycle_key END, weekly_spent_micro_usd=CASE WHEN weekly_cycle_key<>? THEN ? ELSE weekly_spent_micro_usd+? END, weekly_tokens_used=CASE WHEN weekly_cycle_key<>? THEN ? ELSE weekly_tokens_used+? END, monthly_cycle_key=CASE WHEN monthly_cycle_key<>? THEN ? ELSE monthly_cycle_key END, monthly_spent_micro_usd=CASE WHEN monthly_cycle_key<>? THEN ? ELSE monthly_spent_micro_usd+? END, monthly_tokens_used=CASE WHEN monthly_cycle_key<>? THEN ? ELSE monthly_tokens_used+? END, updated_at=? WHERE kid=?`,
+		// 金额、token 与请求次数累计器在同一条 UPDATE 内推进：周期标识只判
+		// 一次，三种口径的归零点因此严格一致（不会出现金额已跨期而请求数未跨期）。
+		if _, err = s.execHotTx(ctx, tx, `UPDATE plugin_keys SET spent_micro_usd=spent_micro_usd+?, tokens_used=tokens_used+?, daily_cycle_key=CASE WHEN daily_cycle_key<>? THEN ? ELSE daily_cycle_key END, daily_spent_micro_usd=CASE WHEN daily_cycle_key<>? THEN ? ELSE daily_spent_micro_usd+? END, daily_tokens_used=CASE WHEN daily_cycle_key<>? THEN ? ELSE daily_tokens_used+? END, daily_requests_used=CASE WHEN daily_cycle_key<>? THEN 1 ELSE daily_requests_used+1 END, weekly_cycle_key=CASE WHEN weekly_cycle_key<>? THEN ? ELSE weekly_cycle_key END, weekly_spent_micro_usd=CASE WHEN weekly_cycle_key<>? THEN ? ELSE weekly_spent_micro_usd+? END, weekly_tokens_used=CASE WHEN weekly_cycle_key<>? THEN ? ELSE weekly_tokens_used+? END, monthly_cycle_key=CASE WHEN monthly_cycle_key<>? THEN ? ELSE monthly_cycle_key END, monthly_spent_micro_usd=CASE WHEN monthly_cycle_key<>? THEN ? ELSE monthly_spent_micro_usd+? END, monthly_tokens_used=CASE WHEN monthly_cycle_key<>? THEN ? ELSE monthly_tokens_used+? END, monthly_requests_used=CASE WHEN monthly_cycle_key<>? THEN 1 ELSE monthly_requests_used+1 END, updated_at=? WHERE kid=?`,
 			int64(cost), billableTokens,
 			cy.Daily, cy.Daily,
 			cy.Daily, int64(cost), int64(cost),
 			cy.Daily, billableTokens, billableTokens,
+			cy.Daily,
 			cy.Weekly, cy.Weekly,
 			cy.Weekly, int64(cost), int64(cost),
 			cy.Weekly, billableTokens, billableTokens,
 			cy.Monthly, cy.Monthly,
 			cy.Monthly, int64(cost), int64(cost),
 			cy.Monthly, billableTokens, billableTokens,
+			cy.Monthly,
 			now.UTC().UnixMilli(), r.KeyID); err != nil {
 			return err
 		}

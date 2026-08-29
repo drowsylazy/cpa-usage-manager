@@ -8,7 +8,7 @@ import (
 
 // SchemaVersion 是本代码期望的数据库 schema 版本。
 // 打开库时若发现库版本更高，说明是被更新版插件写过的库，拒绝降级使用。
-const SchemaVersion = 8
+const SchemaVersion = 9
 
 // migration 是一次版本化迁移。
 type migration struct {
@@ -377,6 +377,20 @@ var migrations = []migration{
 				updated_at       INTEGER NOT NULL
 			)`,
 			`CREATE UNIQUE INDEX idx_model_routes_alias ON model_routes(alias COLLATE NOCASE)`,
+		},
+	},
+	{
+		version: 9,
+		name:    "request_count_limits",
+		stmts: []string{
+			// ---- 请求次数限额（日/月）----
+			// 与金额/Token 并列生效的第三组档位：限制脚本失控刷接口（金额和
+			// Token 都可能反应太钝）。NULL=不限；计数器复用 *_cycle_key 的
+			// 跨期归零机制，结算时在既有同一条 UPDATE 内推进。
+			`ALTER TABLE plugin_keys ADD COLUMN daily_requests_limit INTEGER`,
+			`ALTER TABLE plugin_keys ADD COLUMN monthly_requests_limit INTEGER`,
+			`ALTER TABLE plugin_keys ADD COLUMN daily_requests_used INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE plugin_keys ADD COLUMN monthly_requests_used INTEGER NOT NULL DEFAULT 0`,
 		},
 	},
 }

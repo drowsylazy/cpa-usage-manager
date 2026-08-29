@@ -1599,6 +1599,9 @@ function renderKeyDialog(k) {
   // 详情里多出四行「不限」的空清单。骨架结构据此预先确定。
   const hasTok = [k.token_limit, k.daily_token_limit, k.weekly_token_limit, k.monthly_token_limit]
     .some(v => v !== null && v !== undefined);
+  // 请求次数档独立于金额/Token 二选一，配了才显示。
+  const hasReq = [k.daily_requests_limit, k.monthly_requests_limit]
+    .some(v => v !== null && v !== undefined);
   const d = $('key-dialog');
   d.dataset.kid = kid;
   d.innerHTML =
@@ -1629,6 +1632,11 @@ function renderKeyDialog(k) {
     + (hasTok
       ? '<section class="kd-quota-block"><div class="bal-title">Token 限额</div>'
         + balSkeletonRow('总量') + balSkeletonRow('今日') + balSkeletonRow('本周') + balSkeletonRow('本月')
+        + '</section>'
+      : '')
+    + (hasReq
+      ? '<section class="kd-quota-block"><div class="bal-title">请求次数</div>'
+        + balSkeletonRow('今日') + balSkeletonRow('本月')
         + '</section>'
       : '')
     + '</div>'
@@ -1673,6 +1681,12 @@ function renderKeyDialog(k) {
           + balRow('今日', k.daily_token_limit, b.daily_remaining_tokens, fmtTok)
           + balRow('本周', k.weekly_token_limit, b.weekly_remaining_tokens, fmtTok)
           + balRow('本月', k.monthly_token_limit, b.monthly_remaining_tokens, fmtTok)
+          + '</section>'
+        : '')
+      + (hasReq
+        ? '<section class="kd-quota-block"><div class="bal-title">请求次数</div>'
+          + balRow('今日', k.daily_requests_limit, b.daily_remaining_requests, fmtInt)
+          + balRow('本月', k.monthly_requests_limit, b.monthly_remaining_requests, fmtInt)
           + '</section>'
         : '');
     const note = $('kd-note');
@@ -1807,6 +1821,11 @@ $('key-issue-btn').addEventListener('click', () => {
       + fieldRow('周限额', '<input id="f-tok-weekly" inputmode="numeric" placeholder="留空为不限">')
       + fieldRow('月限额', '<input id="f-tok-monthly" inputmode="numeric" placeholder="留空为不限">')
       + '</div>'
+      + '<div class="form-sep wide">请求次数限额（可选，独立于计费方式）</div>'
+      + '<div class="fg-sub" id="g-req">'
+      + fieldRow('日请求数', '<input id="f-req-daily" inputmode="numeric" placeholder="留空为不限">')
+      + fieldRow('月请求数', '<input id="f-req-monthly" inputmode="numeric" placeholder="留空为不限">')
+      + '</div>'
       + fieldRow('可用模型', '<textarea id="f-models" placeholder="逗号或换行分隔，支持 * 通配；留空不限制"></textarea>', 'wide')
       + '</div>',
     note: '明文只在签发结果里出现一次。计费方式金额/Token 二选一；限额留空为不限。',
@@ -1827,6 +1846,13 @@ $('key-issue-btn').addEventListener('click', () => {
         if (n < 0) throw new Error('Token 限额不接受负数');
         return n;
       };
+      const reqN = id => {
+        const v = $(id).value.trim();
+        if (!v || v === '-1') return null;
+        const n = parseInt(v, 10);
+        if (!isFinite(n) || n < 0) throw new Error('请求次数限额须为不小于 0 的整数');
+        return n;
+      };
       const models = $('f-models').value.split(/[\n,，]/).map(s => s.trim()).filter(Boolean);
       const expires = $('f-expires').value ? new Date($('f-expires').value).toISOString() : null;
       const r = await post('/keys/issue', {
@@ -1842,6 +1868,8 @@ $('key-issue-btn').addEventListener('click', () => {
         daily_token_limit: mode === 'tok' ? tok('f-tok-daily') : null,
         weekly_token_limit: mode === 'tok' ? tok('f-tok-weekly') : null,
         monthly_token_limit: mode === 'tok' ? tok('f-tok-monthly') : null,
+        daily_requests_limit: reqN('f-req-daily'),
+        monthly_requests_limit: reqN('f-req-monthly'),
         max_concurrent_requests: parseInt($('f-conc').value, 10) || 0,
         allowed_models: models,
         expires_at: expires,
@@ -1884,6 +1912,10 @@ function editKeySheet(k) {
     ['e-tok-weekly', 'weekly_token_limit', '周限额'],
     ['e-tok-monthly', 'monthly_token_limit', '月限额'],
   ];
+  const REQ_FIELDS = [
+    ['e-req-daily', 'daily_requests_limit', '日请求数'],
+    ['e-req-monthly', 'monthly_requests_limit', '月请求数'],
+  ];
   // 全量回填当前生效值：不限显示 -1，用户在现有基础上直接改。
   // 提交时所有字段原样发回（-1 由后端归一为不限），不再有「留空=不改」的隐式语义。
   const curMoney = f => k[f] === null || k[f] === undefined ? '-1' : String(k[f] / 1e6);
@@ -1909,6 +1941,12 @@ function editKeySheet(k) {
       + '</div>'
       + '<div class="fg-sub off" id="g-tok">'
       + TOKEN_FIELDS.map(([id, field, label]) =>
+        fieldRow(label, '<input id="' + id + '" inputmode="numeric" value="'
+          + esc(curTok(field)) + '">')).join('')
+      + '</div>'
+      + '<div class="form-sep wide">请求次数限额（独立于计费方式）</div>'
+      + '<div class="fg-sub" id="g-req">'
+      + REQ_FIELDS.map(([id, field, label]) =>
         fieldRow(label, '<input id="' + id + '" inputmode="numeric" value="'
           + esc(curTok(field)) + '">')).join('')
       + '</div>'
@@ -1939,6 +1977,13 @@ function editKeySheet(k) {
         const numv = parseFloat(raw);
         if (!isFinite(numv) || numv < 0) throw new Error('金额限额须为不小于 0 的数字（-1 表示不限）');
         body[field] = Math.round(numv * 1e6);
+      }
+      for (const [id, field] of REQ_FIELDS) {
+        const raw = $(id).value.trim();
+        if (raw === '' || raw === '-1') { body[field] = -1; continue; }
+        const n = parseInt(raw, 10);
+        if (!isFinite(n) || n < 0) throw new Error('请求次数限额须为不小于 0 的整数（-1 表示不限）');
+        body[field] = n;
       }
       const modelsRaw = $('e-models').value.trim();
       body.allowed_models = modelsRaw

@@ -269,6 +269,8 @@ type IssueRequest struct {
 	DailyTokenLimit       *int64       `json:"daily_token_limit"`
 	WeeklyTokenLimit      *int64       `json:"weekly_token_limit"`
 	MonthlyTokenLimit     *int64       `json:"monthly_token_limit"`
+	DailyRequestsLimit    *int64       `json:"daily_requests_limit"`
+	MonthlyRequestsLimit  *int64       `json:"monthly_requests_limit"`
 	MaxConcurrentRequests int          `json:"max_concurrent_requests"`
 	AllowedModels         []string     `json:"allowed_models"`
 	Actor                 string       `json:"actor"`
@@ -311,7 +313,7 @@ func (s *Service) IssueKey(ctx context.Context, r IssueRequest) (IssuedKey, erro
 	if err != nil {
 		return IssuedKey{}, err
 	}
-	rec, err := s.st.InsertKey(ctx, store.InsertKeyParams{KID: kid, KeyHash: hash, EncryptedMaterial: enc, PepperID: p.ID, Fingerprint: fingerprint(plain), Principal: r.Principal, CallerScope: r.CallerScope, CallerID: r.CallerID, Label: r.Label, ExpiresAt: r.ExpiresAt, QuotaMicroUSD: r.QuotaMicroUSD, DailyMicroUSD: r.DailyMicroUSD, WeeklyMicroUSD: r.WeeklyMicroUSD, MonthlyMicroUSD: r.MonthlyMicroUSD, TokenLimit: r.TokenLimit, DailyTokenLimit: r.DailyTokenLimit, WeeklyTokenLimit: r.WeeklyTokenLimit, MonthlyTokenLimit: r.MonthlyTokenLimit, MaxConcurrentRequests: r.MaxConcurrentRequests, AllowedModels: r.AllowedModels})
+	rec, err := s.st.InsertKey(ctx, store.InsertKeyParams{KID: kid, KeyHash: hash, EncryptedMaterial: enc, PepperID: p.ID, Fingerprint: fingerprint(plain), Principal: r.Principal, CallerScope: r.CallerScope, CallerID: r.CallerID, Label: r.Label, ExpiresAt: r.ExpiresAt, QuotaMicroUSD: r.QuotaMicroUSD, DailyMicroUSD: r.DailyMicroUSD, WeeklyMicroUSD: r.WeeklyMicroUSD, MonthlyMicroUSD: r.MonthlyMicroUSD, TokenLimit: r.TokenLimit, DailyTokenLimit: r.DailyTokenLimit, WeeklyTokenLimit: r.WeeklyTokenLimit, MonthlyTokenLimit: r.MonthlyTokenLimit, DailyRequestsLimit: r.DailyRequestsLimit, MonthlyRequestsLimit: r.MonthlyRequestsLimit, MaxConcurrentRequests: r.MaxConcurrentRequests, AllowedModels: r.AllowedModels})
 	if err != nil {
 		return IssuedKey{}, err
 	}

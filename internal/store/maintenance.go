@@ -280,6 +280,7 @@ func (s *Store) ResetStatistics(ctx context.Context, opts ResetOptions) (ResetRe
 				monthly_cycle_key = '', monthly_spent_micro_usd = 0,
 				tokens_used = 0,
 				daily_tokens_used = 0, weekly_tokens_used = 0, monthly_tokens_used = 0,
+				daily_requests_used = 0, monthly_requests_used = 0,
 				updated_at = `+fmt.Sprint(nowMillis())); err != nil {
 				return err
 			}

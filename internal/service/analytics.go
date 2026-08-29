@@ -355,6 +355,10 @@ type Balance struct {
 	WeeklyTokens  *int64 `json:"weekly_remaining_tokens,omitempty"`
 	MonthlyTokens *int64 `json:"monthly_remaining_tokens,omitempty"`
 	HeldTokens    int64  `json:"held_tokens"`
+
+	// 请求次数余量（日/月）；nil 表示该档未设限。计数含在途预占。
+	DailyRequests   *int64 `json:"daily_remaining_requests,omitempty"`
+	MonthlyRequests *int64 `json:"monthly_remaining_requests,omitempty"`
 }
 
 func (s *Service) Balance(ctx context.Context, kid string, now time.Time) (Balance, error) {
@@ -411,7 +415,19 @@ func (s *Service) Balance(ctx context.Context, kid string, now time.Time) (Balan
 	out.DailyTokens = remainTok(k.DailyTokenLimit, cycleTok(k.DailyCycleKey, cy.Daily, k.DailyTokensUsed)+heldTokens)
 	out.WeeklyTokens = remainTok(k.WeeklyTokenLimit, cycleTok(k.WeeklyCycleKey, cy.Weekly, k.WeeklyTokensUsed)+heldTokens)
 	out.MonthlyTokens = remainTok(k.MonthlyTokenLimit, cycleTok(k.MonthlyCycleKey, cy.Monthly, k.MonthlyTokensUsed)+heldTokens)
+	// 请求次数余量：与金额/Token 同构。在途预占按同一查询的 COUNT 并入
+	// （每笔 held 预占即一笔待结算请求）。
+	out.DailyRequests = remainTok(k.DailyRequestsLimit, requestsCycle(k.DailyCycleKey, cy.Daily, k.DailyRequestsUsed)+concurrent)
+	out.MonthlyRequests = remainTok(k.MonthlyRequestsLimit, requestsCycle(k.MonthlyCycleKey, cy.Monthly, k.MonthlyRequestsUsed)+concurrent)
 	return out, nil
+}
+
+// requestsCycle 与 cycleTok 同语义：跨期计数归零。
+func requestsCycle(stored, current string, used int64) int64 {
+	if stored != current {
+		return 0
+	}
+	return used
 }
 
 // RouteRow 是一条「上游实际模型」的路由聚合行。

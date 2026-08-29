@@ -373,7 +373,8 @@ func limitI64(n int64) (int64, error) {
 
 // normalizeIssueLimits 把签发请求里的 -1 归一为 nil（不限），拒绝其余负值。
 func normalizeIssueLimits(in *service.IssueRequest) error {
-	toks := []**int64{&in.TokenLimit, &in.DailyTokenLimit, &in.WeeklyTokenLimit, &in.MonthlyTokenLimit}
+	toks := []**int64{&in.TokenLimit, &in.DailyTokenLimit, &in.WeeklyTokenLimit, &in.MonthlyTokenLimit,
+		&in.DailyRequestsLimit, &in.MonthlyRequestsLimit}
 	for _, p := range toks {
 		if *p == nil || **p >= 0 {
 			continue
@@ -511,6 +512,8 @@ func buildKeyUpdate(raw map[string]json.RawMessage) (store.KeyUpdate, error) {
 		{"daily_token_limit", &u.DailyTokenLimit},
 		{"weekly_token_limit", &u.WeeklyTokenLimit},
 		{"monthly_token_limit", &u.MonthlyTokenLimit},
+		{"daily_requests_limit", &u.DailyRequestsLimit},
+		{"monthly_requests_limit", &u.MonthlyRequestsLimit},
 	} {
 		if v, ok := raw[c.key]; ok {
 			p := (*int64)(nil)
