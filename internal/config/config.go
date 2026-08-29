@@ -104,11 +104,16 @@ type Config struct {
 
 // QuotaConfig 是额度子系统配置。
 type QuotaConfig struct {
-	Enabled    bool             `yaml:"enabled"`
-	Keys       KeysConfig       `yaml:"keys"`
-	Limits     LimitsConfig     `yaml:"limits"`
-	Settlement SettlementConfig `yaml:"settlement"`
-	Stream     StreamConfig     `yaml:"stream"`
+	Enabled bool `yaml:"enabled"`
+	// CycleOffsetMinutes 是日/周/月额度周期相对 UTC 的固定偏移（分钟）：
+	// 周期在「本地时间」的自然边界滚动（如 480=UTC+8，日限额在本地零点归零）。
+	// 合法范围 -720..840（UTC-12:00..UTC+14:00），越界钳制；默认 0 保持 UTC。
+	// cycle_key 是字符串，切换偏移后旧键自然滚动过期，无需数据迁移。
+	CycleOffsetMinutes int              `yaml:"cycle_offset_minutes"`
+	Keys               KeysConfig       `yaml:"keys"`
+	Limits             LimitsConfig     `yaml:"limits"`
+	Settlement         SettlementConfig `yaml:"settlement"`
+	Stream             StreamConfig     `yaml:"stream"`
 }
 
 // KeysConfig 是插件 Key 与 pepper 体系配置。
@@ -283,6 +288,13 @@ func (c *Config) normalize() error {
 	c.Quota.Settlement.MissingUsage = strings.ToLower(strings.TrimSpace(c.Quota.Settlement.MissingUsage))
 	if c.Quota.Settlement.MissingUsage == "" {
 		c.Quota.Settlement.MissingUsage = MissingUsageSettleReserved
+	}
+	// 周期偏移钳到 UTC-12:00..UTC+14:00，非严格 YAML 下越界值静默归一。
+	if c.Quota.CycleOffsetMinutes < -720 {
+		c.Quota.CycleOffsetMinutes = -720
+	}
+	if c.Quota.CycleOffsetMinutes > 840 {
+		c.Quota.CycleOffsetMinutes = 840
 	}
 	c.Pricing.UnknownPolicy = strings.ToLower(strings.TrimSpace(c.Pricing.UnknownPolicy))
 	if c.Pricing.UnknownPolicy == "" {

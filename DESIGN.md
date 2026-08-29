@@ -17,7 +17,7 @@
 - 签发/管理 `cum-<kid>-<secret>` 插件 Key：总/日/周/月额度（micro-USD）、最大并发、可用模型、标签、归属（caller）、禁用/启用/撤销/轮换/删除
 - 请求前**严格预占**（保守 Token 上限 × 计价 → 原子扣占），余额不足 fail-closed 拒绝
 - 按实际 usage **结算**（流式/非流式、多协议：OpenAI/Claude/Gemini/Responses 等），缺失 usage 有兜底策略
-- 周期额度按 UTC 自然周期（日/周一起点周一/月）；并发按在途未结请求计数
+- 周期额度按自然周期滚动（日/周一起点周一/月），默认 UTC；`quota.cycle_offset_minutes` 可整体偏移到本地日历（480=UTC+8，日限额本地零点归零）；并发按在途未结请求计数
 - 明文仅签发时返回一次；数据库只存 HMAC 哈希 + 可恢复的 AES-GCM 密文 + pepper ID + 指纹
 - pepper 体系（环境变量 / `key-peppers` 文件 / 自动生成，支持轮换）
 - OAuth 认证额度快照 + 本地用量预测

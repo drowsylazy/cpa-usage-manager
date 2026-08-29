@@ -624,6 +624,9 @@ func configure(inline string) error {
 		return err
 	}
 	svc := service.New(st, cfg, ps)
+	// 周期额度相对 UTC 的固定偏移（quota.cycle_offset_minutes）：
+	// store 包级 atomic，进程内所有 CyclesFor/CycleStart 共用。
+	store.SetCycleOffsetMinutes(int64(cfg.Quota.CycleOffsetMinutes))
 	// ai_judge 的宿主执行钩子：服务层不直接持有 C ABI 回调，经此注入。
 	// 评判调用以 openai 协议、无头信息直连 host.model.execute，非流式。
 	svc.SetJudgeExecutor(func(_ context.Context, model string, body []byte) ([]byte, int, error) {
@@ -704,6 +707,7 @@ func pluginRegistration(schema uint32) rpcRegistration {
 				{Name: "quota.settlement.missing_usage", Type: "enum", EnumValues: []string{"settle_reserved", "release"}, Description: "上游未返回 usage 时的结算策略。"},
 				{Name: "quota.settlement.host_usage_wait", Type: "string", Description: "流式结算在上游未给 usage 时，关闭客户端流后等待宿主 usage.handle 的时长（0 关闭；非流式不等待）。"},
 				{Name: "quota.stream.stale_reservation_timeout", Type: "string", Description: "无心跳在途预占自动释放时长。"},
+				{Name: "quota.cycle_offset_minutes", Type: "integer", Description: "日/周/月额度周期相对 UTC 的固定偏移分钟数（480=UTC+8，日限额在本地零点归零；默认 0 保持 UTC）。"},
 				{Name: "pricing.unknown_policy", Type: "enum", EnumValues: []string{"deny", "allow", "default"}, Description: "无计价规则命中时的策略。"},
 				{Name: "pricing.models_dev_sync.enabled", Type: "boolean", Description: "是否启用 models.dev 价格同步。"},
 				{Name: "response_compression", Type: "boolean", Description: "管理面板 JSON/HTML 是否 gzip。"},

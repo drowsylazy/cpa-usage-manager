@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/drowsylazy/cpa-usage-manager/internal/money"
@@ -327,16 +328,39 @@ type AuditEvent struct {
 
 // 周期标识 -----------------------------------------------------------------
 
-// CycleKeys 是某一时刻对应的三个 UTC 周期标识。
+// cycleOffsetMinutes 是周期计算相对 UTC 的固定偏移（分钟），进程级配置：
+// 启动/reconfigure 时经 SetCycleOffsetMinutes 写入，请求 goroutine 并发读，
+// 用 atomic 避免 data race。0=纯 UTC。
+var cycleOffsetMinutes atomic.Int64
+
+// SetCycleOffsetMinutes 设置周期偏移。只影响新产生的周期标识：cycle_key
+// 是按「切换时刻所在周期」写入的字符串，旧键随下一次跨期自然归零，无需迁移。
+func SetCycleOffsetMinutes(minutes int64) { cycleOffsetMinutes.Store(minutes) }
+
+// CycleOffsetMinutes 返回当前周期偏移。
+func CycleOffsetMinutes() int64 { return cycleOffsetMinutes.Load() }
+
+// cycleTime 把时刻换算到「本地周期坐标系」：先加偏移再按 UTC 取年月日。
+// 偏移 480（UTC+8）时，本地 2026-08-29 00:00 起的流量记入 08-29 的日周期。
+func cycleTime(t time.Time) time.Time {
+	u := t.UTC()
+	if m := cycleOffsetMinutes.Load(); m != 0 {
+		u = u.Add(time.Duration(m) * time.Minute)
+	}
+	return u
+}
+
+// CycleKeys 是某一时刻对应的三个周期标识。
 type CycleKeys struct {
 	Daily   string
 	Weekly  string
 	Monthly string
 }
 
-// CyclesFor 计算给定时刻的日/周/月周期标识（均按 UTC，周以周一为起点）。
+// CyclesFor 计算给定时刻的日/周/月周期标识（按 quota.cycle_offset_minutes
+// 偏移后的本地日历，周以周一为起点）。
 func CyclesFor(t time.Time) CycleKeys {
-	u := t.UTC()
+	u := cycleTime(t)
 	year, week := u.ISOWeek()
 	return CycleKeys{
 		Daily:   u.Format("2006-01-02"),
@@ -345,14 +369,19 @@ func CyclesFor(t time.Time) CycleKeys {
 	}
 }
 
-// CycleStart 返回给定时刻所在日/周/月周期的起点（UTC）。
+// CycleStart 返回给定时刻所在日/周/月周期的起点（真实时刻）：本地坐标系里
+// 的边界再减回偏移。用于把在途预占按创建时刻归入当前周期。
 func CycleStart(t time.Time) (daily, weekly, monthly time.Time) {
-	u := t.UTC()
-	daily = time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
+	u := cycleTime(t)
+	var off time.Duration
+	if m := cycleOffsetMinutes.Load(); m != 0 {
+		off = time.Duration(m) * time.Minute
+	}
+	daily = time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC).Add(-off)
 	// ISO 周以周一为起点；Go 的 Weekday() 周日为 0，需换算。
 	offset := (int(u.Weekday()) + 6) % 7
 	weekly = daily.AddDate(0, 0, -offset)
-	monthly = time.Date(u.Year(), u.Month(), 1, 0, 0, 0, 0, time.UTC)
+	monthly = time.Date(u.Year(), u.Month(), 1, 0, 0, 0, 0, time.UTC).Add(-off)
 	return daily, weekly, monthly
 }
 
