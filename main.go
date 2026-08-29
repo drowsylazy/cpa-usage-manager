@@ -38,9 +38,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -64,6 +66,8 @@ var runtimeState struct {
 	cfg config.Config
 	// notifyStop 关停告警扫描 goroutine；reconfigure/shutdown 时关闭。
 	notifyStop chan struct{}
+	// backupStop 关停定时备份 goroutine，同上。
+	backupStop chan struct{}
 }
 
 type imageHold struct {
@@ -395,13 +399,18 @@ func cliproxyPluginShutdown() {
 	runtimeState.Lock()
 	st := runtimeState.st
 	notifyStop := runtimeState.notifyStop
+	backupStop := runtimeState.backupStop
 	runtimeState.st = nil
 	runtimeState.svc = nil
 	runtimeState.api = nil
 	runtimeState.notifyStop = nil
+	runtimeState.backupStop = nil
 	runtimeState.Unlock()
 	if notifyStop != nil {
 		close(notifyStop)
+	}
+	if backupStop != nil {
+		close(backupStop)
 	}
 	if st != nil {
 		_ = st.Close()
@@ -609,6 +618,10 @@ func configure(inline string) error {
 		close(runtimeState.notifyStop)
 		runtimeState.notifyStop = nil
 	}
+	if runtimeState.backupStop != nil {
+		close(runtimeState.backupStop)
+		runtimeState.backupStop = nil
+	}
 	// 旧库已关、新库未开：失败路径必须把运行态整体置空，让后续请求拿到
 	// 干净的 service_unavailable，而不是对已关闭的库报错——后者会让
 	// usage.handle 的被动记录在 warn 日志之外静默丢失。
@@ -646,6 +659,11 @@ func configure(inline string) error {
 	notifyStop := make(chan struct{})
 	runtimeState.notifyStop = notifyStop
 	go notifySweepLoop(svc, notifyStop)
+	if cfg.Backup.Enabled {
+		backupStop := make(chan struct{})
+		runtimeState.backupStop = backupStop
+		go autoBackupLoop(svc, cfg.Backup, backupStop)
+	}
 	runtimeState.st = st
 	runtimeState.svc = svc
 	runtimeState.api = httpapi.New(svc, st, httpapi.Options{
@@ -708,6 +726,10 @@ func pluginRegistration(schema uint32) rpcRegistration {
 				{Name: "quota.settlement.host_usage_wait", Type: "string", Description: "流式结算在上游未给 usage 时，关闭客户端流后等待宿主 usage.handle 的时长（0 关闭；非流式不等待）。"},
 				{Name: "quota.stream.stale_reservation_timeout", Type: "string", Description: "无心跳在途预占自动释放时长。"},
 				{Name: "quota.cycle_offset_minutes", Type: "integer", Description: "日/周/月额度周期相对 UTC 的固定偏移分钟数（480=UTC+8，日限额在本地零点归零；默认 0 保持 UTC）。"},
+				{Name: "backup.enabled", Type: "boolean", Description: "每日自动备份库快照到本地目录（默认关闭）。"},
+				{Name: "backup.dir", Type: "string", Description: "备份目录，相对 data_dir（默认 backups，0700）。"},
+				{Name: "backup.keep", Type: "integer", Description: "保留份数，超出删最旧（默认 7）。"},
+				{Name: "backup.hour", Type: "integer", Description: "每日触发的本地小时 0..23（默认 4；启动时当天已过点会补备份）。"},
 				{Name: "pricing.unknown_policy", Type: "enum", EnumValues: []string{"deny", "allow", "default"}, Description: "无计价规则命中时的策略。"},
 				{Name: "pricing.models_dev_sync.enabled", Type: "boolean", Description: "是否启用 models.dev 价格同步。"},
 				{Name: "response_compression", Type: "boolean", Description: "管理面板 JSON/HTML 是否 gzip。"},
@@ -1412,6 +1434,47 @@ func notifySweepLoop(svc *service.Service, stop <-chan struct{}) {
 // 单个后台协程批量续期全部在途预占，不再每请求各起一个 ticker goroutine。
 func startReservationHeartbeat(svc *service.Service, reservationID string) func() {
 	return svc.TrackReservation(reservationID)
+}
+
+// autoBackupLoop 每日一次把库快照写进 backup.dir 并轮转 keep 份。
+// 触发时刻按本机本地时区的 backup.hour；启动时当天时刻已过且尚未备份则立即
+// 补一份（重启不漏当天）。仅租约持有者执行，多实例部署不重复落盘。
+func autoBackupLoop(svc *service.Service, cfg config.BackupConfig, stop <-chan struct{}) {
+	dir := cfg.Dir
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(svc.Config().DataDir, dir)
+	}
+	lastDay := ""
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	fire := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if _, err := svc.RunAutoBackup(ctx, dir, cfg.Keep); err != nil {
+			log.Printf("cpa-usage-manager: 自动备份失败: %v", err)
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel2()
+			svc.NotifyErrorEvent(ctx2, "report", "定时自动备份失败: "+err.Error())
+		}
+	}
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			now := time.Now()
+			day := now.Format("2006-01-02")
+			if lastDay == day || now.Hour() < cfg.Hour {
+				continue
+			}
+			lastDay = day
+			if svc.Store().Writable() {
+				fire()
+			} else {
+				lastDay = "" // 只读实例不占当天名额，接管租约后照常补备份
+			}
+		}
+	}
 }
 
 func hostModelExecute(hostCallbackID string, req rpcExecutorRequest, model string, body []byte, stream bool) ([]byte, http.Header, int, error) {

@@ -97,6 +97,7 @@ type Config struct {
 
 	Quota   QuotaConfig   `yaml:"quota"`
 	Pricing PricingConfig `yaml:"pricing"`
+	Backup  BackupConfig  `yaml:"backup"`
 
 	ResponseCompression         bool `yaml:"response_compression"`
 	ResponseCompressionMinBytes int  `yaml:"response_compression_min_bytes"`
@@ -152,6 +153,19 @@ type PricingConfig struct {
 	ModelsDevSync ModelsDevSyncConfig `yaml:"models_dev_sync"`
 }
 
+// BackupConfig 是定时自动备份配置。
+type BackupConfig struct {
+	// Enabled 开启后每日在本地时刻 hour 点写出一份库快照到 dir 并轮转。
+	Enabled bool `yaml:"enabled"`
+	// Dir 是备份目录；相对路径相对 data_dir（0700，含敏感数据，不要放同步盘）。
+	Dir string `yaml:"dir"`
+	// Keep 是保留份数，超出删除最旧份。
+	Keep int `yaml:"keep"`
+	// Hour 是每日触发的本地小时（0..23）。启动时若当天时刻已过且尚未备份，
+	// 会立即补一份（重启不漏当天的备份）。
+	Hour int `yaml:"hour"`
+}
+
 // ModelsDevSyncConfig 是 models.dev 价格同步配置。
 type ModelsDevSyncConfig struct {
 	Enabled          bool              `yaml:"enabled"`
@@ -195,6 +209,12 @@ func Default() Config {
 				IgnoreSuffixes:   nil,
 				ModelMappings:    nil,
 			},
+		},
+		Backup: BackupConfig{
+			Enabled: false,
+			Dir:     "backups",
+			Keep:    7,
+			Hour:    4,
 		},
 		ResponseCompression:         true,
 		ResponseCompressionMinBytes: 1024,
@@ -295,6 +315,18 @@ func (c *Config) normalize() error {
 	}
 	if c.Quota.CycleOffsetMinutes > 840 {
 		c.Quota.CycleOffsetMinutes = 840
+	}
+	// 备份目录必须是纯相对目录名或绝对路径，但不得指进 data_dir 上层之外的特殊位置；
+	// 这里只归一缺省值与非法数值，路径合法性交由运行时 MkdirAll 校验。
+	c.Backup.Dir = strings.TrimSpace(c.Backup.Dir)
+	if c.Backup.Dir == "" {
+		c.Backup.Dir = Default().Backup.Dir
+	}
+	if c.Backup.Keep < 1 {
+		c.Backup.Keep = Default().Backup.Keep
+	}
+	if c.Backup.Hour < 0 || c.Backup.Hour > 23 {
+		c.Backup.Hour = Default().Backup.Hour
 	}
 	c.Pricing.UnknownPolicy = strings.ToLower(strings.TrimSpace(c.Pricing.UnknownPolicy))
 	if c.Pricing.UnknownPolicy == "" {

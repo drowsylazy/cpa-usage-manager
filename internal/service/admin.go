@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -148,6 +150,61 @@ func (s *Service) Backup(ctx context.Context, w io.Writer, actor string) (store.
 		Detail: map[string]any{"bytes": res.Bytes},
 	})
 	return res, nil
+}
+
+// RunAutoBackup 写出一份定时备份文件（与 /backup 下载同格式）并按 keep
+// 轮转删除最旧份。返回文件路径。dir 不存在时按 0700 创建。
+func (s *Service) RunAutoBackup(ctx context.Context, dir string, keep int) (string, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("创建备份目录失败: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".bak-tmp-*")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() { _ = tmp.Close(); _ = os.Remove(tmpPath) }
+	res, err := s.st.BackupTo(ctx, tmp, store.BackupOptions{MaxBytes: BackupMaxBytes})
+	if err != nil {
+		cleanup()
+		return "", fmt.Errorf("备份快照写出失败: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", err
+	}
+	final := filepath.Join(dir, "cpa-usage-manager_"+time.Now().Format("20060102-150405")+".bak")
+	if err := os.Rename(tmpPath, final); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", err
+	}
+	s.rotateAutoBackups(dir, keep)
+	_ = s.st.AppendAudit(ctx, store.AuditEvent{
+		Actor: "auto", Action: "system.auto_backup", EntityType: "system", EntityID: "database",
+		Detail: map[string]any{"bytes": res.Bytes, "path": final},
+	})
+	return final, nil
+}
+
+// rotateAutoBackups 删除超出 keep 份数的最旧备份（文件名时间戳降序，尾部即最旧）。
+func (s *Service) rotateAutoBackups(dir string, keep int) {
+	entries, err := os.ReadDir(dir)
+	if err != nil || keep < 1 {
+		return
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), "cpa-usage-manager_") && strings.HasSuffix(e.Name(), ".bak") {
+			names = append(names, e.Name())
+		}
+	}
+	if len(names) <= keep {
+		return
+	}
+	sort.Strings(names) // 时间戳命名，字典序即时间序
+	for _, n := range names[:len(names)-keep] {
+		_ = os.Remove(filepath.Join(dir, n))
+	}
 }
 
 // Restore 用上传的快照替换库内容，并记审计。
