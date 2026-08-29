@@ -2123,12 +2123,12 @@ function fillReqSuggestions() {
     .then(r => reqModelCombo.setOptions((r.rows || []).filter(x => x.value)
       .map(x => ({ value: x.value, label: x.value }))))
     .catch(() => {});
-  // 值提交 kid，但标签同时显示 —— datalist 在 Firefox 只显示 value，标签会丢
-  // 注：密钥列表改为服务端分页后，此处候选只覆盖当前页（全量候选需单独轻量
-  // 接口，待产品确认后再加）。
-  reqKeyCombo.setOptions(keysView.cache.map(k => ({
-    value: k.kid, label: k.label || '(无标签)', sub: k.kid,
-  })));
+  // 密钥候选走 /keys/candidates 轻量接口（全量 kid+标签），不再受 /keys 分页限制。
+  api('/keys/candidates')
+    .then(r => reqKeyCombo.setOptions((r.items || []).map(k => ({
+      value: k.kid, label: k.label || '(无标签)', sub: k.kid,
+    }))))
+    .catch(() => {});
 }
 
 loaders.usage = async () => {
@@ -2137,6 +2137,25 @@ loaders.usage = async () => {
   fillReqSuggestions();
   stamp();
 };
+
+// 请求明细自动刷新：30s 轮询当前筛选与页码，偏好经 ui_ 前缀同步到服务器。
+// 只在用量页可见时拉数据，切走即停，不产生后台空转。
+let reqAutoTimer = null;
+function setReqAuto(on) {
+  $('req-auto').checked = on;
+  if (reqAutoTimer) { clearInterval(reqAutoTimer); reqAutoTimer = null; }
+  if (on) {
+    reqAutoTimer = setInterval(() => {
+      if ($('view-usage').hidden || document.hidden) return;
+      loadRequests().catch(() => {});
+    }, 30000);
+  }
+}
+$('req-auto').addEventListener('change', () => {
+  setReqAuto($('req-auto').checked);
+  savePref('req-auto', $('req-auto').checked ? '1' : '0');
+});
+setReqAuto(localStorage.getItem('req-auto') === '1');
 let routeRows = [], routePage = 0, routeModel = '';
 const ROUTE_PAGE_SIZE = 5;
 // 必须选中本地别名才展示路由（无「全部」态）；未选时 value='' 显示占位符。
@@ -3482,7 +3501,7 @@ function showApp() {
 // ——列偏好等组件在构造时读 localStorage，重载是让它们吃到服务器值最
 // 稳妥的方式。sessionStorage 标记防重载循环：重载后值已一致即不再触发，
 // 若期间无差异则清掉标记，允许后续再次同步。
-const PREF_KEYS = ['console-range', 'req-cols', 'req-size', 'ov-models-metric', 'ov-keys-metric'];
+const PREF_KEYS = ['console-range', 'req-cols', 'req-size', 'ov-models-metric', 'ov-keys-metric', 'req-auto'];
 function validPref(k, v) {
   if (v === null || v === undefined || v === '') return false;
   switch (k) {
@@ -3493,6 +3512,8 @@ function validPref(k, v) {
     case 'ov-models-metric':
     case 'ov-keys-metric':
       return ['tokens', 'cost', 'requests'].includes(v);
+    case 'req-auto':
+      return v === '0' || v === '1';
     case 'req-cols': {
       try {
         const arr = JSON.parse(v);

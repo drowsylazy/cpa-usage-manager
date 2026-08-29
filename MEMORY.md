@@ -19,6 +19,15 @@
 
 ## Discovered durable knowledge
 
+- **2026-08 功能批·第二轮持久结论**（8 提交，schema v9+v10）：
+  - 冷却是进程内状态器（routes.go cooldowns map）：新增 `MarkRouteSuccess`（流式在 dialOK 时清、非流式在成功结算前清）；429 的 Retry-After（秒数或 HTTP 日期）经 `cooldownSecondsFor` 采用并钳到 1s~10min。ResolveChain 全冷却分支按 `cooldown_policy`：`force` 返回原链照打、`block`（默认）维持 ErrAllTargetsCooling。
+  - 单请求异常告警：NotifySettings 新增 single_cost_alert/single_cost_micro_usd/single_token_threshold 三字段；Settle 尾部 `maybeNotifySingleUsage`（设置走 notifySettingsCached 60s TTL 缓存，热路径仅两次比较），命中后 goroutine 异步发送，同 Key 1h 冷却（preferences `notify_single_state`）。httpapi notifySettings 的入参结构体是显式字段清单，加设置字段必须同步补。
+  - 周期额度时区：`quota.cycle_offset_minutes`（config 归一 -720..840）→ store 包级 atomic `SetCycleOffsetMinutes`（main.configure 调用）→ `cycleTime` 先加偏移再按 UTC 取年月日；CycleStart 返回真实时刻需减回偏移。cycle_key 是字符串，切偏移后旧键自然滚动归零，无迁移。
+  - 请求次数限额（日/月，schema v9 四列）：独立第三族，与金额/Token 互斥规则无关；结算 UPDATE 内复用 daily/monthly_cycle_key 归零推进（CASE WHEN 换周期则置 1）；预占期在途计入走 HoldReservation 聚合里 created_at>=周期起点的 COUNT。Balance JSON 契约新增 daily/monthly_remaining_requests。
+  - routelang 新增布尔字面量 true/false 与变量 hour/weekday(ISO 1=周一..7=周日，按 cycle_offset 本地日历)/has_tools/has_system（顶层 tools/system/systemInstruction RawMessage 存在性探测，OpenAI messages 内的 system role 不探测）/kid/key_label/caller_id；BuildRouteEnv 签名追加了 `key *store.PluginKey`（干跑传 nil）。
+  - 自动备份：`backup.enabled/dir/keep/hour`（默认关/backups/7/4 点本地时刻，启动时当天已过点补一份）；service.RunAutoBackup 临时文件+rename 原子落盘、时间戳命名轮转；main.autoBackupLoop 仅租约持有者（Writable）执行，失败经 NotifyErrorEvent 上报；快照不含 key-peppers，须自行另行备份。
+  - 新增 GET /keys/candidates（kid+label 轻量全量候选，上限 2000），请求明细密钥联想不再受 /keys 分页限制；面板请求明细「30s 刷新」toggle 偏好走 ui_req-auto。
+
 - **2026-08 功能批持久结论**（154483f）：
   - **HTTP 响应头必须先于首写设置**（实测实锤：导出端点原「先写体再设头」的顺序在真实 HTTP 下 Content-Type/Content-Disposition 全被首写快照丢弃，浏览器拿不到文件名）。导出类处理器一律先用 `svc.ExportTarget(req, png)` 拿文件名+Content-Type 预置头再写体；文件名由 `exportFileName` 统一构造（kind+时间范围标记 `_YYYYMMDD-HHMM[_-终点]|_all`+UTC 时间戳）。中途出错头已提交无法回改成 JSON，只能记日志。
   - 面板偏好跨设备同步约定：本地键经 `savePref` 双写 localStorage 与 /preferences 的 **`ui_` 前缀键**（勿与 notify_* 冲突）；登录后 `syncPrefsFromServer` 以服务器为准回灌本地并整页重载一次（sessionStorage `ui-prefs-reloaded` 防循环；custom 时间范围无起止不同步）。MultiSelect 等 closure 组件没有程序化设值接口，重载是有意的最稳方案。

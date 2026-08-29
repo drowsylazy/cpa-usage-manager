@@ -77,6 +77,7 @@ func (a *API) register() {
 	a.route("/callers/enabled", a.callerEnabled)
 
 	a.route("/keys", a.keys)
+	a.route("/keys/candidates", a.keyCandidates)
 	a.route("/keys/issue", a.issue)
 	a.route("/keys/update", a.updateKey)
 	a.route("/keys/rotate", a.rotate)
@@ -343,6 +344,29 @@ func (a *API) keys(w http.ResponseWriter, r *http.Request) {
 	}
 	jsonOut(w, map[string]any{"items": items, "total": total, "status_counts": counts}, 200)
 }
+// keyCandidates 是请求明细密钥筛选的轻量候选接口：全量 Key 的 kid+label，
+// 不含额度/统计字段。服务端分页后 /keys 只覆盖当前页，联想候选改走这里。
+func (a *API) keyCandidates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.WriteHeader(405)
+		return
+	}
+	items, _, e := a.st.ListKeys(r.Context(), store.KeyFilter{Limit: 2000})
+	if e != nil {
+		jsonOut(w, map[string]string{"error": e.Error()}, 500)
+		return
+	}
+	type cand struct {
+		KID   string `json:"kid"`
+		Label string `json:"label"`
+	}
+	out := make([]cand, 0, len(items))
+	for _, k := range items {
+		out = append(out, cand{KID: k.KID, Label: k.Label})
+	}
+	jsonOut(w, map[string]any{"items": out}, 200)
+}
+
 func (a *API) issue(w http.ResponseWriter, r *http.Request) {
 	var in service.IssueRequest
 	if e := decode(r, &in); e != nil {
