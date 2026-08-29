@@ -11,12 +11,42 @@ import (
 	"github.com/drowsylazy/cpa-usage-manager/internal/money"
 )
 
+// 计价币种取值。CNY 规则的价格以 micro-CNY 存储并按锁定汇率折算入账。
+const (
+	PricingCurrencyUSD = "USD"
+	PricingCurrencyCNY = "CNY"
+)
+
 // pricingColumns 是 pricing_rules 表的完整列清单。
 const pricingColumns = `id, match_kind, pattern, priority, enabled,
 	price_input, price_output,
 	price_cache_read, price_cache_creation,
 	accounting_mode, billing_mode, per_image_micro_usd,
+	currency, fx_rate_milli,
 	source, models_dev_id, created_at, updated_at`
+
+// normalizeCurrency 归一币种与锁定汇率：空值回 USD；CNY 必须带合理汇率。
+func normalizeCurrency(r *PricingRule) error {
+	if r.Currency == "" {
+		r.Currency = PricingCurrencyUSD
+	}
+	r.Currency = strings.ToUpper(strings.TrimSpace(r.Currency))
+	if r.RateMilli <= 0 {
+		r.RateMilli = 1000
+	}
+	switch r.Currency {
+	case PricingCurrencyUSD:
+		r.RateMilli = 1000
+	case PricingCurrencyCNY:
+		// 合理区间 0.5..50 CNY/USD，防手滑录入把折算放大成天文数字。
+		if r.RateMilli < 500 || r.RateMilli > 50_000 {
+			return fmt.Errorf("fx_rate_milli 须为汇率×1000（500..50000，如 7160 = 7.16），得到 %d", r.RateMilli)
+		}
+	default:
+		return fmt.Errorf("currency 须为 USD 或 CNY，得到 %q", r.Currency)
+	}
+	return nil
+}
 
 // scanPricingRule 从一行结果扫描 PricingRule。
 func scanPricingRule(sc interface{ Scan(...any) error }) (PricingRule, error) {
@@ -28,10 +58,17 @@ func scanPricingRule(sc interface{ Scan(...any) error }) (PricingRule, error) {
 		&r.ID, &r.MatchKind, &r.Pattern, &r.Priority, &enabled,
 		&in, &out, &cacheRead, &cacheCreate,
 		&r.AccountingMode, &r.BillingMode, &perImage,
+		&r.Currency, &r.RateMilli,
 		&r.Source, &r.ModelsDevID, &created, &updated,
 	)
 	if err != nil {
 		return PricingRule{}, err
+	}
+	if r.Currency == "" {
+		r.Currency = PricingCurrencyUSD
+	}
+	if r.RateMilli <= 0 {
+		r.RateMilli = 1000
 	}
 	r.Enabled = enabled != 0
 	r.PriceInput = money.Price(in)
@@ -106,6 +143,9 @@ func (s *Store) UpsertPricingRule(ctx context.Context, r PricingRule) (PricingRu
 	if err := ValidBillingMode(r.BillingMode); err != nil {
 		return PricingRule{}, err
 	}
+	if err := normalizeCurrency(&r); err != nil {
+		return PricingRule{}, err
+	}
 
 	now := nowMillis()
 	err := s.Write(ctx, func(tx *sql.Tx) error {
@@ -130,6 +170,8 @@ func (s *Store) UpsertPricingRule(ctx context.Context, r PricingRule) (PricingRu
 						accounting_mode      = ?,
 						billing_mode         = ?,
 						per_image_micro_usd  = ?,
+						currency             = ?,
+						fx_rate_milli        = ?,
 						source               = ?,
 						models_dev_id        = ?,
 						updated_at           = ?
@@ -138,6 +180,7 @@ func (s *Store) UpsertPricingRule(ctx context.Context, r PricingRule) (PricingRu
 					int64(r.PriceInput), int64(r.PriceOutput),
 					int64(r.PriceCacheRead), int64(r.PriceCacheCreation),
 					r.AccountingMode, r.BillingMode, int64(r.PerImageMicroUSD),
+					r.Currency, r.RateMilli,
 					r.Source, r.ModelsDevID, now, r.ID); e != nil {
 					return fmt.Errorf("更新计价规则 #%d 失败: %w", r.ID, e)
 				}
@@ -154,8 +197,9 @@ func (s *Store) UpsertPricingRule(ctx context.Context, r PricingRule) (PricingRu
 				price_input, price_output,
 				price_cache_read, price_cache_creation,
 				accounting_mode, billing_mode, per_image_micro_usd,
+				currency, fx_rate_milli,
 				source, models_dev_id, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(match_kind, pattern) DO UPDATE SET
 				priority             = excluded.priority,
 				enabled              = excluded.enabled,
@@ -166,6 +210,8 @@ func (s *Store) UpsertPricingRule(ctx context.Context, r PricingRule) (PricingRu
 				accounting_mode      = excluded.accounting_mode,
 				billing_mode         = excluded.billing_mode,
 				per_image_micro_usd  = excluded.per_image_micro_usd,
+				currency             = excluded.currency,
+				fx_rate_milli        = excluded.fx_rate_milli,
 				source               = excluded.source,
 				models_dev_id        = excluded.models_dev_id,
 				updated_at           = excluded.updated_at`,
@@ -173,6 +219,7 @@ func (s *Store) UpsertPricingRule(ctx context.Context, r PricingRule) (PricingRu
 			int64(r.PriceInput), int64(r.PriceOutput),
 			int64(r.PriceCacheRead), int64(r.PriceCacheCreation),
 			r.AccountingMode, r.BillingMode, int64(r.PerImageMicroUSD),
+			r.Currency, r.RateMilli,
 			r.Source, r.ModelsDevID, now, now)
 		if err != nil {
 			return fmt.Errorf("写入计价规则 %s:%s 失败: %w", r.MatchKind, r.Pattern, err)
@@ -370,8 +417,9 @@ func (s *Store) ReplaceModelsDevRules(ctx context.Context, rules []PricingRule, 
 				price_input, price_output,
 				price_cache_read, price_cache_creation,
 				accounting_mode, billing_mode, per_image_micro_usd,
+				currency, fx_rate_milli,
 				source, models_dev_id, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(match_kind, pattern) DO UPDATE SET
 				priority             = excluded.priority,
 				enabled              = excluded.enabled,
@@ -382,6 +430,8 @@ func (s *Store) ReplaceModelsDevRules(ctx context.Context, rules []PricingRule, 
 				accounting_mode      = excluded.accounting_mode,
 				billing_mode         = excluded.billing_mode,
 				per_image_micro_usd  = excluded.per_image_micro_usd,
+				currency             = excluded.currency,
+				fx_rate_milli        = excluded.fx_rate_milli,
 				models_dev_id        = excluded.models_dev_id,
 				updated_at           = excluded.updated_at`)
 		if perr != nil {
@@ -402,6 +452,8 @@ func (s *Store) ReplaceModelsDevRules(ctx context.Context, rules []PricingRule, 
 				r.BillingMode = BillingModeToken
 			}
 			r.Source = PricingSourceModelsDev
+			r.Currency = PricingCurrencyUSD
+			r.RateMilli = 1000
 			if verr := r.Validate(); verr != nil {
 				return fmt.Errorf("同步项 %s:%s 非法: %w", r.MatchKind, r.Pattern, verr)
 			}
@@ -410,6 +462,7 @@ func (s *Store) ReplaceModelsDevRules(ctx context.Context, rules []PricingRule, 
 				int64(r.PriceInput), int64(r.PriceOutput),
 				int64(r.PriceCacheRead), int64(r.PriceCacheCreation),
 				r.AccountingMode, r.BillingMode, int64(r.PerImageMicroUSD),
+				r.Currency, r.RateMilli,
 				PricingSourceModelsDev, r.ModelsDevID, ts, ts); eerr != nil {
 				return fmt.Errorf("写入同步项 %s:%s 失败: %w", r.MatchKind, r.Pattern, eerr)
 			}

@@ -199,6 +199,14 @@ type PricingRule struct {
 	BillingMode      string      `json:"billing_mode"`
 	PerImageMicroUSD money.Micro `json:"per_image_micro_usd"`
 
+	// Currency 是价格四档与 PerImageMicroUSD 的计价币种：USD（默认）或 CNY。
+	// 价格列以该币种的 micro 单位存储（每百万 token）；结算时按保存时锁定
+	// 的 RateMilli 折算成 micro-USD 入账——账本恒为 USD，不随汇率行情漂移，
+	// 改价需重新保存规则。
+	Currency string `json:"currency"`
+	// RateMilli 是保存时锁定的 USD→CNY 汇率 ×1000（如 7160 = 7.16）；USD 规则恒为 1000。
+	RateMilli int64 `json:"fx_rate_milli"`
+
 	Source      string `json:"source"`
 	ModelsDevID string `json:"models_dev_id,omitempty"`
 

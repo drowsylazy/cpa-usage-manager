@@ -8,7 +8,7 @@ import (
 
 // SchemaVersion 是本代码期望的数据库 schema 版本。
 // 打开库时若发现库版本更高，说明是被更新版插件写过的库，拒绝降级使用。
-const SchemaVersion = 10
+const SchemaVersion = 11
 
 // migration 是一次版本化迁移。
 type migration struct {
@@ -402,6 +402,17 @@ var migrations = []migration{
 			// force = 忽略冷却按原链照打——冷却只是进程内启发式，重启丢失、
 			// 多实例各自独立，宁可赌一次也不把用户请求直接打死。
 			`ALTER TABLE model_routes ADD COLUMN cooldown_policy TEXT NOT NULL DEFAULT 'block'`,
+		},
+	},
+	{
+		version: 11,
+		name:    "pricing_currency",
+		stmts: []string{
+			// ---- 计价规则币种 ----
+			// 部分国内 API 以人民币计价：价格四档以规则币种的 micro 单位存储，
+			// 结算时按保存时锁定的汇率折算成 micro-USD 入账（账本恒为 USD）。
+			`ALTER TABLE pricing_rules ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'`,
+			`ALTER TABLE pricing_rules ADD COLUMN fx_rate_milli INTEGER NOT NULL DEFAULT 1000`,
 		},
 	},
 }

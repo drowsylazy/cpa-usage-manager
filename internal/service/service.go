@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -177,21 +178,21 @@ type Service struct {
 	// 的设置缓存 / LRU 结果缓存 / single-flight 与宿主执行钩子。
 	routeSnap atomic.Pointer[routeSnapshot]
 	// routeReloadMu / pricingReloadMu 合并 TTL 过期瞬间的并发重载（惊群防护）。
-	routeReloadMu    sync.Mutex
-	pricingReloadMu  sync.Mutex
-	coolMu           sync.Mutex
-	cooldowns        map[string]time.Time
+	routeReloadMu   sync.Mutex
+	pricingReloadMu sync.Mutex
+	coolMu          sync.Mutex
+	cooldowns       map[string]time.Time
 
 	judgeCfgMu  sync.Mutex
 	judgeConf   judgeSettings
 	judgeConfAt time.Time
 	// notifyCfg* 是告警设置的 60s TTL 缓存：结算热路径每次都要比对单请求
 	// 异常阈值，不能逐请求读 preferences；SaveNotifySettings 时失效。
-	notifyCfgMu sync.Mutex
-	notifyCfg   *NotifySettings
-	notifyCfgAt time.Time
-	judgeExec   atomic.Pointer[func(ctx context.Context, model string, body []byte) ([]byte, int, error)]
-	judgeFlMu   sync.Mutex
+	notifyCfgMu  sync.Mutex
+	notifyCfg    *NotifySettings
+	notifyCfgAt  time.Time
+	judgeExec    atomic.Pointer[func(ctx context.Context, model string, body []byte) ([]byte, int, error)]
+	judgeFlMu    sync.Mutex
 	judgeFlights map[string]*judgeFlight
 	judgeLRU     *judgeLRU
 	// 评判子调用归属：宿主被动回调据此把无主行记到触发请求的 Key 名下。
@@ -698,12 +699,36 @@ func billableForRule(r store.PricingRule, u usageparse.Usage) usageparse.Billabl
 	return u.Billable()
 }
 
+// usdCost 把按规则币种计的成本折算成 micro-USD 账本口径。CNY 规则的
+// 价格四档以 micro-CNY 存储，按保存时锁定的 fx_rate_milli 折算（ceil），
+// 不随行情漂移；USD 规则原样返回。
+func usdCost(native money.Micro, r store.PricingRule) (money.Micro, error) {
+	if r.Currency != store.PricingCurrencyCNY || r.RateMilli <= 0 || r.RateMilli == 1000 {
+		return native, nil
+	}
+	if native <= 0 {
+		return 0, nil
+	}
+	if uint64(native) > uint64(math.MaxInt64)/1000 {
+		return 0, money.ErrOverflow
+	}
+	q := (uint64(native)*1000 + uint64(r.RateMilli) - 1) / uint64(r.RateMilli)
+	if q > uint64(math.MaxInt64) {
+		return 0, money.ErrOverflow
+	}
+	return money.Micro(q), nil
+}
+
 func costForRule(r store.PricingRule, u usageparse.Usage, images int64) (money.Micro, error) {
 	switch r.BillingMode {
 	case store.BillingModeFree:
 		return 0, nil
 	case store.BillingModePerImage:
-		return multiplyMicro(r.PerImageMicroUSD, images)
+		v, err := multiplyMicro(r.PerImageMicroUSD, images)
+		if err != nil {
+			return 0, err
+		}
+		return usdCost(v, r)
 	}
 	b := billableForRule(r, u)
 	parts := make([]money.Micro, 0, 4)
@@ -717,7 +742,12 @@ func costForRule(r store.PricingRule, u usageparse.Usage, images int64) (money.M
 		}
 		parts = append(parts, v)
 	}
-	return money.SumCeil(parts...)
+	total, err := money.SumCeil(parts...)
+	if err != nil {
+		return 0, err
+	}
+	// CNY 规则：各档先按 micro-CNY 向上取整相加，再按锁定汇率整笔折算成 USD。
+	return usdCost(total, r)
 }
 
 func multiplyMicro(unit money.Micro, count int64) (money.Micro, error) {
