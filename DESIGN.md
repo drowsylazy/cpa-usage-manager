@@ -20,7 +20,8 @@
 - 周期额度按 UTC 自然周期（日/周一起点周一/月）；并发按在途未结请求计数
 - 明文仅签发时返回一次；数据库只存 HMAC 哈希 + 可恢复的 AES-GCM 密文 + pepper ID + 指纹
 - pepper 体系（环境变量 / `key-peppers` 文件 / 自动生成，支持轮换）
-- 审计事件、OAuth 认证额度快照 + 本地用量预测
+- OAuth 认证额度快照 + 本地用量预测
+- 审计事件仅作内部留痕（关键写操作的 `audit_events` 行）；**面向用户的审计功能（审计页、审计导出/归档）已弃用，不再扩展**（2026-08 决策）
 
 ### 1.2 用量统计
 
@@ -185,13 +186,16 @@ RPC schema 1–3 + 原生 ABI 1，schema 协商取 min(host, 自身)。
 
 ### 5.1 管理路由
 
+> 与实现同步于 v0.6.2 后（v0.5 起新增的路由已补记）。所有路由须经
+> `route()` 登记并与 main.go `managementRegistration()` 双向对账。
+
 ```
-health                  GET   状态/版本
+health                  GET   状态/版本/schema/io_retries
 overview                GET   面板总览（keys/pricing/usage 摘要）
 callers                 POST/GET  创建/列出归属
 callers/enabled         POST  启停归属
-keys                    POST  签发（明文仅此一次，Cache-Control: no-store）
-keys                    GET   列出（不含明文）
+keys                    GET   列出（服务端分页 + status 过滤 + status_counts）
+keys/issue              POST  签发（明文仅此一次，Cache-Control: no-store）
 keys/update             POST  更新标签/状态/额度/并发/可用模型
 keys/rotate             POST  轮换（旧 Key 原子失效）
 keys/revoke             POST  撤销
@@ -199,22 +203,34 @@ keys/reveal             POST  解密可恢复密文（no-store）
 keys/delete             POST  永久删除（保留历史）
 pricing                 POST/GET  新增/更新/列出计价规则
 pricing/delete          POST  删除规则
+pricing/search          GET   models.dev 价格簿搜索（10 分钟缓存）
+pricing/reset           POST  清空计价（保留 glob:* 兜底）
 pricing/sync            POST  models.dev 同步（优先级/忽略后缀/显式映射）
-balance                 GET   查询 Key 剩余额度
+model-routes            GET/POST  列出/保存集合别名（规则脚本）
+model-routes/delete     POST  删除集合
+model-routes/judge      POST  评判模型设置
+model-routes/test       POST  规则干跑（不请求目标、不计费）
 usage                   GET   用量流水（按 key_id/model 过滤，分页）
 usage/summary           GET   按 Key/模型汇总
-requests                GET   逐请求明细（分页/排序/筛选）
+usage/dimension         GET   维度聚合（model/key_id/caller/provider/result/...）
+requests                GET   逐请求明细（分页/排序/筛选，/usage 别名）
+routes                  GET   上游路由聚合（按别名×上游真名）
 trends                  GET   聚合趋势（按 分钟/时/日/周/月）
-costs                   GET   费用统计与价格覆盖率
-audit                   GET   审计事件
+costs                   GET   费用统计与价格覆盖率（含未计价模型 Top N）
+balance                 GET   查询 Key 剩余额度
+audit                   GET   审计事件（仅内部留痕读回；审计功能已弃用扩展）
 auth-quotas             GET   OAuth 认证额度快照 + 本地预测（no-store）
-preferences             GET/POST  面板偏好
+preferences             GET/POST  面板偏好（前端 ui_ 前缀键跨设备同步）
 exchange-rate           GET   USD/CNY 汇率（缓存）
-export/csv              POST  导出当前筛选为 CSV
-export/png              POST  导出当前面板为 PNG
+notify*                 GET/POST  通知端点/设置/测试（shoutrrr）
+reports*                GET/POST  定期报告配置/测试（日/周/月）
+export/csv              POST  导出当前筛选为 CSV（requests/dimension/trends/keys/pricing/audit）
+export/png              POST  服务端渲染趋势图为 PNG
 backup                  GET   下载数据库备份（≤64 MiB）
 restore                 POST  分段上传恢复（X-Confirm-Restore: replace）
 reset                   POST  重置统计（body {"confirm":"reset"}）
+maintain                POST  维护（保留期/去重/清扫）
+dedupe                  POST  库内判重对账
 ```
 
 ### 5.2 资源路由
@@ -374,7 +390,7 @@ response_compression_min_bytes: 1024
 
 ### 12.1 数据与语言
 
-- SQLite `model_routes` 表（schema v8）：`alias` NOCASE 唯一、`rule` 脚本文本、`cooldown_seconds`（默认 60）、`pricing_mode`（target|alias）、`enabled`。写后回调失效服务层内存快照（atomic.Pointer + 60s TTL 兜底跨进程改写）。
+- SQLite `model_routes` 表（schema v8）：`alias` NOCASE 唯一、`rule` 脚本文本、`cooldown_seconds`（0=不冷却；面板表单默认预填 60）、`pricing_mode`（target|alias）、`enabled`。写后回调失效服务层内存快照（atomic.Pointer + 60s TTL 兜底跨进程改写）。
 - 规则脚本由 `internal/routelang` 解释（纯 Go 手写 lexer/parser/eval，零依赖）：`when <条件> -> <候选链>` 分支式；候选链构造器 `"模型"` / `priority [...]`（声明序即回退链）/ `weighted {...}`（加权随机，选中者排首其余按权重降序跟随）；无条件兜底分支必填且只能是最后一条；无循环无赋值 ⇒ 求值天然终止。语法错误带行列号供面板定位。
 
 ### 12.2 运行时行为
@@ -382,7 +398,7 @@ response_compression_min_bytes: 1024
 ```
 执行器入口：MatchRoute(剥思考后缀 + EqualFold) → BuildRouteEnv → ResolveChain
 ResolveChain = Eval（ai_judge 失败自动回落兜底分支并记审计）→ 冷却过滤（保序摘除）
-全冷却 → upstream_error 信封；命中 → 预占一次 + 登记认领（别名+全部引用目标含后缀形态的超集）
+全冷却 → upstream_error 信封；命中 → 预占一次 + 登记认领（别名+全部引用目标含后缀形态的超集；斜杠别名不登记别名形态——其归一裸名会与直连流量撞桶，上报匹配实际依赖 refs）
 逐目标尝试：成功/终局失败 → 单行结算（model=别名, upstream_model=成功目标）
             可转移失败 → MarkRouteFail + 审计 route.failover → 换下一目标
 流式仅在首字节前可切换（dialHostStream 窗口）；routeFailureEligible 判定可转移性
@@ -390,7 +406,7 @@ ResolveChain = Eval（ai_judge 失败自动回落兜底分支并记审计）→ 
 
 - **可转移失败**：401/402/403/408/429、5xx、连接类文本错误；404 除 Responses 存储引用（previous_response_id 等）外可转；400/422、context 取消/超时、emit 失败不可转。
 - **计价**：`target` 模式预占按首选目标规则（PricingOverride），结算按实际成功目标（剥后缀）匹配；`alias` 模式全程按别名声价。维度统计恒记别名。
-- **认领防双计**：宿主 usage.handle 上报的目标真名（可能带思考后缀）命中认领则并入业务请求行；judge 调用不登记认领，自然被动入账到评判模型名下。
+- **认领防双计**：宿主 usage.handle 上报的目标真名（可能带思考后缀）命中认领则并入业务请求行。judge 调用以插件自身名义直连宿主、不带密钥头：回调无主，命中 judgeTracker 归属窗口（调用中 + 15s 宽限）时改记到触发 Key 名下并以来源 `ai_judge` 标记（v0.6.1 起）；干跑测试路径不登记归属。
 
 ### 12.3 ai_judge
 
@@ -402,7 +418,7 @@ ResolveChain = Eval（ai_judge 失败自动回落兜底分支并记审计）→ 
 
 ### 12.4 model_registrar
 
-- 能力位 `model_registrar`（quota.enabled 且存在启用路由时声明）；dispatch 新增 `model.register` 方法返回 `{provider, models}`，ModelInfo 字段 PascalCase 无 tag 与宿主对齐（ID/Name/DisplayName=别名原文、Object=model、OwnedBy=cpa-usage-manager、Description=`集合别名 · N 个目标`、UserDefined=true）。旧宿主忽略能力位，静默降级。
+- 能力位 `model_registrar` **恒声明**（quota.enabled 时；勿按「存在启用路由」条件声明——宿主启动时还没有路由则能力位=false，建路由后必须等一次 reconfigure 才会被当作 registrar，这是「别名没进 /v1/models」的实际踩坑路径）；dispatch 新增 `model.register` 方法返回 `{provider, models}`，ModelInfo 字段 PascalCase 无 tag 与宿主对齐（ID/Name/DisplayName=别名原文、Object=model、OwnedBy=cpa-usage-manager、Description=`集合别名 · N 个目标`、UserDefined=true）。空模型列表宿主自动跳过。旧宿主忽略能力位，静默降级。
 
 ### 12.5 已知限制
 

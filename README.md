@@ -3,8 +3,8 @@
 面向 CLIProxyAPI 的 Go `c-shared` 插件。当前实现覆盖 P0–P4 全部功能与 P5 的工程化脚本：
 
 - P0–P2：配置、单一 SQLite 存储（WAL + 单写者租约）、货币与计价、usage 解析、fx
-- P3：c-shared ABI、管理 API 全量路由、密钥/额度/计价/审计/备份恢复/导出
-- P4：`/console` 完整单文件 SPA（7 页签、图表、多语言、密钥全生命周期管理）
+- P3：c-shared ABI、管理 API 全量路由、密钥/额度/计价/备份恢复/导出
+- P4：`/console` 完整单文件 SPA（7 页签、图表、简体中文界面、密钥全生命周期管理）
 - P5：四平台构建脚本、CI 发布、`scripts/abi-smoke.c` 导出符号校验
 
 ## 本地验证
@@ -32,11 +32,13 @@ gcc -O2 -o abi-smoke.exe scripts/abi-smoke.c
 ```
 health / overview / callers / callers/enabled
 keys / keys/issue / keys/update / keys/rotate / keys/reveal / keys/revoke / keys/delete
-pricing / pricing/delete / pricing/sync
+pricing / pricing/delete / pricing/search / pricing/reset / pricing/sync
 model-routes / model-routes/save / model-routes/delete / model-routes/judge / model-routes/test
-usage / usage/summary / usage/dimension / requests / trends / costs / balance
+usage / usage/summary / usage/dimension / requests / trends / costs / balance / routes
 audit / auth-quotas / preferences / exchange-rate
-export/csv / export/png / backup / restore / reset / maintain
+notify / notify/settings / notify/endpoint/save / notify/endpoint/delete / notify/endpoint/test
+reports / reports/save / reports/delete / reports/test
+export/csv / export/png / backup / restore / reset / maintain / dedupe
 ```
 
 资源路由仅 `/v0/resource/plugins/cpa-usage-manager/console`（SPA HTML 壳，不含业务数据）。
@@ -57,7 +59,7 @@ when ai_judge(["simple", "hard"]) == "hard"
 ```
 
 - 变量：`input_tokens`（body 字符数/2+1 封顶估算）、`body_len`、`model`（剥思考后缀）、`stream`、`thinking_effort`、`source`。无循环无赋值，求值必然终止。
-- **failover 与冷却**：可重试失败（401/402/403/408/429/5xx/连接类错误；404 除 Responses 存储类引用外可转）自动换下一健康目标；失败目标进程内冷却 `cooldown_seconds`（默认 60）。流式仅在首字节前切换。
+- **failover 与冷却**：可重试失败（401/402/403/408/429/5xx/连接类错误；404 除 Responses 存储类引用外可转）自动换下一健康目标；失败目标进程内冷却 `cooldown_seconds`（0=不冷却，面板表单默认预填 60）。流式仅在首字节前切换。
 - **ai_judge**：评判模型在「AI 评判设置」配置（存偏好 KV），经宿主正常转发计费；发送脱敏摘要（结构化指标 + 对话文本前 2000 字符），结果缓存 10 分钟；失败/超时回落兜底分支并记审计。
 - **落库与计价**：一次别名请求落单行——`model`=别名、`upstream_model`=实际成功目标；中间尝试只记审计 `route.failover`。计价模式按集合二选一：`target` 按最终成功目标规则（默认）/ `alias` 按别名声价。维度统计恒记别名。
 - **暴露到 `/v1/models`**：启用中的别名经 `model_registrar` 能力位 + `model.register` 方法注册进宿主模型列表（需要较新宿主；旧宿主忽略该能力位，功能静默降级）。宿主在启动、config.yaml 重载、auth 文件变更或管理端保存配置时同步——新建集合后触发其一即可生效。
