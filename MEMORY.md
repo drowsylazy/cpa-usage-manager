@@ -19,6 +19,12 @@
 
 ## Discovered durable knowledge
 
+- **2026-08 请求原生币种入账 + 顶栏改进（schema v12，用户明确要求）**：
+  - **requests 行原生币种入账**：v12 加 `currency` + `cost_native_micro`（CNY 规则存 micro-CNY 原生金额，这是权威入账记录）；`cost_micro_usd` 保留为按规则**锁定汇率**折算的美元等值——额度扣减（plugin_keys 累计器与限额恒 USD）与跨币种聚合（rollups）必须单一口径，¥/$ 无法直接相加，这条不能按用户直觉去掉。costForRule 改返回 (usd, native)；`PriceNative` 供被动路径（main.go 两处 usage.handle 分支）取币种。scanRequest 对 USD 行 CostNativeMicro==0 时回填 = CostMicroUSD（兼容旧行）。
+  - **CSV 导出契约**：requests CSV 头变为 `cost, currency, cost_usd, priced`（cost=原生金额，currency 指明币种，cost_usd=美元等值）。
+  - **顶栏显示币种**改为 .sel 选择框（disp-cur，带「显示币种」文字标签 + title 说明「仅影响显示，不影响额度与计价口径」）；请求明细 CNY 行费用显示 ¥ 原生金额（title 给美元等值），详情弹窗加「计价币种」fact。
+  - **顶栏自动刷新**：bar-tools 里 checkbox + 秒数输入（5..86400，偏好 ui_auto-refresh / ui_auto-refresh-secs），按 interval 调 reloadActive()（document.hidden / app 未登录时跳过）；**替代并移除**了请求明细面板的固定 30s 开关（ui_req-auto 偏新作废）。
+
 - **2026-08 计价币种与构建结论**：
   - **计价币种（schema v11）**：pricing_rules 加 `currency`（USD/CNY）+ `fx_rate_milli`。价格四档与 PerImageMicroUSD 以**规则币种的 micro 单位**存储（CNY 规则即 micro-CNY/百万 token），结算时 `usdCost()` 按**保存时锁定**的汇率整笔 ceil 折算成 micro-USD——账本恒为 USD、不随行情漂移，改价需重存规则。httpapi 对 CNY 且未显式给汇率时用 `svc.ExchangeRate`（永不失败，兜底 7.2）锁定。normalizeCurrency 钳 rate_milli 到 500..50000。models.dev 同步强制 USD/1000。恢复走 `INSERT..SELECT *`，schema 版本强校验意味着旧版本备份不可直接恢复（既有约定）。
   - **面板显示币种**：`disp-cur` 偏好（ui_ 前缀同步），tabs 栏按钮切换；`fmtCur()` 包一层（cny = microUSD×rate 取整后 fmtMoney ¥），仅换展示位（读数/趋势/维度/密钥卡/明细/详情/余额清单），表单回填与限额输入恒 USD；汇率未就绪回退 USD。原「≈ ¥」附注在 cny 模式下跳过避免重复。

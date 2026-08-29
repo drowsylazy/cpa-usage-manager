@@ -118,6 +118,11 @@ h1,h2,h3,p{margin:0}
 .brand-sub{color:var(--fg3);font-size:11px;letter-spacing:.02em}
 /* 工具组紧跟品牌靠左，避开宿主 management.html 右上角的操作按钮区 */
 .bar-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-right:auto}
+.tb-group{display:flex;align-items:center;gap:6px}
+.tb-label{font-size:12px;color:var(--fg3);white-space:nowrap}
+.tb-chk{display:flex;align-items:center;gap:4px;cursor:pointer}
+#auto-refresh-secs{width:62px;padding:5px 8px;border:1px solid var(--line);border-radius:8px;background:var(--sunken);color:var(--fg);font:inherit;font-size:12px}
+#disp-cur .sel-btn{padding:5px 10px;font-size:12px}
 
 .tabs{
   max-width:1480px;margin:0 auto;padding:0 clamp(14px,2.6vw,32px);

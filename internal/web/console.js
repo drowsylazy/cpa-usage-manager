@@ -65,10 +65,6 @@ const fmtCur = micro => {
   if (dispCur !== 'cny' || !fxRateCNY) return fmtUSD(micro);
   return fmtMoney(Math.round(micro * fxRateCNY), '¥');
 };
-function updateDispCurBtn() {
-  const b = $('disp-cur-btn');
-  if (b) { b.textContent = dispCur === 'cny' ? '¥' : '$'; b.classList.toggle('primary', dispCur === 'cny'); }
-}
 async function loadDispCurRate() {
   try {
     const r = await api('/exchange-rate');
@@ -76,13 +72,48 @@ async function loadDispCurRate() {
   } catch (_) { /* 汇率失败保持美元显示 */ }
   if (dispCur === 'cny') reloadActive();
 }
-$('disp-cur-btn').addEventListener('click', () => {
-  dispCur = dispCur === 'usd' ? 'cny' : 'usd';
-  localStorage.setItem('disp-cur', dispCur);
-  savePref('disp-cur', dispCur);
-  updateDispCurBtn();
-  if (dispCur === 'cny' && !fxRateCNY) loadDispCurRate();
+// 显示币种选择框（仅影响展示；账本与额度口径恒为 USD）。
+const dispCurSel = new Select('disp-cur', [
+  { value: 'usd', label: '美元（USD）' },
+  { value: 'cny', label: '人民币（CNY）' },
+], v => {
+  dispCur = v;
+  localStorage.setItem('disp-cur', v);
+  savePref('disp-cur', v);
+  if (v === 'cny' && !fxRateCNY) loadDispCurRate();
   else reloadActive();
+}, { value: dispCur, head: '金额显示币种' });
+
+// ---------- 顶栏自动刷新 ----------
+// 按用户自定义间隔重载当前页签的数据加载器；页面隐藏或未登录时跳过。
+// 替代此前请求明细面板里的固定 30s 开关（ui_req-auto 偏好作废，不再读取）。
+let autoRefreshTimer = null;
+function parseAutoRefreshSecs() {
+  const n = parseInt($('auto-refresh-secs').value, 10);
+  return isFinite(n) ? Math.min(86400, Math.max(5, n)) : 0;
+}
+function setupAutoRefresh() {
+  if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+  if (!$('auto-refresh').checked) return;
+  const secs = parseAutoRefreshSecs();
+  if (!secs) return;
+  autoRefreshTimer = setInterval(() => {
+    if (document.hidden || $('app').hidden) return;
+    reloadActive();
+  }, secs * 1000);
+}
+$('auto-refresh').addEventListener('change', () => {
+  localStorage.setItem('auto-refresh', $('auto-refresh').checked ? '1' : '0');
+  savePref('auto-refresh', $('auto-refresh').checked ? '1' : '0');
+  setupAutoRefresh();
+});
+$('auto-refresh-secs').addEventListener('change', () => {
+  const secs = parseAutoRefreshSecs();
+  if (!secs) return;
+  $('auto-refresh-secs').value = String(secs);
+  localStorage.setItem('auto-refresh-secs', String(secs));
+  savePref('auto-refresh-secs', String(secs));
+  if ($('auto-refresh').checked) setupAutoRefresh();
 });
 function fmtSec(ms) {
   ms = Number(ms) || 0;
@@ -2114,7 +2145,9 @@ const REQ_COLS = [
     tip: '计费四类合计：输入＋输出＋缓存读＋缓存写。与 Token 限额同一口径。',
     cell: x => '<td class="num">' + reqTokenCell(x) + '</td>',
   },
-  { id: 'cost', label: '费用', sort: 'cost', num: true, cell: x => '<td class="num">' + fmtCur(x.cost_micro_usd) + '</td>' },
+  { id: 'cost', label: '费用', sort: 'cost', num: true, cell: x => x.currency === 'CNY'
+      ? '<td class="num" title="人民币计价规则，按保存时锁定汇率折算 $' + fmtUSD(x.cost_micro_usd).slice(1) + '">' + fmtMoney(x.cost_native_micro, '¥') + '</td>'
+      : '<td class="num">' + fmtCur(x.cost_micro_usd) + '</td>' },
   {
     // 排序键指向 latency（总延迟）。旧版把「首字」表头标成 data-sort="latency"，
     // 而 latency 在后端映射到 latency_ms，点「首字」实际按总延迟排 —— 表头与行为不一致。
@@ -2170,24 +2203,6 @@ loaders.usage = async () => {
   stamp();
 };
 
-// 请求明细自动刷新：30s 轮询当前筛选与页码，偏好经 ui_ 前缀同步到服务器。
-// 只在用量页可见时拉数据，切走即停，不产生后台空转。
-let reqAutoTimer = null;
-function setReqAuto(on) {
-  $('req-auto').checked = on;
-  if (reqAutoTimer) { clearInterval(reqAutoTimer); reqAutoTimer = null; }
-  if (on) {
-    reqAutoTimer = setInterval(() => {
-      if ($('view-usage').hidden || document.hidden) return;
-      loadRequests().catch(() => {});
-    }, 30000);
-  }
-}
-$('req-auto').addEventListener('change', () => {
-  setReqAuto($('req-auto').checked);
-  savePref('req-auto', $('req-auto').checked ? '1' : '0');
-});
-setReqAuto(localStorage.getItem('req-auto') === '1');
 let routeRows = [], routePage = 0, routeModel = '';
 const ROUTE_PAGE_SIZE = 5;
 // 必须选中本地别名才展示路由（无「全部」态）；未选时 value='' 显示占位符。
@@ -2491,7 +2506,9 @@ $('req-rows').addEventListener('click', e => {
       + fact('生成耗时', fmtSec(x.generation_ms))
       + fact('TPS', fmtTPS(x.tps_milli))
       + fact('总延迟', fmtSec(x.latency_ms))
-      + fact('费用', fmtCur(x.cost_micro_usd)) + fact('命中计价', x.priced ? '是' : '否')
+      + fact('费用', x.currency === 'CNY' ? fmtMoney(x.cost_native_micro, '¥') + '（≈' + fmtCur(x.cost_micro_usd) + '）' : fmtCur(x.cost_micro_usd))
+    + fact('计价币种', x.currency === 'CNY' ? '人民币（CNY）' : '美元（USD）')
+    + fact('命中计价', x.priced ? '是' : '否')
       + (x.reservation_id ? fact('预占 ID', x.reservation_id) : '')
       + '</div>',
   });
@@ -3540,7 +3557,9 @@ function showApp() {
   syncPrefsFromServer();
   refreshKeys().catch(() => {}); // 预热徽标
   api('/health').then(h => { S.stats = h.stats; updateBadges(); }).catch(() => {});
-  updateDispCurBtn();
+  $('auto-refresh').checked = localStorage.getItem('auto-refresh') === '1';
+  $('auto-refresh-secs').value = localStorage.getItem('auto-refresh-secs') || '30';
+  setupAutoRefresh();
   loadDispCurRate();
   switchTab('overview');
 }
@@ -3551,7 +3570,7 @@ function showApp() {
 // ——列偏好等组件在构造时读 localStorage，重载是让它们吃到服务器值最
 // 稳妥的方式。sessionStorage 标记防重载循环：重载后值已一致即不再触发，
 // 若期间无差异则清掉标记，允许后续再次同步。
-const PREF_KEYS = ['console-range', 'req-cols', 'req-size', 'ov-models-metric', 'ov-keys-metric', 'req-auto', 'disp-cur'];
+const PREF_KEYS = ['console-range', 'req-cols', 'req-size', 'ov-models-metric', 'ov-keys-metric', 'disp-cur', 'auto-refresh', 'auto-refresh-secs'];
 function validPref(k, v) {
   if (v === null || v === undefined || v === '') return false;
   switch (k) {
@@ -3562,10 +3581,14 @@ function validPref(k, v) {
     case 'ov-models-metric':
     case 'ov-keys-metric':
       return ['tokens', 'cost', 'requests'].includes(v);
-    case 'req-auto':
-      return v === '0' || v === '1';
     case 'disp-cur':
       return v === 'usd' || v === 'cny';
+    case 'auto-refresh':
+      return v === '0' || v === '1';
+    case 'auto-refresh-secs': {
+      const n = parseInt(v, 10);
+      return isFinite(n) && n >= 5 && n <= 86400;
+    }
     case 'req-cols': {
       try {
         const arr = JSON.parse(v);
