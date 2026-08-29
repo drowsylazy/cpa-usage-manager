@@ -72,49 +72,6 @@ async function loadDispCurRate() {
   } catch (_) { /* 汇率失败保持美元显示 */ }
   if (dispCur === 'cny') reloadActive();
 }
-// 显示币种选择框（仅影响展示；账本与额度口径恒为 USD）。
-const dispCurSel = new Select('disp-cur', [
-  { value: 'usd', label: '美元（USD）' },
-  { value: 'cny', label: '人民币（CNY）' },
-], v => {
-  dispCur = v;
-  localStorage.setItem('disp-cur', v);
-  savePref('disp-cur', v);
-  if (v === 'cny' && !fxRateCNY) loadDispCurRate();
-  else reloadActive();
-}, { value: dispCur, head: '金额显示币种' });
-
-// ---------- 顶栏自动刷新 ----------
-// 按用户自定义间隔重载当前页签的数据加载器；页面隐藏或未登录时跳过。
-// 替代此前请求明细面板里的固定 30s 开关（ui_req-auto 偏好作废，不再读取）。
-let autoRefreshTimer = null;
-function parseAutoRefreshSecs() {
-  const n = parseInt($('auto-refresh-secs').value, 10);
-  return isFinite(n) ? Math.min(86400, Math.max(5, n)) : 0;
-}
-function setupAutoRefresh() {
-  if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
-  if (!$('auto-refresh').checked) return;
-  const secs = parseAutoRefreshSecs();
-  if (!secs) return;
-  autoRefreshTimer = setInterval(() => {
-    if (document.hidden || $('app').hidden) return;
-    reloadActive();
-  }, secs * 1000);
-}
-$('auto-refresh').addEventListener('change', () => {
-  localStorage.setItem('auto-refresh', $('auto-refresh').checked ? '1' : '0');
-  savePref('auto-refresh', $('auto-refresh').checked ? '1' : '0');
-  setupAutoRefresh();
-});
-$('auto-refresh-secs').addEventListener('change', () => {
-  const secs = parseAutoRefreshSecs();
-  if (!secs) return;
-  $('auto-refresh-secs').value = String(secs);
-  localStorage.setItem('auto-refresh-secs', String(secs));
-  savePref('auto-refresh-secs', String(secs));
-  if ($('auto-refresh').checked) setupAutoRefresh();
-});
 function fmtSec(ms) {
   ms = Number(ms) || 0;
   if (ms <= 0) return '-';
@@ -786,6 +743,50 @@ function confirmSheet(title, note, action) {
     onOk: async () => { await action(); toast('已完成', 'ok'); },
   });
 }
+
+// 显示币种选择框（仅影响展示；账本与额度口径恒为 USD）。
+const dispCurSel = new Select('disp-cur', [
+  { value: 'usd', label: '美元（USD）' },
+  { value: 'cny', label: '人民币（CNY）' },
+], v => {
+  dispCur = v;
+  localStorage.setItem('disp-cur', v);
+  savePref('disp-cur', v);
+  if (v === 'cny' && !fxRateCNY) loadDispCurRate();
+  else reloadActive();
+}, { value: dispCur, head: '金额显示币种' });
+
+// ---------- 顶栏自动刷新 ----------
+// 按用户自定义间隔重载当前页签的数据加载器；页面隐藏或未登录时跳过。
+// 替代此前请求明细面板里的固定 30s 开关（ui_req-auto 偏好作废，不再读取）。
+let autoRefreshTimer = null;
+function parseAutoRefreshSecs() {
+  const n = parseInt($('auto-refresh-secs').value, 10);
+  return isFinite(n) ? Math.min(86400, Math.max(5, n)) : 0;
+}
+function setupAutoRefresh() {
+  if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+  if (!$('auto-refresh').checked) return;
+  const secs = parseAutoRefreshSecs();
+  if (!secs) return;
+  autoRefreshTimer = setInterval(() => {
+    if (document.hidden || $('app').hidden) return;
+    reloadActive();
+  }, secs * 1000);
+}
+$('auto-refresh').addEventListener('change', () => {
+  localStorage.setItem('auto-refresh', $('auto-refresh').checked ? '1' : '0');
+  savePref('auto-refresh', $('auto-refresh').checked ? '1' : '0');
+  setupAutoRefresh();
+});
+$('auto-refresh-secs').addEventListener('change', () => {
+  const secs = parseAutoRefreshSecs();
+  if (!secs) return;
+  $('auto-refresh-secs').value = String(secs);
+  localStorage.setItem('auto-refresh-secs', String(secs));
+  savePref('auto-refresh-secs', String(secs));
+  if ($('auto-refresh').checked) setupAutoRefresh();
+});
 
 // ---------- 页签调度 ----------
 const loaders = {};

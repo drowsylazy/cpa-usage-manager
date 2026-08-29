@@ -19,6 +19,8 @@
 
 ## Discovered durable knowledge
 
+- **console.js 顶层执行顺序 TDZ 陷阱（v0.7.3 白屏实锤，用户浏览器复现）**：`const dispCurSel = new Select(...)` 写在 fmtMoney 附近（76 行），而 `Select`/`CARET`/`savePref` 定义在后面（142/452 行）——顶层代码立即执行时 const 处于暂时性死区，ReferenceError 让整个脚本加载即崩，页面只剩背景。`node --check` 只查语法查不出这种错；gofmt 同理。**规则：所有组件实例化（new Select/Combo）与 DOM 事件绑定必须放在「页签调度」段之前（组件定义全部就绪之后），顶层只放纯数据初始化。** 修复后用 devserver + 浏览器实测登录前后渲染正常（用户明确要求时可用浏览器验证，不受「禁止 playwright」默认规则约束）。
+
 - **2026-08 数据表精简（schema v13）**：
   - **requests 列清单单一来源**：`store.RequestColumns` + `store.ScanRequest` 导出，service 层禁止手抄副本——曾两次实锤副本漂移：service 内联清单漏 currency/cost_native（v12 引入即丢字段），store 的 requestColumns 竟一直缺 `upstream_model`（v5 加列只改了 service 副本，GetRequest 从未返回过 UpstreamModel）。改列必须只动 requestColumns+scanRequest 一处。
   - **认证额度功能整体移除（v13 DROP）**：auth_quota_snapshots / auth_quota_window_baselines 自 v0.1 起无任何写入方（宿主无推送回调），页签永远为空。已删 store/authquota.go、service.AuthQuotas、/auth-quotas 端点与双注册、面板 tab-auth/view-auth/loader 与 auth-* CSS；snapshotTables 同步移除（旧备份含这两表会被 schema 版本强校验拒绝，属既有约定）。设计文档曾把「OAuth 认证额度快照」列为 P0 特性但从未接线——以后接类似宿主推送特性时，先确认宿主侧真的有回调再建表。
