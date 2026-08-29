@@ -420,7 +420,7 @@ func (s *Service) ExportPNG(ctx context.Context, w io.Writer, req ExportRequest)
 	}
 	spec.Subtitle = chartSubtitle(f, len(spec.Values))
 
-	name := fmt.Sprintf("cpa-usage-manager_%s_%s.png", kind, time.Now().UTC().Format("20060102-150405"))
+	name := exportFileName(kind, f, "png")
 	img := renderChart(spec, 1280, 720)
 	if err := png.Encode(w, img); err != nil {
 		return "", err

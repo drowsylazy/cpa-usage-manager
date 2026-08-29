@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -871,14 +872,15 @@ func (a *API) exportCSV(w http.ResponseWriter, r *http.Request) {
 		jsonOut(w, map[string]string{"error": e.Error()}, 400)
 		return
 	}
-	noStore(w)
-	name, e := a.svc.ExportCSV(r.Context(), w, in)
-	if e != nil {
-		jsonOut(w, map[string]string{"error": e.Error()}, 500)
-		return
-	}
-	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	// 头必须先于首写设置：首次写入即快照 header，之后再设会被丢弃。
+	name, ct := a.svc.ExportTarget(in, false)
+	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	noStore(w)
+	if _, e := a.svc.ExportCSV(r.Context(), w, in); e != nil {
+		// 头已提交（attachment + CSV），错误响应无法改写为 JSON，只记日志。
+		log.Printf("[cpa-usage-manager] export csv: %v", e)
+	}
 }
 func (a *API) exportPNG(w http.ResponseWriter, r *http.Request) {
 	var in service.ExportRequest
@@ -886,14 +888,13 @@ func (a *API) exportPNG(w http.ResponseWriter, r *http.Request) {
 		jsonOut(w, map[string]string{"error": e.Error()}, 400)
 		return
 	}
-	noStore(w)
-	name, e := a.svc.ExportPNG(r.Context(), w, in)
-	if e != nil {
-		jsonOut(w, map[string]string{"error": e.Error()}, 500)
-		return
-	}
-	w.Header().Set("Content-Type", "image/png")
+	name, ct := a.svc.ExportTarget(in, true)
+	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	noStore(w)
+	if _, e := a.svc.ExportPNG(r.Context(), w, in); e != nil {
+		log.Printf("[cpa-usage-manager] export png: %v", e)
+	}
 }
 func (a *API) backup(w http.ResponseWriter, r *http.Request) {
 	noStore(w)

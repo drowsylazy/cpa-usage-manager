@@ -264,6 +264,42 @@ type ExportRequest struct {
 	Filter    QueryFilter `json:"filter"`
 }
 
+// exportFileName 构造导出文件名：kind + 时间范围标记（归档后可直接对账，
+// 无范围标记 _all）+ UTC 时间戳。ExportCSV/ExportPNG 与 ExportTarget 共用，
+// 保证头预置的 Content-Disposition 与实际内容一致。
+func exportFileName(kind string, f UsageFilter, ext string) string {
+	rangeTag := ""
+	if !f.From.IsZero() {
+		rangeTag += "_" + f.From.UTC().Format("20060102-1504")
+	}
+	if !f.To.IsZero() {
+		rangeTag += "-" + f.To.UTC().Format("20060102-1504")
+	}
+	if rangeTag == "" {
+		rangeTag = "_all"
+	}
+	return fmt.Sprintf("cpa-usage-manager_%s%s_%s.%s", kind, rangeTag, time.Now().UTC().Format("20060102-150405"), ext)
+}
+
+// ExportTarget 返回导出端点的建议文件名与 Content-Type。HTTP 处理器必须
+// 在写响应体之前设置响应头（首次写入即快照 header，之后再设会被丢弃），
+// 因此文件名要先于 Export 的写入过程算出来。
+func (s *Service) ExportTarget(req ExportRequest, png bool) (string, string) {
+	kind := strings.TrimSpace(req.Kind)
+	if kind == "" {
+		if png {
+			kind = "trends"
+		} else {
+			kind = "requests"
+		}
+	}
+	f := req.Filter.Usage()
+	if png {
+		return exportFileName(kind, f, "png"), "image/png"
+	}
+	return exportFileName(kind, f, "csv"), "text/csv; charset=utf-8"
+}
+
 // ExportCSV 把指定数据集写成 CSV（UTF-8 BOM 开头，便于 Excel 直接打开）。
 // 返回建议的文件名。
 func (s *Service) ExportCSV(ctx context.Context, w io.Writer, req ExportRequest) (string, error) {
@@ -283,7 +319,7 @@ func (s *Service) ExportCSV(ctx context.Context, w io.Writer, req ExportRequest)
 	cw := csv.NewWriter(w)
 	defer cw.Flush()
 
-	name := fmt.Sprintf("cpa-usage-manager_%s_%s.csv", kind, time.Now().UTC().Format("20060102-150405"))
+	name := exportFileName(kind, f, "csv")
 	switch kind {
 	case "requests":
 		// 流式写出：逐行遍历，不把整页请求装载进内存（上限 10 万行时

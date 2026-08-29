@@ -426,6 +426,25 @@ function withStorageHint(msg) {
   return msg;
 }
 const post = (path, body) => api(path, { method: 'POST', body: JSON.stringify(body) });
+// savePref 面板偏好双写：localStorage 即时生效，ui_ 前缀键经 /preferences
+// 同步到服务器（fire-and-forget，失败不影响本地体验）；多设备登录后由
+// syncPrefsFromServer 以服务器值回灌本地（见 showApp）。
+const savePref = (k, v) => {
+  localStorage.setItem(k, v);
+  post('/preferences', { ['ui_' + k]: v }).catch(() => {});
+};
+// downloadFile 下载导出接口返回的二进制流。文件名优先取响应头
+// Content-Disposition（服务端已带 kind 与时间范围标记），无则用 fallback。
+async function downloadFile(path, body, fallbackName) {
+  const r = await api(path, { method: 'POST', body: JSON.stringify(body) });
+  const blob = await r.blob();
+  const m = (r.headers.get('Content-Disposition') || '').match(/filename="([^"]+)"/);
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = m ? m[1] : fallbackName;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
 
 function logout() {
   sessionStorage.removeItem('cpa-management-key');
@@ -538,7 +557,7 @@ function toLocalInput(d) {
     const b = e.target.closest('.pop-item');
     if (!b) return;
     rangeState.id = b.dataset.id;
-    localStorage.setItem('console-range', rangeState.id);
+    savePref('console-range', rangeState.id);
     closeRangePop();
     renderRangeUI();
     reloadActive();
@@ -861,7 +880,7 @@ function bindMetricSeg(id, key, apply) {
     const b = e.target.closest('button[data-m]');
     if (!b || b.dataset.m === ovMetric[key]) return;
     ovMetric[key] = b.dataset.m;
-    localStorage.setItem(id, b.dataset.m);
+    savePref(id, b.dataset.m);
     seg.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
     apply();
   });
@@ -1428,6 +1447,59 @@ function balRow(name, limit, remain, fmt) {
     + '<span class="bal-bar"><span style="width:' + pct.toFixed(1) + '%"></span></span>'
     + '<span class="bal-val mono">余 ' + fmt(Math.max(0, remain)) + ' / ' + fmt(limit) + '</span></div>';
 }
+// burnEtaText 按今日已消耗推算额度触顶时间：日速率 = 今日已用 / 今日已过
+// 比例（UTC 口径，与额度周期一致）。今日无消耗、刚开日不足 5%（外推不可
+// 靠）或余量已为 0 时返回空串——触顶与否进度条自会示警，不重复播报。
+function burnEtaText(lim, used, spentToday) {
+  if (lim === null || lim === undefined || lim <= 0) return '';
+  if (!(spentToday > 0)) return '';
+  const now = new Date();
+  const midnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const elapsed = (Date.now() - midnight) / 864e5;
+  if (elapsed < 0.05) return '';
+  const remain = lim - used;
+  if (remain <= 0) return '';
+  const days = remain / (spentToday / elapsed);
+  if (days >= 365) return '一年以上';
+  if (days < 1) return '今日内';
+  return '约 ' + Math.max(1, Math.round(days)) + ' 天';
+}
+// keyEtaText 汇总金额/Token 两族的触顶预估：档位选取与卡片 usdPick/tokPick
+// 同口径（优先总额，其次当前周期未滚动的日/周/月）。
+function keyEtaText(k) {
+  const c = cycleKeysNow();
+  const today = k.daily_cycle_key === c.daily;
+  const usdToday = today ? k.daily_spent_micro_usd : 0;
+  const tokToday = today ? k.daily_tokens_used : 0;
+  const parts = [];
+  if (k.quota_micro_usd !== null && k.quota_micro_usd !== undefined) {
+    const t = burnEtaText(k.quota_micro_usd, k.spent_micro_usd, usdToday);
+    if (t) parts.push('金额 ' + t);
+  } else if (k.daily_micro_usd !== null && k.daily_micro_usd !== undefined) {
+    const t = burnEtaText(k.daily_micro_usd, usdToday, usdToday);
+    if (t) parts.push('金额 ' + t);
+  } else if (k.weekly_micro_usd !== null && k.weekly_micro_usd !== undefined) {
+    const t = burnEtaText(k.weekly_micro_usd, k.weekly_cycle_key === c.weekly ? k.weekly_spent_micro_usd : 0, usdToday);
+    if (t) parts.push('金额 ' + t);
+  } else if (k.monthly_micro_usd !== null && k.monthly_micro_usd !== undefined) {
+    const t = burnEtaText(k.monthly_micro_usd, k.monthly_cycle_key === c.monthly ? k.monthly_spent_micro_usd : 0, usdToday);
+    if (t) parts.push('金额 ' + t);
+  }
+  if (k.token_limit !== null && k.token_limit !== undefined) {
+    const t = burnEtaText(k.token_limit, k.tokens_used, tokToday);
+    if (t) parts.push('Token ' + t);
+  } else if (k.daily_token_limit !== null && k.daily_token_limit !== undefined) {
+    const t = burnEtaText(k.daily_token_limit, tokToday, tokToday);
+    if (t) parts.push('Token ' + t);
+  } else if (k.weekly_token_limit !== null && k.weekly_token_limit !== undefined) {
+    const t = burnEtaText(k.weekly_token_limit, k.weekly_cycle_key === c.weekly ? k.weekly_tokens_used : 0, tokToday);
+    if (t) parts.push('Token ' + t);
+  } else if (k.monthly_token_limit !== null && k.monthly_token_limit !== undefined) {
+    const t = burnEtaText(k.monthly_token_limit, k.monthly_cycle_key === c.monthly ? k.monthly_tokens_used : 0, tokToday);
+    if (t) parts.push('Token ' + t);
+  }
+  return parts.join(' · ');
+}
 function renderKeys() {
   // 服务端分页：cache 即当前页，total/status_counts 是筛选后的全量口径。
   const rows = keysView.cache;
@@ -1604,9 +1676,11 @@ function renderKeyDialog(k) {
           + '</section>'
         : '');
     const note = $('kd-note');
+    const eta = keyEtaText(k);
     if (note) note.textContent = '在途预占 ' + fmtUSD(b.held_micro_usd || 0)
       + (hasTok ? ' / ' + fmtTok(b.held_tokens) + ' token' : '')
-      + ' · 当前周期 ' + cycleKeysNow().daily;
+      + ' · 当前周期 ' + cycleKeysNow().daily
+      + (eta ? ' · 按今日消耗预计触顶：' + eta : '');
   }).catch(() => { /* 余额核算失败不打断详情 */ });
 }
 
@@ -2202,7 +2276,7 @@ function renderCostCoverage(costs) {
   const rate = S.fx;
   const cny = rate && costs.cost_micro_usd
     ? '¥' + fmtUSD(Math.round(costs.cost_micro_usd * rate.usd_to_cny_micro / 1e6)).slice(1) : '-';
-  $('ov-cost-body').innerHTML = '<div class="kv">'
+  let html = '<div class="kv">'
     + kv('请求总数', fmtInt(costs.requests))
     + kv('已计价请求', fmtInt(costs.priced_requests))
     + kv('价格覆盖率', '<span class="pill ' + (cover >= 90 ? 'live' : cover >= 60 ? 'warn' : 'alarm') + ' mono">' + cover + '%</span>')
@@ -2210,6 +2284,28 @@ function renderCostCoverage(costs) {
     + kv('约合人民币', cny)
     + '</div><p class="note" style="margin-top:10px">未命中价格的请求不计费用；汇率来源 '
     + esc(rate ? rate.source + (rate.fallback ? '（兜底）' : '') : '未知') + '。</p>';
+  // 计价覆盖体检：有流量但落在免费兜底的模型清单，点击跳转请求明细；
+  // 到「价格」页补一条规则即可纳入计费。
+  const up = costs.unpriced_models || [];
+  if (up.length) {
+    html += '<div class="up-head">未计价模型 Top ' + up.length + '</div>'
+      + '<div class="up-list">' + up.map(u =>
+        '<button type="button" class="up-item" data-model="' + esc(u.model) + '"'
+        + ' title="点击查看该模型的请求明细">'
+        + '<span class="mono">' + esc(u.model) + '</span>'
+        + '<span class="mono cell-dim">' + fmtInt(u.requests) + ' 次 · ' + fmtTok(u.total_tokens) + '</span></button>').join('')
+      + '</div><p class="note">以上模型有流量但未命中任何计价规则（免费兜底）；点击模型查看明细，到「价格」页补规则即可纳入计费。</p>';
+  }
+  $('ov-cost-body').innerHTML = html;
+  $('ov-cost-body').querySelectorAll('[data-model]').forEach(b => {
+    b.onclick = () => {
+      const inp = document.querySelector('#req-model input');
+      if (inp) inp.value = b.dataset.model;
+      reqView.model = b.dataset.model;
+      reqView.page = 0;
+      switchTab('usage');
+    };
+  });
 }
 async function loadRequests() {
   const q = new URLSearchParams({
@@ -2250,7 +2346,7 @@ async function loadRequests() {
   if (next) next.onclick = () => { reqView.page++; go(); };
   $('req-pager').querySelectorAll('[data-size]').forEach(b => b.onclick = () => {
     reqView.size = +b.dataset.size;
-    localStorage.setItem('req-size', String(reqView.size));
+    savePref('req-size', String(reqView.size));
     reqView.page = 0;
     go();
   });
@@ -2324,24 +2420,46 @@ const dimSel = new Select('dim', DIMS, () => loadDim().catch(e => toast(e.messag
 new MultiSelect('req-cols', REQ_COLS.map(c => ({ value: c.id, label: c.label, fixed: c.fixed })),
   reqCols, sel => {
     reqCols = new Set(sel);
-    localStorage.setItem('req-cols', JSON.stringify([...sel]));
+    savePref('req-cols', JSON.stringify([...sel]));
     loadRequests().catch(e => toast(e.message, 'err'));
   }, { text: '列', head: '显示列', defaults: REQ_COLS_DEFAULT });
 $('req-export').addEventListener('click', async () => {
   try {
-    const r = await api('/export/csv', {
-      method: 'POST',
-      body: JSON.stringify({
-        kind: 'requests', limit: 50000,
-        filter: Object.assign({ model: reqView.model, key_id: reqView.keyId, result: reqView.result }, rangeParams()),
-      }),
-    });
-    const blob = await r.blob();
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'cpa-usage-manager-requests.csv';
-    a.click();
-    URL.revokeObjectURL(a.href);
+    await downloadFile('/export/csv', {
+      kind: 'requests', limit: 100000,
+      filter: Object.assign({ model: reqView.model, key_id: reqView.keyId, result: reqView.result }, rangeParams()),
+    }, 'cpa-usage-manager-requests.csv');
+    toast('CSV 已导出', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+});
+// 趋势导出：PNG 由服务端渲染（与面板主题、缩放无关），CSV 为聚合数据。
+// 均按当前时间范围与所选粒度/指标取数。
+$('trend-export').addEventListener('click', () => {
+  openSheet({
+    title: '导出趋势数据',
+    okText: '关闭', noFocus: true,
+    body: '<p class="note" style="margin-top:0">按当前时间范围与所选指标导出；PNG 由服务端渲染，与面板主题无关。</p>'
+      + '<div class="btn-row"><button type="button" class="btn" data-exp="png">图表 PNG</button>'
+      + '<button type="button" class="btn" data-exp="csv">数据 CSV</button></div>',
+  });
+  $('sheet-body').querySelectorAll('[data-exp]').forEach(b => {
+    b.onclick = async () => {
+      const fmt = b.dataset.exp === 'png' ? 'png' : 'csv';
+      try {
+        await downloadFile(b.dataset.exp === 'png' ? '/export/png' : '/export/csv', {
+          kind: 'trends', grain: trendGrainSel.value, metric: trendMetricSel.value, filter: rangeParams(),
+        }, 'cpa-usage-manager-trends.' + fmt);
+        toast('已导出', 'ok');
+        animateCloseSheet();
+      } catch (e) { toast(e.message, 'err'); }
+    };
+  });
+});
+$('dim-export').addEventListener('click', async () => {
+  try {
+    await downloadFile('/export/csv', {
+      kind: 'dimension', dimension: dimSel.value, limit: 100000, filter: rangeParams(),
+    }, 'cpa-usage-manager-dimension.csv');
     toast('CSV 已导出', 'ok');
   } catch (e) { toast(e.message, 'err'); }
 });
@@ -3295,9 +3413,57 @@ function showApp() {
   $('gate').hidden = true;
   $('app').hidden = false;
   loadCallers();
+  syncPrefsFromServer();
   refreshKeys().catch(() => {}); // 预热徽标
   api('/health').then(h => { S.stats = h.stats; updateBadges(); }).catch(() => {});
   switchTab('overview');
+}
+
+// ---------- 偏好服务器端同步 ----------
+// 偏好改动经 savePref 双写 localStorage 与 /preferences（ui_ 前缀键）；
+// 登录后拉回服务器值，与本地不一致时以服务器为准写回本地并整页重载一次
+// ——列偏好等组件在构造时读 localStorage，重载是让它们吃到服务器值最
+// 稳妥的方式。sessionStorage 标记防重载循环：重载后值已一致即不再触发，
+// 若期间无差异则清掉标记，允许后续再次同步。
+const PREF_KEYS = ['console-range', 'req-cols', 'req-size', 'ov-models-metric', 'ov-keys-metric'];
+function validPref(k, v) {
+  if (v === null || v === undefined || v === '') return false;
+  switch (k) {
+    case 'console-range':
+      return PRESETS.some(p => p.id === v); // custom 无起止时刻，不做跨设备同步
+    case 'req-size':
+      return ['20', '50', '100'].includes(v);
+    case 'ov-models-metric':
+    case 'ov-keys-metric':
+      return ['tokens', 'cost', 'requests'].includes(v);
+    case 'req-cols': {
+      try {
+        const arr = JSON.parse(v);
+        return Array.isArray(arr) && arr.length > 0 && arr.every(id => REQ_COLS.some(c => c.id === id));
+      } catch (_) { return false; }
+    }
+    default: return false;
+  }
+}
+async function syncPrefsFromServer() {
+  try {
+    const prefs = await api('/preferences');
+    let changed = false;
+    for (const k of PREF_KEYS) {
+      const v = prefs['ui_' + k];
+      if (!validPref(k, v) || localStorage.getItem(k) === v) continue;
+      localStorage.setItem(k, v);
+      changed = true;
+    }
+    if (changed) {
+      if (!sessionStorage.getItem('ui-prefs-reloaded')) {
+        sessionStorage.setItem('ui-prefs-reloaded', '1');
+        location.reload();
+      }
+    } else {
+      sessionStorage.removeItem('ui-prefs-reloaded');
+    }
+  } catch (_) { /* 同步失败不影响本地使用 */ }
 }
 
 // ---------- 启动 ----------
