@@ -468,15 +468,20 @@ func writeCSV(cw *csv.Writer, header []string, n int, row func(i int) []string) 
 var requestCSVHeader = []string{"id", "ts", "key_id", "caller_id", "model", "upstream_model", "provider", "source",
 	"auth_label", "auth_type", "tier", "result", "input_tokens", "output_tokens", "reasoning_tokens",
 	"cached_tokens", "cache_read_tokens", "cache_creation_tokens", "total_tokens",
-	"latency_ms", "ttft_ms", "tps", "thinking_intensity", "cost_usd", "priced"}
+	"latency_ms", "ttft_ms", "tps", "thinking_intensity", "cost", "currency", "cost_usd", "priced"}
 
 func requestCSVRow(r store.Request) []string {
+	currency := r.Currency
+	if currency == "" {
+		currency = "USD"
+	}
 	return []string{r.ID, r.TS.Format(time.RFC3339), r.KeyID, r.CallerID, r.Model, r.UpstreamModel, r.Provider, r.Source,
 		r.AuthLabel, r.AuthType, r.Tier, r.Result,
 		itoa(r.InputTokens), itoa(r.OutputTokens), itoa(r.ReasoningTokens), itoa(r.CachedTokens),
 		itoa(r.CacheReadTokens), itoa(r.CacheCreationTokens), itoa(r.TotalTokens),
 		itoa(r.LatencyMS), itoa(r.TTFTMS), milliString(r.TPSMilli), r.ThinkingIntensity,
-		r.CostMicroUSD.USDString(), strconv.FormatBool(r.Priced)}
+		// cost = 原生币种金额（currency 指明币种），cost_usd = 美元等值（按规则锁定汇率折算）。
+		money.Micro(r.CostNativeMicro).USDString(), currency, r.CostMicroUSD.USDString(), strconv.FormatBool(r.Priced)}
 }
 
 var dimensionCSVHeader = []string{"value", "requests", "failures", "input_tokens", "output_tokens",

@@ -51,15 +51,15 @@ func insertRequestTx(ctx context.Context, s *Store, tx *sql.Tx, r Request) error
 			input_tokens, output_tokens, reasoning_tokens, cached_tokens,
 			cache_read_tokens, cache_creation_tokens, total_tokens,
 			latency_ms, ttft_ms, generation_ms, tps_milli,
-			thinking_intensity, cost_micro_usd, priced, reservation_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			thinking_intensity, cost_micro_usd, currency, cost_native_micro, priced, reservation_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING`,
 		r.ID, r.TS.UTC().UnixMilli(), r.KeyID, r.CallerID, r.Model, r.Provider, r.Source, r.UpstreamModel,
 		r.AuthID, r.AuthLabel, r.AuthType, r.Tier, r.Result,
 		r.InputTokens, r.OutputTokens, r.ReasoningTokens, r.CachedTokens,
 		r.CacheReadTokens, r.CacheCreationTokens, r.TotalTokens,
 		r.LatencyMS, r.TTFTMS, r.GenerationMS, r.TPSMilli,
-		r.ThinkingIntensity, int64(r.CostMicroUSD), boolInt(r.Priced), r.ReservationID)
+		r.ThinkingIntensity, int64(r.CostMicroUSD), nativeCurrency(r), int64(r.CostNativeMicro), boolInt(r.Priced), r.ReservationID)
 	if err != nil {
 		return fmt.Errorf("写入请求记录 %s 失败: %w", r.ID, err)
 	}
@@ -667,7 +667,15 @@ const requestColumns = `id, ts, key_id, caller_id, model, provider, source,
 	input_tokens, output_tokens, reasoning_tokens, cached_tokens,
 	cache_read_tokens, cache_creation_tokens, total_tokens,
 	latency_ms, ttft_ms, generation_ms, tps_milli,
-	thinking_intensity, cost_micro_usd, priced, reservation_id`
+	thinking_intensity, cost_micro_usd, currency, cost_native_micro, priced, reservation_id`
+
+// nativeCurrency 归一请求行的币种：空值视为 USD。
+func nativeCurrency(r Request) string {
+	if r.Currency == "" {
+		return "USD"
+	}
+	return r.Currency
+}
 
 // RedactSource 清洗疑似上游凭据的来源字段。
 // 部分兼容渠道会把上游 API Key 填进 Source；这类值绝不入库/外显：
@@ -699,7 +707,7 @@ func isAlnum(s string) bool {
 // scanRequest 从一行结果扫描 Request。
 func scanRequest(sc interface{ Scan(...any) error }) (Request, error) {
 	var r Request
-	var ts, cost int64
+	var ts, cost, costNative int64
 	var priced int
 	err := sc.Scan(
 		&r.ID, &ts, &r.KeyID, &r.CallerID, &r.Model, &r.Provider, &r.Source,
@@ -707,13 +715,20 @@ func scanRequest(sc interface{ Scan(...any) error }) (Request, error) {
 		&r.InputTokens, &r.OutputTokens, &r.ReasoningTokens, &r.CachedTokens,
 		&r.CacheReadTokens, &r.CacheCreationTokens, &r.TotalTokens,
 		&r.LatencyMS, &r.TTFTMS, &r.GenerationMS, &r.TPSMilli,
-		&r.ThinkingIntensity, &cost, &priced, &r.ReservationID,
+		&r.ThinkingIntensity, &cost, &r.Currency, &costNative, &priced, &r.ReservationID,
 	)
 	if err != nil {
 		return Request{}, err
 	}
 	r.TS = time.UnixMilli(ts).UTC()
 	r.CostMicroUSD = money.Micro(cost)
+	r.CostNativeMicro = money.Micro(costNative)
+	if r.Currency == "" {
+		r.Currency = "USD"
+	}
+	if r.Currency == "USD" && r.CostNativeMicro == 0 {
+		r.CostNativeMicro = r.CostMicroUSD
+	}
 	r.Priced = priced != 0
 	r.Source = RedactSource(r.Source)
 	return r, nil

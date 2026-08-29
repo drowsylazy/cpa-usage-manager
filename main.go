@@ -2080,8 +2080,10 @@ func handleUsage(body []byte) ([]byte, error) {
 		if req.CallerID == "" {
 			req.CallerID = store.DefaultCallerID
 		}
-		if cost, _, perr := svc.Price(req.Model, usageFromRecord(u)); perr == nil {
+		if cost, native, cur, _, perr := svc.PriceNative(req.Model, usageFromRecord(u)); perr == nil {
 			req.CostMicroUSD = cost
+			req.CostNativeMicro = native
+			req.Currency = cur
 		}
 		// 身份已确定，不带判重候选直接落库。
 		if err := st.RecordPassiveUsage(ctx, req, store.PassiveDedupeHint{Near: req.TS}); err != nil {
@@ -2114,8 +2116,10 @@ func handleUsage(body []byte) ([]byte, error) {
 		}
 	}
 	req := usageRecordToRequest(st, u)
-	if cost, _, err := svc.Price(req.Model, usageFromRecord(u)); err == nil {
+	if cost, native, cur, _, err := svc.PriceNative(req.Model, usageFromRecord(u)); err == nil {
 		req.CostMicroUSD = cost
+		req.CostNativeMicro = native
+		req.Currency = cur
 	}
 	// 入库时防重：同一写事务内探测执行器行，命中即合并、不再插行——
 	// 双写重复在落库瞬间被消除，无需任何事后对账。上方的只读预检

@@ -511,17 +511,20 @@ func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req
 	if !priced && s.cfg.Pricing.UnknownPolicy == config.UnknownPolicyDeny && !u.IsZero() {
 		return store.Reservation{}, ErrUnknownPricing
 	}
-	var cost money.Micro
+	var cost, costNative money.Micro
+	var costCurrency string
 	if u.IsZero() {
 		if s.cfg.Quota.Settlement.MissingUsage == config.MissingUsageRelease {
 			return s.st.ReleaseReservation(ctx, id, time.Now())
 		}
-		cost = r.HeldMicroUSD
+		// 上游未回用量：按预占估算（美元口径）入账。
+		cost, costNative, costCurrency = r.HeldMicroUSD, r.HeldMicroUSD, store.PricingCurrencyUSD
 	} else {
-		cost, e = costForRule(rule, u, u.ImageCount)
+		cost, costNative, e = costForRule(rule, u, u.ImageCount)
 		if e != nil {
 			return store.Reservation{}, e
 		}
+		costCurrency = rule.Currency
 	}
 	if req != nil {
 		req.InputTokens = u.InputTokens
@@ -532,6 +535,9 @@ func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req
 		req.CacheCreationTokens = u.CacheCreationTokens
 		req.TotalTokens = u.EffectiveTotal()
 		req.CostMicroUSD = cost
+		// 原生币种入账：requests 行保留计价规则币种的原生金额。
+		req.Currency = costCurrency
+		req.CostNativeMicro = costNative
 		req.Priced = priced
 		// 上游不回 TPS 时按 输出token/生成时长 自算（毫单位整数，避免浮点）。
 		// 宿主把整段响应缓冲后一次转发时 generation 只有几毫秒，算出的 TPS
@@ -678,15 +684,26 @@ func (s *Service) pricingRules(ctx context.Context) ([]store.PricingRule, error)
 	return rules, nil
 }
 func (s *Service) Price(model string, u usageparse.Usage) (money.Micro, bool, error) {
+	usd, _, _, p, e := s.PriceNative(model, u)
+	return usd, p, e
+}
+
+// PriceNative 在 Price 的基础上返回原生币种金额与币种，供被动入库路径把
+// requests 行按计价规则币种入账。
+func (s *Service) PriceNative(model string, u usageparse.Usage) (money.Micro, money.Micro, string, bool, error) {
 	r, p, e := s.matchPricing(context.Background(), model)
 	if e != nil {
-		return 0, false, e
+		return 0, 0, store.PricingCurrencyUSD, false, e
 	}
 	if !p && s.cfg.Pricing.UnknownPolicy == config.UnknownPolicyDeny {
-		return 0, false, ErrUnknownPricing
+		return 0, 0, store.PricingCurrencyUSD, false, ErrUnknownPricing
 	}
-	c, e := costForRule(r, u, u.ImageCount)
-	return c, p, e
+	usd, native, e := costForRule(r, u, u.ImageCount)
+	cur := r.Currency
+	if cur == "" {
+		cur = store.PricingCurrencyUSD
+	}
+	return usd, native, cur, p, e
 }
 
 func billableForRule(r store.PricingRule, u usageparse.Usage) usageparse.Billable {
@@ -719,16 +736,20 @@ func usdCost(native money.Micro, r store.PricingRule) (money.Micro, error) {
 	return money.Micro(q), nil
 }
 
-func costForRule(r store.PricingRule, u usageparse.Usage, images int64) (money.Micro, error) {
+// costForRule 返回 (美元等值, 原生币种金额, error)。CNY 规则的价格四档以
+// micro-CNY 计算，原生金额即 micro-CNY 合计；美元等值按保存时锁定的
+// fx_rate_milli 整笔折算（ceil），供额度扣减与跨币种聚合使用。
+func costForRule(r store.PricingRule, u usageparse.Usage, images int64) (money.Micro, money.Micro, error) {
 	switch r.BillingMode {
 	case store.BillingModeFree:
-		return 0, nil
+		return 0, 0, nil
 	case store.BillingModePerImage:
 		v, err := multiplyMicro(r.PerImageMicroUSD, images)
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
-		return usdCost(v, r)
+		usd, err := usdCost(v, r)
+		return usd, v, err
 	}
 	b := billableForRule(r, u)
 	parts := make([]money.Micro, 0, 4)
@@ -738,16 +759,17 @@ func costForRule(r store.PricingRule, u usageparse.Usage, images int64) (money.M
 	}{{b.Input, r.PriceInput}, {b.Output, r.PriceOutput}, {b.CacheRead, r.PriceCacheRead}, {b.CacheCreation, r.PriceCacheCreation}} {
 		v, err := money.CostForTokens(x.t, x.p)
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		parts = append(parts, v)
 	}
 	total, err := money.SumCeil(parts...)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	// CNY 规则：各档先按 micro-CNY 向上取整相加，再按锁定汇率整笔折算成 USD。
-	return usdCost(total, r)
+	usd, err := usdCost(total, r)
+	return usd, total, err
 }
 
 func multiplyMicro(unit money.Micro, count int64) (money.Micro, error) {

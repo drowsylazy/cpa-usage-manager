@@ -46,6 +46,15 @@ func TestCostForRuleCNYConversion(t *testing.T) {
 		t.Fatalf("1000 token 应折算 %d micro-USD，得到 %d", want, cost)
 	}
 
+	// 原生币种入账口径：PriceNative 返回 micro-CNY 原生金额与币种。
+	_, native, cur, _, err := s.PriceNative("cn-model", usageparse.Usage{InputTokens: 1_000_000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur != store.PricingCurrencyCNY || int64(native) != 2_000_000 {
+		t.Fatalf("原生入账应为 CNY 2000000 micro，得到 %s %d", cur, native)
+	}
+
 	// 汇率越界拒绝。
 	if _, err := st.UpsertPricingRule(ctx, store.PricingRule{
 		MatchKind: store.MatchExact, Pattern: "bad-rate", Priority: 10, Enabled: true,

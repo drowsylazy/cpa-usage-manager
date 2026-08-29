@@ -332,6 +332,12 @@ type Request struct {
 
 	ThinkingIntensity string      `json:"thinking_intensity"`
 	CostMicroUSD      money.Micro `json:"cost_micro_usd"`
+	// Currency / CostNativeMicro 是该请求费用的**原生币种入账**：
+	// 命中 CNY 计价规则时 CostNativeMicro 存 micro-CNY、Currency=CNY，
+	// CostMicroUSD 则是按规则锁定汇率折算的美元等值（供额度扣减与跨币种
+	// 聚合使用）。空币种视为 USD（CostNativeMicro == CostMicroUSD）。
+	Currency        string      `json:"currency"`
+	CostNativeMicro money.Micro `json:"cost_native_micro"`
 	// Priced 标记该请求是否命中了非兜底计价规则（用于价格覆盖率统计）。
 	Priced        bool   `json:"priced"`
 	ReservationID string `json:"reservation_id,omitempty"`
