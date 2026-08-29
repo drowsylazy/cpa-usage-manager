@@ -29,6 +29,10 @@ type astStr struct {
 	v         string
 	line, col int
 }
+type astBool struct {
+	v         bool
+	line, col int
+}
 type astVar struct {
 	name      string
 	line, col int
@@ -51,6 +55,7 @@ type astCall struct {
 
 func (n *astNum) exprPos() (int, int)   { return n.line, n.col }
 func (n *astStr) exprPos() (int, int)   { return n.line, n.col }
+func (n *astBool) exprPos() (int, int)  { return n.line, n.col }
 func (n *astVar) exprPos() (int, int)   { return n.line, n.col }
 func (n *astUnary) exprPos() (int, int) { return n.line, n.col }
 func (n *astBin) exprPos() (int, int)   { return n.line, n.col }
@@ -591,6 +596,10 @@ func (p *parser) parsePrimary() (astExpr, bool, error) {
 		return &astList{items: items, line: sl, col: sc}, false, nil
 	case t.kind == tkIdent:
 		p.next()
+		// 布尔字面量：与请求上下文里的布尔变量（has_tools 等）配合使用。
+		if t.text == "true" || t.text == "false" {
+			return &astBool{v: t.text == "true", line: t.line, col: t.col}, false, nil
+		}
 		if o := p.peek(); o.kind == tkOp && o.text == "(" {
 			p.next()
 			var args []astExpr

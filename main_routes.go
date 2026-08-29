@@ -52,7 +52,7 @@ func resolveRouting(ctx context.Context, svc *service.Service, key *store.Plugin
 	}
 	baseAlias, _ := service.StripThinkingSuffix(req.Model)
 	meta := service.ParseRequestMeta(request)
-	env := svc.BuildRouteEnv(meta, req.Model, stream, req.SourceFormat)
+	env := svc.BuildRouteEnv(meta, req.Model, stream, req.SourceFormat, key)
 	var digestFn func() (string, error)
 	if match.Route.Prog.UsesAI() {
 		digestFn = sync.OnceValues(func() (string, error) { return service.RequestDigest(request), nil })

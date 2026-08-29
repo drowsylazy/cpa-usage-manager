@@ -27,6 +27,8 @@ func evalExpr(ctx context.Context, x astExpr, env *Env) (any, error) {
 		return n.v, nil
 	case *astStr:
 		return n.v, nil
+	case *astBool:
+		return n.v, nil
 	case *astList:
 		return n.items, nil
 	case *astVar:

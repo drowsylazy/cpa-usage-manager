@@ -44,6 +44,15 @@ weighted 约束：权重必须是正数、同一链内模型名不得重复（�
 | `stream` | 布尔 | 是否流式请求 |
 | `thinking_effort` | 字符串 | 取 `reasoning.effort` → `thinking.effort` → `reasoning_effort` 首个非空者；无则为空串 |
 | `source` | 字符串 | 入口格式：`openai` / `claude` / `gemini` / `chat-completions` |
+| `hour` | 整数 | 请求时刻的小时（0–23），按 `quota.cycle_offset_minutes` 偏移后的本地日历取值（480=UTC+8 时即本地钟点） |
+| `weekday` | 整数 | 请求时刻的星期（1=周一 … 7=周日），同一本地日历；工作日分流写作 `weekday >= 1 && weekday <= 5` |
+| `has_tools` | 布尔 | 请求体是否带非空顶层 `tools` 字段（agent/工具调用流量的标志） |
+| `has_system` | 布尔 | 请求体是否带非空顶层 `system`（Claude）或 `systemInstruction`（Gemini）；OpenAI 的 system role 在 messages 数组内，**不**参与探测 |
+| `kid` | 字符串 | 触发请求的插件 Key ID；规则干跑测试中为空串 |
+| `key_label` | 字符串 | 插件 Key 标签；干跑测试中为空串 |
+| `caller_id` | 字符串 | Key 的归属（caller）ID；干跑测试中为空串 |
+
+字面量 `true` / `false` 可直接用于与布尔变量比较（`has_tools == true`、`!has_tools`）。
 
 ### 运算符
 

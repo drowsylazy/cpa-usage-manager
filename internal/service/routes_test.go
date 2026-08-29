@@ -209,7 +209,7 @@ func stubJudge(t *testing.T, s *Service, fn func(model string) (string, error)) 
 }
 
 func judgeEnv(s *Service, model string) *routelang.Env {
-	return s.BuildRouteEnv(ParseRequestMeta([]byte(`{"model":"` + model + `"}`)), model, true, "openai")
+	return s.BuildRouteEnv(ParseRequestMeta([]byte(`{"model":"`+model+`"}`)), model, true, "openai", nil)
 }
 
 func TestAIJudgeEvalWithCache(t *testing.T) {

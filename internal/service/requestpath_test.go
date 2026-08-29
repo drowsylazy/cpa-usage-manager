@@ -205,3 +205,22 @@ func TestParseKeyID(t *testing.T) {
 		t.Fatal("空 secret 不应解析成功")
 	}
 }
+
+func TestParseRequestMetaContextFlags(t *testing.T) {
+	m := ParseRequestMeta([]byte(`{"model":"m","tools":[{"type":"function"}],"system":"你是助手"}`))
+	if !m.HasTools || !m.HasSystem {
+		t.Fatalf("tools/system 应被探测到: %+v", m)
+	}
+	m = ParseRequestMeta([]byte(`{"model":"m","systemInstruction":{"parts":[{"text":"x"}]}}`))
+	if m.HasTools || !m.HasSystem {
+		t.Fatalf("systemInstruction 应算 has_system: %+v", m)
+	}
+	m = ParseRequestMeta([]byte(`{"model":"m","tools":null,"system":[]}`))
+	if m.HasTools || m.HasSystem {
+		t.Fatalf("null/空容器不算存在: %+v", m)
+	}
+	m = ParseRequestMeta([]byte(`{"model":"m"}`))
+	if m.HasTools || m.HasSystem {
+		t.Fatalf("无 tools/system 不应误报: %+v", m)
+	}
+}

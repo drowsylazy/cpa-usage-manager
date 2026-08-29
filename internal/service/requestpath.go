@@ -173,6 +173,17 @@ type RequestMeta struct {
 	Tier            string          `json:"tier"`
 	ReasoningEffort string          `json:"reasoning_effort"`
 
+	// Tools / System / SystemInstruction 只做存在性探测（路由规则的
+	// has_tools / has_system 变量）：RawMessage 零拷贝切片，无额外解析开销。
+	// system 覆盖 Claude 顶层 system 与 Gemini systemInstruction；OpenAI 的
+	// system role 藏在 messages 数组里，不做逐元素重解析（热路径成本），不探测。
+	Tools             json.RawMessage `json:"tools"`
+	System            json.RawMessage `json:"system"`
+	SystemInstruction json.RawMessage `json:"systemInstruction"`
+
+	HasTools  bool
+	HasSystem bool
+
 	MaxTokens        *int64               `json:"max_tokens"`
 	MaxCompletion    *int64               `json:"max_completion_tokens"`
 	MaxOutput        *int64               `json:"max_output_tokens"`
@@ -205,7 +216,17 @@ func ParseRequestMeta(body []byte) RequestMeta {
 	m.Model = strings.TrimSpace(m.Model)
 	m.ResolvedTier = FirstNonEmpty(m.ServiceTier, m.Tier)
 	m.ResolvedThinking = FirstNonEmpty(m.Reasoning.Effort, m.Thinking.Effort, m.ReasoningEffort)
+	m.HasTools = rawNonEmpty(m.Tools)
+	m.HasSystem = rawNonEmpty(m.System) || rawNonEmpty(m.SystemInstruction)
 	return m
+}
+
+// rawNonEmpty 判定 RawMessage 是否承载实际值：null 与缺省/空容器都算空。
+func rawNonEmpty(raw json.RawMessage) bool {
+	if len(raw) <= 2 {
+		return false
+	}
+	return string(raw) != "null"
 }
 
 // tokenEstimates 按锁定决策估算输入/输出上限：输入 body 字符数/2+1，

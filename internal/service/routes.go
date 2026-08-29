@@ -262,7 +262,10 @@ func (s *Service) ResolveChain(ctx context.Context, m RouteMatch, env *routelang
 
 // BuildRouteEnv 构造规则语言的运行时变量集。input_tokens 与预占估算同口径：
 // body 字节数/2+1 封顶 MaxTokenEstimate；model 为请求原名剥思考后缀。
-func (s *Service) BuildRouteEnv(meta RequestMeta, rawModel string, stream bool, source string) *routelang.Env {
+// key 可为 nil（规则干跑测试）：此时 kid/key_label/caller_id 为空串。
+// hour/weekday（1=周一..7=周日）按 quota.cycle_offset_minutes 偏移后的
+// 本地日历取值，与额度周期口径一致。
+func (s *Service) BuildRouteEnv(meta RequestMeta, rawModel string, stream bool, source string, key *store.PluginKey) *routelang.Env {
 	in := int64(meta.BodyLen)/2 + 1
 	if in > s.cfg.Quota.Limits.MaxTokenEstimate {
 		in = s.cfg.Quota.Limits.MaxTokenEstimate
@@ -270,6 +273,15 @@ func (s *Service) BuildRouteEnv(meta RequestMeta, rawModel string, stream bool, 
 	base, _ := StripThinkingSuffix(rawModel)
 	if base == "" {
 		base = meta.Model
+	}
+	local := time.Now().Add(time.Duration(store.CycleOffsetMinutes()) * time.Minute)
+	wd := int(local.Weekday())
+	if wd == 0 {
+		wd = 7 // ISO：周一=1..周日=7（Go 的 Weekday 周日为 0）
+	}
+	kid, keyLabel, callerID := "", "", ""
+	if key != nil {
+		kid, keyLabel, callerID = key.KID, key.Label, key.CallerID
 	}
 	return &routelang.Env{
 		Vars: map[string]any{
@@ -279,6 +291,13 @@ func (s *Service) BuildRouteEnv(meta RequestMeta, rawModel string, stream bool, 
 			"stream":          stream,
 			"thinking_effort": meta.ResolvedThinking,
 			"source":          source,
+			"hour":            int64(local.Hour()),
+			"weekday":         int64(wd),
+			"has_tools":       meta.HasTools,
+			"has_system":      meta.HasSystem,
+			"kid":             kid,
+			"key_label":       keyLabel,
+			"caller_id":       callerID,
 		},
 	}
 }
@@ -423,7 +442,7 @@ func (s *Service) TestRoute(ctx context.Context, in TestRouteRequest) TestRouteR
 		})
 	}
 	rawModel := FirstNonEmpty(strings.TrimSpace(in.Model), in.Alias)
-	env := s.BuildRouteEnv(ParseRequestMeta(body), rawModel, in.Stream, FirstNonEmpty(strings.TrimSpace(in.Source), "openai"))
+	env := s.BuildRouteEnv(ParseRequestMeta(body), rawModel, in.Stream, FirstNonEmpty(strings.TrimSpace(in.Source), "openai"), nil)
 	if prog.UsesAI() && in.RunAI {
 		digest := RequestDigest(body)
 		// 干跑不归属任何 Key：评判调用（若真实执行）的用量保持无主。

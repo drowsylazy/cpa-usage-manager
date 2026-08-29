@@ -224,3 +224,28 @@ func TestEvalStringOpsAndErrors(t *testing.T) {
 		t.Fatalf("跨类型比较应报错: %v", err)
 	}
 }
+
+func TestBoolLiterals(t *testing.T) {
+	src := `
+when has_tools == true || !has_system
+  -> "tool-m"
+when has_tools == false && has_system == false
+  -> "plain-m"
+-> "default-m"
+`
+	vars := map[string]any{"input_tokens": int64(1), "body_len": int64(2), "model": "m",
+		"stream": false, "thinking_effort": "", "source": "openai",
+		"has_tools": true, "has_system": false}
+	chain, fb, err := evalOf(t, src, &Env{Vars: vars})
+	if err != nil || fb || len(chain) != 1 || chain[0] != "tool-m" {
+		t.Fatalf("true/false 字面量分支异常: chain=%v fb=%v err=%v", chain, fb, err)
+	}
+	// has_system == false 命中第二条（第一链未触发短路语义下顺延）。
+	vars2 := map[string]any{"input_tokens": int64(1), "body_len": int64(2), "model": "m",
+		"stream": false, "thinking_effort": "", "source": "openai",
+		"has_tools": false, "has_system": true}
+	chain, _, err = evalOf(t, src, &Env{Vars: vars2})
+	if err != nil || len(chain) != 1 || chain[0] != "default-m" {
+		t.Fatalf("has_system=true 时应落兜底: chain=%v err=%v", chain, err)
+	}
+}
