@@ -361,13 +361,25 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, n C.size_t, out *C.c
 	if request != nil && n > 0 {
 		body = C.GoBytes(unsafe.Pointer(request), C.int(n))
 	}
-	raw, err := dispatch(C.GoString(method), body)
+	raw, err := safeDispatch(C.GoString(method), body)
 	if err != nil {
 		writeResponse(out, errorEnvelope("plugin_error", err.Error()))
 		return 1
 	}
 	writeResponse(out, raw)
 	return 0
+}
+
+// safeDispatch 包住 dispatch：c-shared 库里 Go panic 跨 C 边界是 abort，
+// 会直接击穿宿主进程，任何插件内 panic 都必须折叠成错误信封返回。
+func safeDispatch(method string, body []byte) (raw []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			raw = nil
+			err = fmt.Errorf("plugin panic: %v", r)
+		}
+	}()
+	return dispatch(method, body)
 }
 
 //export cliproxyPluginFree

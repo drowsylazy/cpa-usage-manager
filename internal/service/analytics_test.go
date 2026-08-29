@@ -120,3 +120,41 @@ func TestRouteReportBareNameMerge(t *testing.T) {
 		t.Fatalf("聚合错误: req=%d tok=%d", rows[0].Requests, rows[0].TotalTokens)
 	}
 }
+
+// TestTrendsWeekBucketMonday 锁定周粒度分桶：SQLite 的 weekday 修饰符在日期
+// 已是周一时不前进，旧口径（先 weekday 1 再 -7 days）会把周一的桶退到上一
+// 周；修正后同 ISO 周的周一/周三/周日必须聚成同周一起点的一桶。
+func TestTrendsWeekBucketMonday(t *testing.T) {
+	s, st := testService(t)
+	ctx := context.Background()
+	i, err := s.IssueKey(ctx, IssueRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	monday := time.Date(2026, 8, 24, 10, 3, 0, 0, time.UTC)
+	if monday.Weekday() != time.Monday {
+		t.Fatalf("测试锚点应为周一: %v", monday.Weekday())
+	}
+	ids := []string{"w-mon", "w-wed", "w-sun"}
+	for n, ts := range []time.Time{
+		monday,
+		monday.Add(48 * time.Hour),
+		monday.Add(6 * 24 * time.Hour),
+	} {
+		r := store.Request{ID: ids[n], TS: ts, KeyID: i.KID, CallerID: store.DefaultCallerID, Model: "m", Result: store.ResultOK}
+		if err := st.RecordUsage(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pts, err := s.Trends(ctx, UsageFilter{}, "week")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pts) != 1 {
+		t.Fatalf("同 ISO 周三天应聚成 1 桶，实际 %d 桶: %+v", len(pts), pts)
+	}
+	want := time.Date(2026, 8, 24, 0, 0, 0, 0, time.UTC)
+	if !pts[0].Bucket.Equal(want) {
+		t.Fatalf("周桶应为本周一零点 %v，实际 %v", want, pts[0].Bucket)
+	}
+}

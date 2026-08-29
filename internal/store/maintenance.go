@@ -25,6 +25,9 @@ var snapshotTables = []string{
 	"audit_events",
 	"auth_quota_snapshots",
 	"auth_quota_window_baselines",
+	"model_routes",
+	"notify_endpoints",
+	"report_configs",
 	"preferences",
 	"meta",
 }
@@ -179,6 +182,10 @@ func (s *Store) RestoreFrom(ctx context.Context, src io.Reader, maxBytes int64) 
 		_ = tx.Rollback()
 		return RestoreResult{}, fmt.Errorf("提交恢复事务失败: %w", err)
 	}
+	// 恢复可能替换 pricing_rules / model_routes，必须失效服务层的内存快照，
+	// 否则计价与路由继续用恢复前的旧规则直到下一次写操作。
+	s.notifyPricingChanged()
+	s.notifyRoutesChanged()
 	return out, nil
 }
 
@@ -216,7 +223,8 @@ type ResetOptions struct {
 	Requests bool
 	// Reservations 清空已终结的预占记录（在途预占始终保留）。
 	Reservations bool
-	// KeyCounters 归零 Key 上的累计与周期已用金额。
+	// KeyCounters 归零 Key 上的累计与周期已用金额/Token（两种口径必须同步清，
+	// 归零点不一致会让 Token 限额继续被旧用量占用）。
 	KeyCounters bool
 	// Audit 清空审计事件。
 	Audit bool
@@ -270,6 +278,8 @@ func (s *Store) ResetStatistics(ctx context.Context, opts ResetOptions) (ResetRe
 				daily_cycle_key = '', daily_spent_micro_usd = 0,
 				weekly_cycle_key = '', weekly_spent_micro_usd = 0,
 				monthly_cycle_key = '', monthly_spent_micro_usd = 0,
+				tokens_used = 0,
+				daily_tokens_used = 0, weekly_tokens_used = 0, monthly_tokens_used = 0,
 				updated_at = `+fmt.Sprint(nowMillis())); err != nil {
 				return err
 			}

@@ -59,7 +59,9 @@ func resolveRouting(ctx context.Context, svc *service.Service, key *store.Plugin
 	// 改记密钥，不再以无主「-」行出现在明细里。
 	attr := &service.JudgeAttribution{KID: key.KID, CallerID: key.CallerID}
 	chain, fellBack, cerr := svc.ResolveChain(ctx, match, env, digestFn, attr)
-	if cerr != nil {
+	// cerr 非空但 chain 也非空：ai_judge 失败已回落兜底分支（route.ai_fallback
+	// 审计在 ResolveChain 内落库），请求本身不受阻，按 DESIGN §12.2 继续执行。
+	if cerr != nil && chain == nil {
 		if errors.Is(cerr, service.ErrAllTargetsCooling) {
 			return nil, &routeFailure{"upstream_error", "模型集合 " + baseAlias + " 的候选目标全部冷却中，请稍后重试"}
 		}

@@ -431,6 +431,62 @@ func bucketHasClaim(kid, model string) bool {
 	return false
 }
 
+// TestResolveRoutingAIFallback 锁定 DESIGN §12.2 语义：ai_judge 失败时
+// resolveRouting 必须带着兜底链继续（route.ai_fallback 审计在 ResolveChain
+// 内落库），而不是把随链返回的 AI 错误当作求值失败拒绝整条请求。
+func TestResolveRoutingAIFallback(t *testing.T) {
+	svc, st := routeTestEnv(t)
+	ctx := context.Background()
+	if _, err := st.UpsertPricingRule(ctx, store.PricingRule{MatchKind: store.MatchExact, Pattern: "fb", Priority: 10, Enabled: true, Source: store.PricingSourceManual}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.InsertModelRoute(ctx, store.ModelRoute{Alias: "auto", Rule: `when ai_judge(["simple", "hard"]) == "hard"
+  -> "expensive"
+-> "fb"`, CooldownSeconds: 60, PricingMode: "target", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SaveJudgeSettings(ctx, "judge-model", 3000); err != nil {
+		t.Fatal(err)
+	}
+	svc.SetJudgeExecutor(func(_ context.Context, _ string, _ []byte) ([]byte, int, error) {
+		return nil, 500, errors.New("judge down")
+	})
+	issued, err := svc.IssueKey(ctx, service.IssueRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyRec, err := st.GetKey(ctx, issued.KID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := rpcExecutorRequest{Model: "auto", SourceFormat: "openai", Format: "openai"}
+	request := []byte(`{"model":"auto","messages":[{"role":"user","content":"hi"}]}`)
+
+	re, failure := resolveRouting(ctx, svc, &keyRec, req, request, false)
+	if re == nil || failure != nil {
+		t.Fatalf("AI 失败应回落兜底链继续: re=%v failure=%+v", re, failure)
+	}
+	if !re.fellBack {
+		t.Fatal("fellBack 应为真")
+	}
+	if len(re.chain) != 1 || re.chain[0] != "fb" {
+		t.Fatalf("链应回落为 [fb]: %v", re.chain)
+	}
+	events, err := st.ListAudit(ctx, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range events {
+		if e.Action == "route.ai_fallback" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("缺少 route.ai_fallback 审计")
+	}
+}
+
 // TestSlashAliasClaimExclusion 验证斜杠别名不把别名形态登记进认领桶：
 // 「grp/auto」归一后落在裸名 auto 的桶，若登记会与真实模型 auto 的直连流量互相误吞；
 // refs 的登记不受影响。普通别名维持原行为。

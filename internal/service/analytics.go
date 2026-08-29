@@ -226,8 +226,10 @@ func (s *Service) Trends(ctx context.Context, f UsageFilter, grain string) ([]Tr
 	case "day":
 		seconds = 86400
 	case "week":
-		// ISO 周以周一为起点：先退到当周周一零点。
-		bucketExpr = `CAST(strftime('%s', date(bucket_minute*60, 'unixepoch', 'weekday 1', '-7 days')) AS INTEGER)`
+		// ISO 周以周一为起点。SQLite 的 `weekday N` 只在日期不是 N 时前进，
+		// 先 `weekday 1` 再 `-7 days` 会把周一的桶退到上一个周一；改为先退
+		// 6 天再前进到下一个周一，周一/周日都落在本周起点。
+		bucketExpr = `CAST(strftime('%s', date(bucket_minute*60, 'unixepoch', '-6 days', 'weekday 1')) AS INTEGER)`
 	case "month":
 		bucketExpr = `CAST(strftime('%s', date(bucket_minute*60, 'unixepoch', 'start of month')) AS INTEGER)`
 	default:
