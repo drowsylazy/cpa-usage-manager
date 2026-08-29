@@ -19,6 +19,11 @@
 
 ## Discovered durable knowledge
 
+- **2026-08 计价币种与构建结论**：
+  - **计价币种（schema v11）**：pricing_rules 加 `currency`（USD/CNY）+ `fx_rate_milli`。价格四档与 PerImageMicroUSD 以**规则币种的 micro 单位**存储（CNY 规则即 micro-CNY/百万 token），结算时 `usdCost()` 按**保存时锁定**的汇率整笔 ceil 折算成 micro-USD——账本恒为 USD、不随行情漂移，改价需重存规则。httpapi 对 CNY 且未显式给汇率时用 `svc.ExchangeRate`（永不失败，兜底 7.2）锁定。normalizeCurrency 钳 rate_milli 到 500..50000。models.dev 同步强制 USD/1000。恢复走 `INSERT..SELECT *`，schema 版本强校验意味着旧版本备份不可直接恢复（既有约定）。
+  - **面板显示币种**：`disp-cur` 偏好（ui_ 前缀同步），tabs 栏按钮切换；`fmtCur()` 包一层（cny = microUSD×rate 取整后 fmtMoney ¥），仅换展示位（读数/趋势/维度/密钥卡/明细/详情/余额清单），表单回填与限额输入恒 USD；汇率未就绪回退 USD。原「≈ ¥」附注在 cny 模式下跳过避免重复。
+  - **构建体积实测量级（Go 1.27, c-shared DLL ≈16.7MB）**：`-s -w` 后无符号可查；符号级构成 runtime≈5.8MB + modernc/sqlite≈2.2MB+rodata + shoutrrr 等 github 依赖 1.5MB + type/funcdata 元数据≈2MB，无单一可剔除死重。已测无效：extldflags=-s、osusergo/netgo、-buildid=（KB 级）。采纳：zip -9（Windows 用 .NET ZipArchive Optimal，Compress-Archive 档位不可控）、去除 google/uuid 依赖（service.NewUUID，crypto/rand 16B hex）→ −9KB。UPX（AV 误报+c-shared 风险）与换 mattn/go-sqlite3（重写单写者语义）评估后否决。
+
 - **2026-08 功能批·第二轮持久结论**（8 提交，schema v9+v10）：
   - 冷却是进程内状态器（routes.go cooldowns map）：新增 `MarkRouteSuccess`（流式在 dialOK 时清、非流式在成功结算前清）；429 的 Retry-After（秒数或 HTTP 日期）经 `cooldownSecondsFor` 采用并钳到 1s~10min。ResolveChain 全冷却分支按 `cooldown_policy`：`force` 返回原链照打、`block`（默认）维持 ErrAllTargetsCooling。
   - 单请求异常告警：NotifySettings 新增 single_cost_alert/single_cost_micro_usd/single_token_threshold 三字段；Settle 尾部 `maybeNotifySingleUsage`（设置走 notifySettingsCached 60s TTL 缓存，热路径仅两次比较），命中后 goroutine 异步发送，同 Key 1h 冷却（preferences `notify_single_state`）。httpapi notifySettings 的入参结构体是显式字段清单，加设置字段必须同步补。

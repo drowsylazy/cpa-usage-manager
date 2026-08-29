@@ -54,6 +54,36 @@ function fmtMoney(micro, sym) {
   return (neg ? '-' + sym : sym) + s;
 }
 const fmtPrice = p => (Number(p) || 0) === 0 ? '0' : fmtUSD(p);
+
+// ---------- 显示币种 ----------
+// dispCur 只影响面板展示（账本与限额口径恒为 USD）；cny 按启动时拉取的
+// 汇率折算，汇率未就绪时回退美元。偏好经 ui_disp-cur 跨设备同步。
+let dispCur = localStorage.getItem('disp-cur') === 'cny' ? 'cny' : 'usd';
+let fxRateCNY = 0;
+const fmtCur = micro => {
+  if (micro === null || micro === undefined) return '不限';
+  if (dispCur !== 'cny' || !fxRateCNY) return fmtUSD(micro);
+  return fmtMoney(Math.round(micro * fxRateCNY), '¥');
+};
+function updateDispCurBtn() {
+  const b = $('disp-cur-btn');
+  if (b) { b.textContent = dispCur === 'cny' ? '¥' : '$'; b.classList.toggle('primary', dispCur === 'cny'); }
+}
+async function loadDispCurRate() {
+  try {
+    const r = await api('/exchange-rate');
+    if (r && r.usd_to_cny_micro) fxRateCNY = r.usd_to_cny_micro / 1e6;
+  } catch (_) { /* 汇率失败保持美元显示 */ }
+  if (dispCur === 'cny') reloadActive();
+}
+$('disp-cur-btn').addEventListener('click', () => {
+  dispCur = dispCur === 'usd' ? 'cny' : 'usd';
+  localStorage.setItem('disp-cur', dispCur);
+  savePref('disp-cur', dispCur);
+  updateDispCurBtn();
+  if (dispCur === 'cny' && !fxRateCNY) loadDispCurRate();
+  else reloadActive();
+});
 function fmtSec(ms) {
   ms = Number(ms) || 0;
   if (ms <= 0) return '-';
@@ -841,7 +871,7 @@ function renderReadouts(total, costs) {
   const failRate = total.requests ? (total.failures / total.requests * 100).toFixed(1) + '%' : '0%';
   const cover = costs.requests ? Math.round(costs.priced_requests / costs.requests * 100) : 0;
   const rate = S.fx;
-  const cny = rate && total.cost_micro_usd
+  const cny = dispCur !== 'cny' && rate && total.cost_micro_usd
     ? ' ≈ ¥' + fmtUSD(Math.round(total.cost_micro_usd * rate.usd_to_cny_micro / 1e6)).slice(1) : '';
   const hitPct = cacheHitRate(total);
   $('ov-readouts').innerHTML =
@@ -851,7 +881,7 @@ function renderReadouts(total, costs) {
     + readout('总消耗 Token', effTokens(total).toLocaleString('zh-CN'),
       '输入 <b>' + fmtTok(total.input_tokens) + '</b> · 输出 <b>' + fmtTok(total.output_tokens)
       + '</b> · 缓存命中 <b>' + fmtTok(cacheHit(total)) + '</b>')
-    + readout('总费用', fmtUSD(total.cost_micro_usd),
+    + readout('总费用', fmtCur(total.cost_micro_usd),
       '计价覆盖 <b>' + cover + '%</b>' + esc(cny))
     + readout('缓存命中率', hitPct < 0 ? '—' : hitPct.toFixed(1) + '%',
       '读 <b>' + fmtTok(cacheReadOf(total)) + '</b> · 写 <b>' + fmtTok(total.cache_creation_tokens)
@@ -871,7 +901,7 @@ function metricVal(r, m) {
   return effTokens(r);
 }
 function metricText(v, m) {
-  return m === 'cost' ? fmtUSD(v) : m === 'tokens' ? fmtTok(v) : fmtInt(v);
+  return m === 'cost' ? fmtCur(v) : m === 'tokens' ? fmtTok(v) : fmtInt(v);
 }
 const METRIC_SUBS = { tokens: '按 Token 计量', cost: '按费用计量', requests: '按请求次数计量' };
 function bindMetricSeg(id, key, apply) {
@@ -1191,7 +1221,7 @@ function renderTrend() {
   let grid = '', labels = '';
   const isMoney = defs.some(d => d.money);
   const isTokens = defs.some(d => d.tok);
-  const fmtAxis = v => isMoney ? fmtUSD(v) : isTokens ? fmtTok(v) : fmtInt(v);
+  const fmtAxis = v => isMoney ? fmtCur(v) : isTokens ? fmtTok(v) : fmtInt(v);
   for (let g = 0; g <= 4; g++) {
     const gv = ymax * g / 4, gy = y(gv);
     grid += '<line class="gridline" x1="' + padL + '" y1="' + gy.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + gy.toFixed(1) + '"/>';
@@ -1271,7 +1301,7 @@ function renderTrend() {
     const p = pts[idx];
     let rows = defs.filter(d => d.on).map(d =>
       '<div class="tip-row"><span class="swatch" style="background:' + d.color + '"></span><span>' + d.label
-      + '</span><b>' + (d.money ? fmtUSD(d.val(p)) : d.tok ? fmtTok(d.val(p)) : fmtInt(d.val(p))) + '</b></div>').join('');
+      + '</span><b>' + (d.money ? fmtCur(d.val(p)) : d.tok ? fmtTok(d.val(p)) : fmtInt(d.val(p))) + '</b></div>').join('');
     rows += '<div class="tip-row tip-total"><span></span><span>合计</span><b>' + fmtAxis(stacks[idx]) + '</b></div>';
     tip.innerHTML = '<div class="tip-head">' + esc(bucketLabel(p.bucket, grain)) + '</div>' + rows;
     tip.hidden = false;
@@ -1324,7 +1354,7 @@ function renderTrendTable(pts, defs, grain) {
   const host = $('trend-table');
   host.hidden = false;
   const on = defs.filter(d => d.on);
-  const fmtOf = d => v => d.money ? fmtUSD(v) : d.tok ? fmtTok(v) : fmtInt(v);
+  const fmtOf = d => v => d.money ? fmtCur(v) : d.tok ? fmtTok(v) : fmtInt(v);
   if (!pts.length) {
     host.innerHTML = '<div class="empty"><p class="empty-title">暂无趋势数据</p>'
       + '<p class="empty-hint">所选时间范围与粒度下没有聚合记录</p></div>';
@@ -1565,7 +1595,7 @@ function keyCardHTML(k) {
   const meta = STATUS_META[keyStatus(k)];
   const u = usdPick(k), t = tokPick(k);
   const cells =
-    (u ? keyQuotaCell(u, 'usd', '金额（USD）', fmtUSD) : '')
+    (u ? keyQuotaCell(u, 'usd', '金额', fmtCur) : '')
     + (t ? keyQuotaCell(t, 'tok', 'Token', fmtTok) : '');
   return '<article class="ky-card" data-kid="' + esc(k.kid) + '" role="listitem" tabindex="0">'
     + '<div class="ky-card-top">'
@@ -1578,7 +1608,7 @@ function keyCardHTML(k) {
     + '</div>'
     + (cells
       ? '<div class="ky-split' + (u && t ? '' : ' ky-single') + '">' + cells + '</div>'
-      : '<div class="ky-spent mono">累计已用 ' + fmtUSD(k.spent_micro_usd) + '</div>')
+      : '<div class="ky-spent mono">累计已用 ' + fmtCur(k.spent_micro_usd) + '</div>')
     + '<footer class="ky-meta">'
     + '<span class="ky-pair"><b>' + esc(k.caller_id || '-') + '</b>' + (k.caller_scope === 'key' ? '独立计额' : '归属 caller') + '</span>'
     + '<span>并发 ' + (k.max_concurrent_requests > 0 ? '≤ ' + k.max_concurrent_requests : '不限') + '</span>'
@@ -1672,10 +1702,10 @@ function renderKeyDialog(k) {
     // 字段名必须与 service.Balance 的 JSON tag 一致。结构与骨架一致，原位替换无跳动。
     wrap.innerHTML =
       '<section class="kd-quota-block"><div class="bal-title">金额额度（USD）</div>'
-      + balRow('总额度', k.quota_micro_usd, b.total_remaining_micro_usd, fmtUSD)
-      + balRow('今日', k.daily_micro_usd, b.daily_remaining_micro_usd, fmtUSD)
-      + balRow('本周', k.weekly_micro_usd, b.weekly_remaining_micro_usd, fmtUSD)
-      + balRow('本月', k.monthly_micro_usd, b.monthly_remaining_micro_usd, fmtUSD)
+      + balRow('总额度', k.quota_micro_usd, b.total_remaining_micro_usd, fmtCur)
+      + balRow('今日', k.daily_micro_usd, b.daily_remaining_micro_usd, fmtCur)
+      + balRow('本周', k.weekly_micro_usd, b.weekly_remaining_micro_usd, fmtCur)
+      + balRow('本月', k.monthly_micro_usd, b.monthly_remaining_micro_usd, fmtCur)
       + '</section>'
       + (hasTok
         ? '<section class="kd-quota-block"><div class="bal-title">Token 限额</div>'
@@ -1693,7 +1723,7 @@ function renderKeyDialog(k) {
         : '');
     const note = $('kd-note');
     const eta = keyEtaText(k);
-    if (note) note.textContent = '在途预占 ' + fmtUSD(b.held_micro_usd || 0)
+    if (note) note.textContent = '在途预占 ' + fmtCur(b.held_micro_usd || 0)
       + (hasTok ? ' / ' + fmtTok(b.held_tokens) + ' token' : '')
       + ' · 当前周期 ' + cycleKeysNow().daily
       + (eta ? ' · 按今日消耗预计触顶：' + eta : '');
@@ -2084,7 +2114,7 @@ const REQ_COLS = [
     tip: '计费四类合计：输入＋输出＋缓存读＋缓存写。与 Token 限额同一口径。',
     cell: x => '<td class="num">' + reqTokenCell(x) + '</td>',
   },
-  { id: 'cost', label: '费用', sort: 'cost', num: true, cell: x => '<td class="num">' + fmtUSD(x.cost_micro_usd) + '</td>' },
+  { id: 'cost', label: '费用', sort: 'cost', num: true, cell: x => '<td class="num">' + fmtCur(x.cost_micro_usd) + '</td>' },
   {
     // 排序键指向 latency（总延迟）。旧版把「首字」表头标成 data-sort="latency"，
     // 而 latency 在后端映射到 latency_ms，点「首字」实际按总延迟排 —— 表头与行为不一致。
@@ -2304,7 +2334,7 @@ function renderDim() {
       + '<td class="num">' + fmtInt(row.requests) + '</td>'
       + '<td class="num">' + (row.failures ? '<span class="pill alarm mono">' + fmtInt(row.failures) + '</span>' : '0') + '</td>'
       + '<td class="num">' + fmtTok(effTokens(row)) + '</td>'
-      + '<td class="num">' + fmtUSD(row.cost_micro_usd) + '</td>'
+      + '<td class="num">' + fmtCur(row.cost_micro_usd) + '</td>'
       + '<td class="num">' + (hit >= 0 ? hit.toFixed(1) + '%' : '—') + '</td>'
       + '<td class="num">' + fmtSec(row.latency_avg_ms) + '</td>'
       + '<td class="num">' + fmtTPS(row.tps_avg_milli) + '</td></tr>';
@@ -2341,12 +2371,12 @@ function renderCostCoverage(costs) {
   const cover = costs.requests ? Math.round(costs.priced_requests / costs.requests * 100) : 0;
   const rate = S.fx;
   const cny = rate && costs.cost_micro_usd
-    ? '¥' + fmtUSD(Math.round(costs.cost_micro_usd * rate.usd_to_cny_micro / 1e6)).slice(1) : '-';
+    ? (dispCur === 'cny' ? fmtCur(costs.cost_micro_usd) : '¥' + fmtUSD(Math.round(costs.cost_micro_usd * rate.usd_to_cny_micro / 1e6)).slice(1)) : '-';
   let html = '<div class="kv">'
     + kv('请求总数', fmtInt(costs.requests))
     + kv('已计价请求', fmtInt(costs.priced_requests))
     + kv('价格覆盖率', '<span class="pill ' + (cover >= 90 ? 'live' : cover >= 60 ? 'warn' : 'alarm') + ' mono">' + cover + '%</span>')
-    + kv('总费用', '<b class="mono">' + fmtUSD(costs.cost_micro_usd) + '</b>')
+    + kv('总费用', '<b class="mono">' + fmtCur(costs.cost_micro_usd) + '</b>')
     + kv('约合人民币', cny)
     + '</div><p class="note" style="margin-top:10px">未命中价格的请求不计费用；汇率来源 '
     + esc(rate ? rate.source + (rate.fallback ? '（兜底）' : '') : '未知') + '。</p>';
@@ -2461,7 +2491,7 @@ $('req-rows').addEventListener('click', e => {
       + fact('生成耗时', fmtSec(x.generation_ms))
       + fact('TPS', fmtTPS(x.tps_milli))
       + fact('总延迟', fmtSec(x.latency_ms))
-      + fact('费用', fmtUSD(x.cost_micro_usd)) + fact('命中计价', x.priced ? '是' : '否')
+      + fact('费用', fmtCur(x.cost_micro_usd)) + fact('命中计价', x.priced ? '是' : '否')
       + (x.reservation_id ? fact('预占 ID', x.reservation_id) : '')
       + '</div>',
   });
@@ -3510,6 +3540,8 @@ function showApp() {
   syncPrefsFromServer();
   refreshKeys().catch(() => {}); // 预热徽标
   api('/health').then(h => { S.stats = h.stats; updateBadges(); }).catch(() => {});
+  updateDispCurBtn();
+  loadDispCurRate();
   switchTab('overview');
 }
 
@@ -3519,7 +3551,7 @@ function showApp() {
 // ——列偏好等组件在构造时读 localStorage，重载是让它们吃到服务器值最
 // 稳妥的方式。sessionStorage 标记防重载循环：重载后值已一致即不再触发，
 // 若期间无差异则清掉标记，允许后续再次同步。
-const PREF_KEYS = ['console-range', 'req-cols', 'req-size', 'ov-models-metric', 'ov-keys-metric', 'req-auto'];
+const PREF_KEYS = ['console-range', 'req-cols', 'req-size', 'ov-models-metric', 'ov-keys-metric', 'req-auto', 'disp-cur'];
 function validPref(k, v) {
   if (v === null || v === undefined || v === '') return false;
   switch (k) {
@@ -3532,6 +3564,8 @@ function validPref(k, v) {
       return ['tokens', 'cost', 'requests'].includes(v);
     case 'req-auto':
       return v === '0' || v === '1';
+    case 'disp-cur':
+      return v === 'usd' || v === 'cny';
     case 'req-cols': {
       try {
         const arr = JSON.parse(v);
