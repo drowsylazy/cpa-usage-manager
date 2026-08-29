@@ -162,9 +162,12 @@ type Service struct {
 	lastSweepAt atomic.Int64
 
 	// 集中式预占心跳注册表：所有在途预占共用一个 goroutine 批量续期。
+	// beatsStop 是该 goroutine 的退出通道，由 Close 关闭——reconfigure 换新
+	// Service 时旧循环若不退出，会永久泄漏并反复触碰已关闭的库。
 	beatsMu      sync.Mutex
 	beats        map[string]struct{}
 	beatsStarted bool
+	beatsStop    chan struct{}
 
 	// 鉴权成功的 Key 挂起表：由同一个心跳协程按周期批量刷 last_used_at，
 	// 鉴权热路径上不再出现独立写事务（见 requestpath.go queueKeyTouch）。
@@ -216,13 +219,29 @@ func (s *Service) Config() config.Config {
 func (s *Service) Store() *store.Store { return s.st }
 
 func New(st *store.Store, c config.Config, ps PepperSet) *Service {
-	s := &Service{st: st, cfg: c, peppers: ps}
+	s := &Service{st: st, cfg: c, peppers: ps, beatsStop: make(chan struct{})}
 	st.SetPricingChangeHandler(func() { s.pricingSnap.Store(nil) })
 	// 路由写后即时失效快照；TTL 只兜底跨进程改写。
 	st.SetRoutesChangedHandler(s.invalidateRoutes)
 	s.judgeLRU = newJudgeLRU(judgeCacheMax)
 	s.judgeFlights = make(map[string]*judgeFlight)
 	return s
+}
+
+// Close 停止后台心跳协程（预占续期与 last_used_at 批量落库共用）。
+// reconfigure 构建新 Service 前对旧实例调用；关闭后再启动的心跳循环会
+// 立即退出，不会泄漏。
+func (s *Service) Close() {
+	s.beatsMu.Lock()
+	defer s.beatsMu.Unlock()
+	if s.beatsStop != nil {
+		select {
+		case <-s.beatsStop:
+		default:
+			close(s.beatsStop)
+		}
+		s.beatsStop = nil
+	}
 }
 func (s *Service) pepper(id string) (Pepper, bool) {
 	s.mu.RLock()

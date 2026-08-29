@@ -76,9 +76,21 @@ func (s *Service) TrackReservation(id string) (stop func()) {
 }
 
 func (s *Service) reservationBeatLoop() {
+	s.beatsMu.Lock()
+	stop := s.beatsStop
+	s.beatsMu.Unlock()
+	if stop == nil {
+		// Close 已执行（reconfigure 换新 Service 的竞态尾部）：立即退出。
+		return
+	}
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+		}
 		s.flushKeyTouches()
 		s.beatsMu.Lock()
 		ids := make([]string, 0, len(s.beats))

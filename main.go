@@ -44,6 +44,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -598,13 +599,28 @@ func configure(inline string) error {
 	if runtimeState.st != nil {
 		_ = runtimeState.st.Close()
 	}
+	// 旧 Service 的后台心跳协程必须显式停止：reservationBeatLoop 原本无退出
+	// 通道，reconfigure 换新 Service 后旧循环会永久泄漏并反复触碰已关闭的库。
+	if old := runtimeState.svc; old != nil {
+		old.Close()
+	}
+	// 旧通知循环引用的 svc 包着已关闭的库，无论后面成败都要在这里停下。
+	if runtimeState.notifyStop != nil {
+		close(runtimeState.notifyStop)
+		runtimeState.notifyStop = nil
+	}
+	// 旧库已关、新库未开：失败路径必须把运行态整体置空，让后续请求拿到
+	// 干净的 service_unavailable，而不是对已关闭的库报错——后者会让
+	// usage.handle 的被动记录在 warn 日志之外静默丢失。
 	st, err := store.Open(context.Background(), store.Options{Path: cfg.DatabasePath(), BusyTimeout: cfg.BusyTimeout.Std()})
 	if err != nil {
+		runtimeState.st, runtimeState.svc, runtimeState.api, runtimeState.cfg = nil, nil, nil, config.Config{}
 		return err
 	}
 	ps, err := service.LoadPeppers(cfg, os.LookupEnv)
 	if err != nil {
 		_ = st.Close()
+		runtimeState.st, runtimeState.svc, runtimeState.api, runtimeState.cfg = nil, nil, nil, config.Config{}
 		return err
 	}
 	svc := service.New(st, cfg, ps)
@@ -624,9 +640,6 @@ func configure(inline string) error {
 			svc.NotifyErrorEvent(ctx, "storage", "数据库租约被其他进程接管，本实例已降级为只读模式。")
 		}()
 	})
-	if runtimeState.notifyStop != nil {
-		close(runtimeState.notifyStop)
-	}
 	notifyStop := make(chan struct{})
 	runtimeState.notifyStop = notifyStop
 	go notifySweepLoop(svc, notifyStop)
@@ -1080,6 +1093,10 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 
 	acc := &usageparse.Accumulator{}
 	var firstChunkAt, completedAt time.Time
+	var lastProgress atomic.Int64
+	lastProgress.Store(time.Now().UnixNano())
+	stopWatch := startStreamIdleWatchdog(stream.StreamID, &lastProgress)
+	defer stopWatch()
 	for {
 		chunkRaw, errRead := callHost("host.model.stream_read", rpcHostModelStreamReadRequest{StreamID: stream.StreamID})
 		if errRead != nil {
@@ -1105,6 +1122,7 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 			// 用量逐块增量解析，不在本地留存流副本（旧版曾缓冲整条流用于
 			// 结算兜底，每请求最多数 MB，是内存占用的主要来源）。
 			acc.FeedChunk(chunk.Payload)
+			lastProgress.Store(time.Now().UnixNano())
 			if firstChunkAt.IsZero() {
 				firstChunkAt = time.Now()
 			}
@@ -1162,6 +1180,12 @@ func finishSettle(svc *service.Service, reservation store.Reservation, r *store.
 	_, err := svc.Settle(ctx, reservation.ID, usage, r)
 	if err != nil {
 		// 未落库请求行：放弃认领，宿主回调回落到被动统计，避免用量凭空丢失。
+		// 若认领已先一步收到宿主口径，此刻已无法消费——置 released 后该记录
+		// 若再来会走被动入库，但已 attach 的这份只能丢弃，留日志可查。
+		if rec, ok := claim.wait(0); ok {
+			warnf("结算失败且认领已收到宿主用量（model=%s in=%d out=%d），该口径随放弃认领丢弃: %v",
+				rec.Model, rec.Detail.InputTokens, rec.Detail.OutputTokens, err)
+		}
 		claim.release(0)
 		_, _ = svc.Release(ctx, reservation.ID)
 		return err
@@ -1323,6 +1347,39 @@ func closeHostModelStream(streamID string) error {
 	}
 	_, err := hostCall("host.model.stream_close", rpcHostModelStreamCloseRequest{StreamID: streamID})
 	return err
+}
+
+// streamIdleTimeout 是读泵的无进度守护阈值：超过该时长没收到任何新块、
+// 也没有 done/error，视为宿主侧挂死，主动关闭宿主流以解除阻塞的
+// stream_read。宿主回调是 C ABI 同步调用、无取消语义——不设防的话一次
+// 挂死的 stream_read 会让本 goroutine 卡死，且在途预占被心跳无限续命，
+// stale_reservation_timeout 永远扫不到。阈值取远大于思考模型的合法出块
+// 间隔：只兜「永不返回」的底，不干扰慢流。
+const streamIdleTimeout = 10 * time.Minute
+
+// startStreamIdleWatchdog 启动读泵的无进度守护。progress 由读泵在每收到
+// 一块时刷新（Unix 纳秒，原子）；守护触发即关闭宿主流（应使阻塞中的
+// stream_read 返回错误或 done），随后自行退出。stop 必须在泵返回前调用。
+func startStreamIdleWatchdog(streamID string, progress *atomic.Int64) (stop func()) {
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if time.Since(time.Unix(0, progress.Load())) > streamIdleTimeout {
+					warnf("宿主流 %s 超过 %v 无新数据，主动关闭以解除阻塞的 stream_read", streamID, streamIdleTimeout)
+					_ = closeHostModelStream(streamID)
+					return
+				}
+			}
+		}
+	}()
+	return func() { once.Do(func() { close(done) }) }
 }
 
 // ---------- 请求拦截 / 生命周期（图片/视频路径） ----------
@@ -1544,10 +1601,11 @@ type usageClaim struct {
 	buckets    []*claimBucket
 	registered bool
 
-	mu    sync.Mutex
-	rec   *rpcUsageRecord
-	reqID string
-	ready chan struct{}
+	mu       sync.Mutex
+	released bool
+	rec      *rpcUsageRecord
+	reqID    string
+	ready    chan struct{}
 }
 
 // claimBucket 是同一归一化模型名下的在途认领集合。
@@ -1635,6 +1693,13 @@ func (c *usageClaim) release(delay time.Duration) {
 		time.AfterFunc(delay, func() { c.release(0) })
 		return
 	}
+	// 先在 c.mu 内置 released 再摘桶：与 attach/openFor 同锁互斥，保证
+	// 「选择命中（openFor）→ 交付（attach）」窗口里发生的放弃认领不会让
+	// 交付落在已无人消费的认领上——那会导致宿主用量既不挂请求行也不被动
+	// 入库，凭空丢失。置位后 attach 返回 false，调用方回落被动统计路径。
+	c.mu.Lock()
+	c.released = true
+	c.mu.Unlock()
 	for _, b := range c.buckets {
 		b.mu.Lock()
 		for i, v := range b.claims {
@@ -1661,11 +1726,12 @@ func (c *usageClaim) settled(requestID string) *rpcUsageRecord {
 }
 
 // attach 交付一条宿主用量记录，返回已落库的请求行 ID（尚未结算时为空）。
-// 调用方持有 usageClaimsMu，因此同一认领不会被并发交付两次。
+// 已交付过或已放弃（released）的认领拒绝交付：前者防重复，后者保证放弃后
+// 的宿主回调回落被动统计而不是被吞掉。
 func (c *usageClaim) attach(u rpcUsageRecord) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.rec != nil {
+	if c.rec != nil || c.released {
 		return "", false
 	}
 	rec := u
@@ -1674,11 +1740,11 @@ func (c *usageClaim) attach(u rpcUsageRecord) (string, bool) {
 	return c.reqID, true
 }
 
-// openFor 报告认领在模型 k 的桶中是否仍可吸收回调（未交付过且登记了该模型）。
+// openFor 报告认领在模型 k 的桶中是否仍可吸收回调（未放弃、未交付过且登记了该模型）。
 func (c *usageClaim) openFor(k string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.rec == nil && c.models[k]
+	return !c.released && c.rec == nil && c.models[k]
 }
 
 // wait 等待宿主交付用量，最长 d；d <= 0 时只做一次非阻塞探测。

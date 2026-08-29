@@ -233,6 +233,9 @@ func (s *Store) GetKey(ctx context.Context, kid string) (PluginKey, error) {
 }
 
 // FindKeyByCallerScope 按 caller_scope 读取一个启用中的 Key（caller 归属模式）。
+// 只取 Usable 语义的 Key（启用、未撤销、未过期）：该查询是 model.route 元数据
+// 兜底鉴权的依据，已撤销/禁用/过期的 Key 不能因排序最新而被采信、遮蔽同
+// scope 下较旧的有效 Key。
 func (s *Store) FindKeyByCallerScope(ctx context.Context, scope string) (PluginKey, error) {
 	scope = strings.TrimSpace(scope)
 	if scope == "" {
@@ -242,7 +245,10 @@ func (s *Store) FindKeyByCallerScope(ctx context.Context, scope string) (PluginK
 	err := s.Read(ctx, func(q Querier) error {
 		var e error
 		k, e = scanKey(q.QueryRowContext(ctx,
-			`SELECT `+keyColumns+` FROM plugin_keys WHERE caller_scope = ? ORDER BY created_at DESC, kid LIMIT 1`, scope))
+			`SELECT `+keyColumns+` FROM plugin_keys
+			 WHERE caller_scope = ? AND enabled = 1 AND revoked_at IS NULL
+			   AND (expires_at IS NULL OR expires_at > ?)
+			 ORDER BY created_at DESC, kid LIMIT 1`, scope, nowMillis()))
 		return e
 	})
 	if errors.Is(err, sql.ErrNoRows) {

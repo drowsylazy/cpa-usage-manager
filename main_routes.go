@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/drowsylazy/cpa-usage-manager/internal/config"
@@ -389,6 +390,10 @@ func pumpRoutedStream(re *routedExecution, req rpcExecutorRequest, startedAt tim
 	upstreamFallback := bareTargetName(finalTgt)
 	acc := &usageparse.Accumulator{}
 	var firstChunkAt, completedAt time.Time
+	var lastProgress atomic.Int64
+	lastProgress.Store(time.Now().UnixNano())
+	stopWatch := startStreamIdleWatchdog(stream.StreamID, &lastProgress)
+	defer stopWatch()
 	for {
 		chunkRaw, errRead := hostCall("host.model.stream_read", rpcHostModelStreamReadRequest{StreamID: stream.StreamID})
 		if errRead != nil {
@@ -412,6 +417,7 @@ func pumpRoutedStream(re *routedExecution, req rpcExecutorRequest, startedAt tim
 		}
 		if len(chunk.Payload) > 0 {
 			acc.FeedChunk(chunk.Payload)
+			lastProgress.Store(time.Now().UnixNano())
 			if firstChunkAt.IsZero() {
 				firstChunkAt = time.Now()
 			}
