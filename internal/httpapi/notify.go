@@ -29,16 +29,23 @@ func (a *API) notify(w http.ResponseWriter, r *http.Request) {
 // POST /notify/settings：保存全局设置。
 func (a *API) notifySettings(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Enabled     bool   `json:"enabled"`
-		WarnPct     int    `json:"warn_pct"`
-		ErrorAlerts bool   `json:"error_alerts"`
-		Actor       string `json:"actor"`
+		Enabled              bool   `json:"enabled"`
+		WarnPct              int    `json:"warn_pct"`
+		ErrorAlerts          bool   `json:"error_alerts"`
+		SingleCostAlert      bool   `json:"single_cost_alert"`
+		SingleCostMicroUSD   int64  `json:"single_cost_micro_usd"`
+		SingleTokenThreshold int64  `json:"single_token_threshold"`
+		Actor                string `json:"actor"`
 	}
 	if e := decode(r, &in); e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 400)
 		return
 	}
-	if err := a.svc.SaveNotifySettings(r.Context(), service.NotifySettings{Enabled: in.Enabled, WarnPct: in.WarnPct, ErrorAlerts: in.ErrorAlerts}, in.Actor); err != nil {
+	if err := a.svc.SaveNotifySettings(r.Context(), service.NotifySettings{
+		Enabled: in.Enabled, WarnPct: in.WarnPct, ErrorAlerts: in.ErrorAlerts,
+		SingleCostAlert: in.SingleCostAlert, SingleCostMicroUSD: in.SingleCostMicroUSD,
+		SingleTokenThreshold: in.SingleTokenThreshold,
+	}, in.Actor); err != nil {
 		jsonOut(w, map[string]string{"error": err.Error()}, 400)
 		return
 	}

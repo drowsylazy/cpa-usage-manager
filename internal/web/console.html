@@ -318,6 +318,9 @@
         <label class="check-row"><input type="checkbox" id="nt-enabled"> 额度告警</label>
         <label class="check-row"><input type="checkbox" id="nt-errors"> 错误上报</label>
         <label class="check-row">告警阈值 <input type="number" id="nt-warn" min="1" max="95" step="1" value="20"> %</label>
+        <label class="check-row"><input type="checkbox" id="nt-single"> 单请求异常告警</label>
+        <label class="check-row">费用 ≥ <input type="number" id="nt-single-usd" min="0" step="0.01" placeholder="不限"> $</label>
+        <label class="check-row">Token ≥ <input type="number" id="nt-single-tok" min="0" step="1" placeholder="不限"></label>
         <button type="button" class="btn primary" id="nt-save-btn">保存设置</button>
         <button type="button" class="btn" id="nt-add-btn">新增端点</button>
       </div>

@@ -3118,6 +3118,9 @@ function renderNotify() {
   $('nt-enabled').checked = !!st.enabled;
   $('nt-errors').checked = !!st.error_alerts;
   $('nt-warn').value = st.warn_pct ?? 20;
+  $('nt-single').checked = !!st.single_cost_alert;
+  $('nt-single-usd').value = st.single_cost_micro_usd > 0 ? (st.single_cost_micro_usd / 1e6) : '';
+  $('nt-single-tok').value = st.single_token_threshold > 0 ? st.single_token_threshold : '';
   const eps = notifyCache.endpoints;
   if (!eps.length) {
     $('nt-list').innerHTML = '<p class="note">尚未配置通知端点。</p>';
@@ -3174,11 +3177,16 @@ function openEndpointSheet(ep) {
 $('nt-add-btn').addEventListener('click', () => openEndpointSheet(null));
 $('nt-save-btn').addEventListener('click', async () => {
   const warn = Math.round(Number($('nt-warn').value));
+  const su = Number($('nt-single-usd').value);
+  const stk = Number($('nt-single-tok').value);
   try {
     const r = await post('/notify/settings', {
       enabled: $('nt-enabled').checked,
       error_alerts: $('nt-errors').checked,
       warn_pct: Number.isFinite(warn) && warn > 0 ? warn : 20,
+      single_cost_alert: $('nt-single').checked,
+      single_cost_micro_usd: Number.isFinite(su) && su > 0 ? Math.round(su * 1e6) : 0,
+      single_token_threshold: Number.isFinite(stk) && stk > 0 ? Math.round(stk) : 0,
       actor: 'console',
     });
     notifyCache.settings = r;

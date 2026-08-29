@@ -28,6 +28,13 @@ type NotifySettings struct {
 	WarnPct int `json:"warn_pct"`
 	// ErrorAlerts 开启后，报告发送失败、存储降级等系统错误会经通知端点上报。
 	ErrorAlerts bool `json:"error_alerts"`
+	// SingleCostAlert 开启后，单请求结算的费用或计费 Token 达到阈值即推送
+	// （发现「误把批量任务打到昂贵模型」最快的一类信号；按 Key 每小时限一条）。
+	SingleCostAlert bool `json:"single_cost_alert"`
+	// 单请求费用阈值（micro-USD），0=不按费用判定。
+	SingleCostMicroUSD int64 `json:"single_cost_micro_usd"`
+	// 单请求计费 Token 阈值，0=不按 Token 判定。
+	SingleTokenThreshold int64 `json:"single_token_threshold"`
 }
 
 func defaultNotifySettings() NotifySettings { return NotifySettings{Enabled: false, WarnPct: 20} }
@@ -55,6 +62,12 @@ func (n *NotifySettings) normalize() {
 	if n.WarnPct > 95 {
 		n.WarnPct = 95
 	}
+	if n.SingleCostMicroUSD < 0 {
+		n.SingleCostMicroUSD = 0
+	}
+	if n.SingleTokenThreshold < 0 {
+		n.SingleTokenThreshold = 0
+	}
 }
 
 // SaveNotifySettings 校验并保存设置。
@@ -67,6 +80,9 @@ func (s *Service) SaveNotifySettings(ctx context.Context, in NotifySettings, act
 	if err := s.st.SetPreference(ctx, notifySettingsKey, string(raw)); err != nil {
 		return err
 	}
+	s.notifyCfgMu.Lock()
+	s.notifyCfg = nil
+	s.notifyCfgMu.Unlock()
 	s.st.AppendAudit(ctx, store.AuditEvent{Actor: actor, Action: "notify.settings_save",
 		EntityType: "notify", EntityID: "settings",
 		Detail: map[string]any{"enabled": in.Enabled, "warn_pct": in.WarnPct}})
@@ -256,6 +272,105 @@ func (s *Service) NotifyErrorEvent(ctx context.Context, source, text string) {
 	state[source] = now.Unix()
 	if raw, err := json.Marshal(state); err == nil {
 		_ = s.st.SetPreference(ctx, notifyErrorStateKey, string(raw))
+	}
+}
+
+// ---------- 单请求异常告警 ----------
+
+const notifySingleStateKey = "notify_single_state"
+
+// singleAlertCooldown 是同一 Key 单请求异常告警的最小间隔：批量任务误打到
+// 贵模型往往连续几十笔超标，逐笔推送等于轰炸；每小时提醒一次足以把人引来。
+const singleAlertCooldown = time.Hour
+
+// notifySettingsCached 是 GetNotifySettings 的 60s TTL 缓存。Settle 是
+// 每请求热路径，不能每次都读 preferences；跨进程改写的陈旧窗口由 TTL 兜底
+// （与 routeSnapshot 同一策略）。
+func (s *Service) notifySettingsCached(ctx context.Context) (NotifySettings, error) {
+	s.notifyCfgMu.Lock()
+	if s.notifyCfg != nil && time.Since(s.notifyCfgAt) < 60*time.Second {
+		out := *s.notifyCfg
+		s.notifyCfgMu.Unlock()
+		return out, nil
+	}
+	s.notifyCfgMu.Unlock()
+	cfg, err := s.GetNotifySettings(ctx)
+	if err != nil {
+		return cfg, err
+	}
+	s.notifyCfgMu.Lock()
+	s.notifyCfg, s.notifyCfgAt = &cfg, time.Now()
+	s.notifyCfgMu.Unlock()
+	return cfg, nil
+}
+
+// maybeNotifySingleUsage 是 Settle 结算路径的钩子：命中阈值即异步推送，
+// 判定本身只做两次整数比较（设置走 60s TTL 缓存），不拖慢结算。
+func (s *Service) maybeNotifySingleUsage(kid, model string, cost money.Micro, tokens int64) {
+	cfg, err := s.notifySettingsCached(context.Background())
+	if err != nil || !cfg.SingleCostAlert {
+		return
+	}
+	overCost := cfg.SingleCostMicroUSD > 0 && int64(cost) >= cfg.SingleCostMicroUSD
+	overTok := cfg.SingleTokenThreshold > 0 && tokens >= cfg.SingleTokenThreshold
+	if !overCost && !overTok {
+		return
+	}
+	go s.sendSingleUsageAlert(kid, model, cost, tokens)
+}
+
+// sendSingleUsageAlert 经全部启用端点推送单请求异常（按 Key 每小时限一条）。
+func (s *Service) sendSingleUsageAlert(kid, model string, cost money.Micro, tokens int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if !s.st.Writable() {
+		return
+	}
+	endpoints, err := s.st.ListNotifyEndpoints(ctx)
+	if err != nil {
+		return
+	}
+	var targets []store.NotifyEndpoint
+	for _, e := range endpoints {
+		if e.Enabled {
+			targets = append(targets, e)
+		}
+	}
+	if len(targets) == 0 {
+		return
+	}
+	state := map[string]int64{}
+	if raw, ok, err := s.st.GetPreference(ctx, notifySingleStateKey); err == nil && ok {
+		_ = json.Unmarshal([]byte(raw), &state)
+	}
+	now := time.Now().UTC()
+	if now.Unix()-state[kid] < int64(singleAlertCooldown.Seconds()) {
+		return
+	}
+
+	label := shortKID(kid)
+	if k, err := s.st.GetKey(ctx, kid); err == nil && k.Label != "" {
+		label = k.Label + "（" + shortKID(kid) + "）"
+	}
+	body := fmt.Sprintf("密钥 %s\n模型：%s\n单请求费用：$%s\n单请求计费 Token：%d\n时间：%s",
+		label, model, microUSD(int64(cost)), tokens, now.Format("2006-01-02 15:04 UTC"))
+	for _, e := range targets {
+		if ctx.Err() != nil {
+			return
+		}
+		url, err := s.decryptURL(e.URLEnc)
+		if err != nil {
+			continue
+		}
+		msg := ""
+		if err := shoutrrrSend(url, "CPA 用量异常提醒", body); err != nil {
+			msg = err.Error()
+		}
+		_ = s.st.UpdateNotifyEndpointResult(ctx, e.ID, now, msg)
+	}
+	state[kid] = now.Unix()
+	if raw, err := json.Marshal(state); err == nil {
+		_ = s.st.SetPreference(ctx, notifySingleStateKey, string(raw))
 	}
 }
 

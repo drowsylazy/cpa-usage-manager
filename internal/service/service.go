@@ -186,6 +186,11 @@ type Service struct {
 	judgeCfgMu  sync.Mutex
 	judgeConf   judgeSettings
 	judgeConfAt time.Time
+	// notifyCfg* 是告警设置的 60s TTL 缓存：结算热路径每次都要比对单请求
+	// 异常阈值，不能逐请求读 preferences；SaveNotifySettings 时失效。
+	notifyCfgMu sync.Mutex
+	notifyCfg   *NotifySettings
+	notifyCfgAt time.Time
 	judgeExec   atomic.Pointer[func(ctx context.Context, model string, body []byte) ([]byte, int, error)]
 	judgeFlMu   sync.Mutex
 	judgeFlights map[string]*judgeFlight
@@ -545,6 +550,9 @@ func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req
 	}
 	out, err := s.st.SettleReservation(ctx, id, cost, billableTokens, time.Now(), req,
 		store.AuditEvent{Action: "quota.settle", EntityType: "reservation", EntityID: id, Detail: map[string]any{"cost_micro_usd": cost}})
+	if err == nil {
+		s.maybeNotifySingleUsage(r.KeyID, r.Model, cost, billableTokens)
+	}
 	// 双写防重已前移到 SettleReservation 事务内（入库时探测合并），
 	// 不再有逐请求的事后对账；历史遗留对由 Maintain 的 DedupeRequests 兜底。
 	return out, err

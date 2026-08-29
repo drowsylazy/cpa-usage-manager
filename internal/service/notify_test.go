@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/drowsylazy/cpa-usage-manager/internal/money"
+	"github.com/drowsylazy/cpa-usage-manager/internal/usageparse"
 	"github.com/drowsylazy/cpa-usage-manager/internal/store"
 )
 
@@ -320,5 +321,104 @@ func TestNotifyEndpointEncryptionRoundtrip(t *testing.T) {
 	}
 	if _, err := s.SaveNotifyEndpoint(ctx, 99999, "x", "logger://y", true, "t"); err == nil {
 		t.Fatalf("更新不存在的端点应报错: %v", err)
+	}
+}
+
+func TestNotifySingleUsageAlert(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	var calls []ntCall
+	orig := shoutrrrSend
+	shoutrrrSend = func(url, title, body string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, ntCall{url, title, body})
+		return nil
+	}
+	t.Cleanup(func() { shoutrrrSend = orig })
+
+	if err := s.SaveNotifySettings(ctx, NotifySettings{
+		SingleCostAlert:      true,
+		SingleCostMicroUSD:   1_000_000, // $1
+		SingleTokenThreshold: 10_000,
+	}, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SaveNotifyEndpoint(ctx, 0, "通道", "logger://single", true, "t"); err != nil {
+		t.Fatal(err)
+	}
+	issued, err := s.IssueKey(ctx, IssueRequest{CallerID: store.DefaultCallerID, Label: "异常键", Actor: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 未达阈值：不发送（钩子直接调用，同步可断言）。
+	s.maybeNotifySingleUsage(issued.KID, "gpt-x", money.Micro(500_000), 5_000)
+	mu.Lock()
+	n0 := len(calls)
+	mu.Unlock()
+	if n0 != 0 {
+		t.Fatalf("未达阈值不应发送: %d", n0)
+	}
+
+	// 费用超阈值：结算路径异步发送一条。
+	res, err := s.Reserve(ctx, ReservationRequest{KeyID: issued.KID, CallerID: store.DefaultCallerID, Model: "gpt-x", EstimatedTokens: 12_000, Actor: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage := usageparse.Usage{InputTokens: 6_000, OutputTokens: 6_000, TotalTokens: 12_000}
+	// gpt-x 无计价规则 → 费用 0，靠 Token 阈值触发。
+	if _, err := s.Settle(ctx, res.ID, usage, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor := func(cond func(n int) bool) ntCall {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			mu.Lock()
+			n := len(calls)
+			var c ntCall
+			if n > 0 {
+				c = calls[n-1]
+			}
+			mu.Unlock()
+			if n > 0 && cond(n) {
+				return c
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatal("3s 内未收到告警")
+		return ntCall{}
+	}
+	c := waitFor(func(n int) bool { return n >= 1 })
+	if !strings.Contains(c.title, "异常") || !strings.Contains(c.body, "12000") || !strings.Contains(c.body, "异常键") {
+		t.Fatalf("告警内容不符: %+v", c)
+	}
+
+	// 冷却期内再触发：不再发送。
+	s.maybeNotifySingleUsage(issued.KID, "gpt-x", money.Micro(2_000_000), 20_000)
+	time.Sleep(150 * time.Millisecond)
+	mu.Lock()
+	n1 := len(calls)
+	mu.Unlock()
+	if n1 != 1 {
+		t.Fatalf("冷却期内不应重复发送: %d", n1)
+	}
+
+	// 开关关闭：不发送。
+	if err := s.SaveNotifySettings(ctx, NotifySettings{}, "t"); err != nil {
+		t.Fatal(err)
+	}
+	s.notifyCfgMu.Lock()
+	s.notifyCfg = nil
+	s.notifyCfgMu.Unlock()
+	s.maybeNotifySingleUsage(issued.KID, "gpt-x", money.Micro(2_000_000), 20_000)
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	n2 := len(calls)
+	mu.Unlock()
+	if n2 != 1 {
+		t.Fatalf("开关关闭不应发送: %d", n2)
 	}
 }
