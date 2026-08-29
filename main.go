@@ -1259,31 +1259,131 @@ func requestBody(req rpcExecutorRequest) []byte {
 	return req.Payload
 }
 
-// requestBodyWithStreamUsage 为 OpenAI 系流式请求注入 stream_options.include_usage，
-// 使终止 chunk 携带用量，保证流式结算准确。
+// requestBodyWithStreamUsage 为 OpenAI 系流式请求注入 stream_options.include_usage。
+//
+// 用 json.Decoder 只定位顶层 stream_options 的字节区间，按位置做字节级
+// 拼接：直连流式路径此前对每个请求整包 Unmarshal+Marshal 两个来回（长
+// 上下文请求数 MB，是热路径上最大的无谓分配，且 Marshal 会重排序键并
+// HTML 转义 `<>&`），现在除注入点外原文体逐字节保留。
 func requestBodyWithStreamUsage(body []byte, sourceFormat, outputFormat string) []byte {
 	format := strings.ToLower(service.FirstNonEmpty(outputFormat, sourceFormat))
 	if strings.Contains(format, "claude") || strings.Contains(format, "gemini") {
 		return body
 	}
-	var payload map[string]any
-	if len(body) == 0 || json.Unmarshal(body, &payload) != nil {
+	if len(body) == 0 {
 		return body
 	}
-	options, ok := payload["stream_options"].(map[string]any)
-	if !ok {
-		options = make(map[string]any)
-		payload["stream_options"] = options
+
+	// 找顶层 stream_options 的值区间：optsStart<0 表示顶层没有该键。
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if t, err := dec.Token(); err != nil {
+		return body // 非 JSON 体原样返回
+	} else if d, ok := t.(json.Delim); !ok || d != '{' {
+		return body // 顶层不是对象
 	}
-	if _, exists := options["include_usage"]; exists {
-		return body
+	optsStart, optsEnd := -1, -1
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return body
+		}
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return body
+		}
+		if key, _ := keyTok.(string); key == "stream_options" {
+			optsEnd = int(dec.InputOffset())
+			optsStart = optsEnd - len(raw)
+			break
+		}
 	}
-	options["include_usage"] = true
-	updated, err := json.Marshal(payload)
-	if err != nil {
-		return body
+
+	if optsStart < 0 {
+		// 顶层无 stream_options：在起始 { 后整键插入（空对象不带前导逗号）。
+		i := bytes.IndexByte(body, '{')
+		if i < 0 {
+			return body
+		}
+		j := i + 1
+		for j < len(body) && (body[j] == ' ' || body[j] == '\t' || body[j] == '\n' || body[j] == '\r') {
+			j++
+		}
+		insert := []byte(`"stream_options":{"include_usage":true}`)
+		out := make([]byte, 0, len(body)+len(insert)+1)
+		out = append(out, body[:i+1]...)
+		out = append(out, insert...)
+		if j < len(body) && body[j] != '}' {
+			out = append(out, ',')
+		}
+		return append(out, body[i+1:]...)
 	}
-	return updated
+
+	raw := json.RawMessage(bytes.TrimLeft(body[optsStart:optsEnd], " \t\r\n"))
+	if head, ok := rawObjectHead(raw); ok {
+		// 已是对象：含 include_usage（无论取值）则原样返回，否则在对象
+		// 起始 { 后补键（与旧 map 口径一致——只看键存在性）。
+		if rawObjectHasKey(raw, "include_usage") {
+			return body
+		}
+		insert := []byte(`"include_usage":true`)
+		empty := rawObjectEmpty(raw)
+		out := make([]byte, 0, len(body)+len(insert)+1)
+		out = append(out, body[:optsStart+head+1]...)
+		out = append(out, insert...)
+		if !empty {
+			out = append(out, ',')
+		}
+		return append(out, body[optsStart+head+1:]...)
+	}
+	// stream_options 存在但不是对象（null/标量/数组）：整体替换为对象，
+	// 与旧 map 路径的覆盖行为一致。
+	out := make([]byte, 0, len(body)+len(`{"include_usage":true}`))
+	out = append(out, body[:optsStart]...)
+	out = append(out, `{"include_usage":true}`...)
+	return append(out, body[optsEnd:]...)
+}
+
+// rawObjectHead 报告 raw 以对象起始（返回 { 的偏移）。
+func rawObjectHead(raw []byte) (int, bool) {
+	i := bytes.IndexByte(raw, '{')
+	return i, i >= 0
+}
+
+// rawObjectEmpty 报告 raw 是空对象 {}（允许内部空白）。
+func rawObjectEmpty(raw []byte) bool {
+	i := bytes.IndexByte(raw, '{')
+	if i < 0 {
+		return false
+	}
+	j := i + 1
+	for j < len(raw) && (raw[j] == ' ' || raw[j] == '\t' || raw[j] == '\n' || raw[j] == '\r') {
+		j++
+	}
+	return j < len(raw) && raw[j] == '}'
+}
+
+// rawObjectHasKey 扫描 raw 顶层对象是否含键 want（只扫第一层）。
+func rawObjectHasKey(raw []byte, want string) bool {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if t, err := dec.Token(); err != nil {
+		return false
+	} else if d, ok := t.(json.Delim); !ok || d != '{' {
+		return false
+	}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return false
+		}
+		var skip json.RawMessage
+		if dec.Decode(&skip) != nil {
+			return false
+		}
+		if key, _ := keyTok.(string); key == want {
+			return true
+		}
+	}
+	return false
 }
 
 // notifySweepLoop 每分钟做一次周期扫描：告警（额度越线/密钥过期 → shoutrrr

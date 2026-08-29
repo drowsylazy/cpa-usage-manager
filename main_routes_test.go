@@ -3,9 +3,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -535,4 +537,83 @@ func TestSlashAliasClaimExclusion(t *testing.T) {
 	if !bucketHasClaim(issued.KID, "plain2") || !bucketHasClaim(issued.KID, "t9") {
 		t.Fatal("普通别名的别名形态与 refs 都应登记")
 	}
+}
+
+// TestRequestBodyWithStreamUsage 锁定 include_usage 定点注入的字节级语义：
+// 除注入点外原文体逐字节保留（不再整包 Unmarshal+Marshal——那会重排序键
+// 并 HTML 转义 <>&），并覆盖既有键/已有值/坏 JSON/非对象/空对象等分支。
+func TestRequestBodyWithStreamUsage(t *testing.T) {
+	validate := func(t *testing.T, out []byte) map[string]any {
+		t.Helper()
+		var m map[string]any
+		if json.Unmarshal(out, &m) != nil {
+			t.Fatalf("输出应为合法 JSON: %s", out)
+		}
+		return m
+	}
+
+	t.Run("无 stream_options 时整键注入", func(t *testing.T) {
+		body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi<&>"}],"stream":true}`)
+		out := requestBodyWithStreamUsage(body, "openai", "openai")
+		m := validate(t, out)
+		opts, _ := m["stream_options"].(map[string]any)
+		if opts == nil || opts["include_usage"] != true {
+			t.Fatalf("应注入 include_usage: %s", out)
+		}
+		// 原文体的键序、HTML 字符与空白逐字节保留。
+		if !strings.Contains(string(out), `hi<&>`) {
+			t.Fatalf("原文不应被 HTML 转义: %s", out)
+		}
+		if !strings.Contains(string(out), `,"model":"m","messages"`) {
+			t.Fatalf("原键序应原位保留: %s", out)
+		}
+	})
+
+	t.Run("已有 stream_options 缺 include_usage 时补键", func(t *testing.T) {
+		body := []byte(`{"model":"m","stream_options":{"drop_params":true}}`)
+		out := requestBodyWithStreamUsage(body, "openai", "openai")
+		m := validate(t, out)
+		opts := m["stream_options"].(map[string]any)
+		if opts["drop_params"] != true || opts["include_usage"] != true {
+			t.Fatalf("应保留原键并补 include_usage: %s", out)
+		}
+	})
+
+	t.Run("已有 include_usage 时原样返回", func(t *testing.T) {
+		body := []byte(`{"stream_options":{"include_usage":false}}`)
+		if out := requestBodyWithStreamUsage(body, "openai", "openai"); !bytes.Equal(out, body) {
+			t.Fatalf("已有键应原样返回: %s", out)
+		}
+	})
+
+	t.Run("stream_options 为 null 时整体替换", func(t *testing.T) {
+		body := []byte(`{"model":"m","stream_options":null}`)
+		out := requestBodyWithStreamUsage(body, "openai", "openai")
+		m := validate(t, out)
+		if m["stream_options"].(map[string]any)["include_usage"] != true {
+			t.Fatalf("null 应替换为对象: %s", out)
+		}
+	})
+
+	t.Run("空对象体注入不带前导逗号", func(t *testing.T) {
+		out := requestBodyWithStreamUsage([]byte(`{}`), "openai", "openai")
+		m := validate(t, out)
+		if len(m) != 1 || m["stream_options"] == nil {
+			t.Fatalf("空对象应只注入一个键: %s", out)
+		}
+	})
+
+	t.Run("坏 JSON 原样返回", func(t *testing.T) {
+		raw := []byte("not-json")
+		if out := requestBodyWithStreamUsage(raw, "openai", "openai"); !bytes.Equal(out, raw) {
+			t.Fatalf("坏 JSON 应原样返回: %q", out)
+		}
+	})
+
+	t.Run("claude 协议不注入", func(t *testing.T) {
+		body := []byte(`{"model":"m","stream":true}`)
+		if out := requestBodyWithStreamUsage(body, "claude", "claude"); !bytes.Equal(out, body) {
+			t.Fatalf("claude 不应注入: %s", out)
+		}
+	})
 }

@@ -42,6 +42,7 @@ func (s *Store) HoldReservation(ctx context.Context, p HoldReservationParams) (R
 	}
 	var out Reservation
 	existing := false
+	var callerID string
 	err := s.Write(ctx, func(tx *sql.Tx) error {
 		if !p.SweepStaleBefore.IsZero() {
 			// 先清僵尸预占再做额度统计：崩溃/重启残留的 held 行若不清，
@@ -184,6 +185,7 @@ func (s *Store) HoldReservation(ctx context.Context, p HoldReservationParams) (R
 		if k.CallerScope == CallerScopeCaller {
 			reservationCaller = k.CallerID
 		}
+		callerID = reservationCaller
 		_, err = s.execHotTx(ctx, tx, `INSERT INTO reservations (id,key_id,caller_id,model,idempotency_key,status,held_micro_usd,settled_micro_usd,reserved_tokens,created_at,expires_at,heartbeat_at) VALUES (?,?,?,?,?,'held',?,?,?, ?,?,?)`, p.ID, p.KeyID, reservationCaller, p.Model, nullIfEmpty(p.IdempotencyKey), int64(p.HeldMicroUSD), 0, p.ReservedTokens, p.Now.UTC().UnixMilli(), p.ExpiresAt.UTC().UnixMilli(), p.Now.UTC().UnixMilli())
 		if isUniqueViolation(err) && p.IdempotencyKey != "" {
 			return fmt.Errorf("预占幂等键冲突: %w", ErrConflict)
@@ -204,8 +206,22 @@ func (s *Store) HoldReservation(ctx context.Context, p HoldReservationParams) (R
 	if existing {
 		return out, true, nil
 	}
-	r, err := s.GetReservation(ctx, p.ID)
-	return r, false, err
+	// 预占行是本事务按入参刚写的，直接组装返回值：省掉提交后再发一次
+	// GetReservation 读往返（鉴权热路径上每次预占都要付）。
+	out = Reservation{
+		ID:             p.ID,
+		KeyID:          p.KeyID,
+		CallerID:       callerID,
+		Model:          p.Model,
+		IdempotencyKey: p.IdempotencyKey,
+		Status:         "held",
+		HeldMicroUSD:   p.HeldMicroUSD,
+		ReservedTokens: p.ReservedTokens,
+		CreatedAt:      p.Now.UTC(),
+		ExpiresAt:      p.ExpiresAt.UTC(),
+		HeartbeatAt:    p.Now.UTC(),
+	}
+	return out, false, nil
 }
 
 func nullIfEmpty(s string) any {

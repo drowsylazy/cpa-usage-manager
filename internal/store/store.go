@@ -685,30 +685,63 @@ func (s *Store) ApplyRetention(ctx context.Context, retentionDays int, now time.
 	cutoffMinute := cutoff.Unix() / 60
 
 	var res RetentionResult
-	err := s.Write(ctx, func(tx *sql.Tx) error {
-		r, err := tx.ExecContext(ctx, `DELETE FROM requests WHERE ts < ?`, cutoffMillis)
-		if err != nil {
-			return fmt.Errorf("清理 requests 失败: %w", err)
-		}
-		res.Requests, _ = r.RowsAffected()
+	// 大保留期调整（如首次启用或天数骤减）可能面对数十万行待删数据。删除
+	// 按批拆成多个独立写事务：单个巨型 DELETE 会把唯一写连接占满整个事务
+	// 期，阻塞 beat 与一切写路径并推高 WAL；分批后每批之间读池与心跳都有
+	// 机会插进来。保留期清理幂等，中断后下次 Maintain 会继续删完。
+	var err error
+	res.Requests, err = s.deleteBatchesTx(ctx,
+		`DELETE FROM requests WHERE id IN (SELECT id FROM requests WHERE ts < ? LIMIT ?)`,
+		cutoffMillis)
+	if err != nil {
+		return res, fmt.Errorf("清理 requests 失败: %w", err)
+	}
 
-		r, err = tx.ExecContext(ctx, `DELETE FROM usage_rollups WHERE bucket_minute < ?`, cutoffMinute)
-		if err != nil {
-			return fmt.Errorf("清理 usage_rollups 失败: %w", err)
-		}
-		res.Rollups, _ = r.RowsAffected()
+	// usage_rollups 是 WITHOUT ROWID 表，按复合主键元组分批。
+	res.Rollups, err = s.deleteBatchesTx(ctx,
+		`DELETE FROM usage_rollups WHERE (bucket_minute, model, key_id, caller_id, provider, source, auth_type, tier, result) IN
+			(SELECT bucket_minute, model, key_id, caller_id, provider, source, auth_type, tier, result FROM usage_rollups WHERE bucket_minute < ? LIMIT ?)`,
+		cutoffMinute)
+	if err != nil {
+		return res, fmt.Errorf("清理 usage_rollups 失败: %w", err)
+	}
 
-		// 已结算/已释放且早于截止时间的预占没有查询价值，一并回收。
-		r, err = tx.ExecContext(ctx,
-			`DELETE FROM reservations WHERE status IN ('settled','released') AND created_at < ?`,
-			cutoffMillis)
+	// 已结算/已释放且早于截止时间的预占没有查询价值，一并回收。
+	res.Reservations, err = s.deleteBatchesTx(ctx,
+		`DELETE FROM reservations WHERE id IN (SELECT id FROM reservations WHERE status IN ('settled','released') AND created_at < ? LIMIT ?)`,
+		cutoffMillis)
+	if err != nil {
+		return res, fmt.Errorf("清理 reservations 失败: %w", err)
+	}
+	return res, nil
+}
+
+// retentionBatchSize 是保留期清理的每批删除行数，在语句代价与事务时长
+// 之间折中：每批一个独立写事务，短事务不阻塞并发路径。
+const retentionBatchSize = 20000
+
+// deleteBatchesTx 循环执行带 LIMIT 子查询的批量删除，每批一个独立写事务，
+// 返回累计删除行数。query 必须含恰好两个占位符：删除谓词参数与批大小。
+func (s *Store) deleteBatchesTx(ctx context.Context, query string, arg any) (int64, error) {
+	var total int64
+	for {
+		var n int64
+		err := s.Write(ctx, func(tx *sql.Tx) error {
+			r, e := tx.ExecContext(ctx, query, arg, retentionBatchSize)
+			if e != nil {
+				return e
+			}
+			n, _ = r.RowsAffected()
+			return nil
+		})
 		if err != nil {
-			return fmt.Errorf("清理 reservations 失败: %w", err)
+			return total, err
 		}
-		res.Reservations, _ = r.RowsAffected()
-		return nil
-	})
-	return res, err
+		total += n
+		if n < retentionBatchSize {
+			return total, nil
+		}
+	}
 }
 
 // Vacuum 执行 VACUUM 回收空间。耗时较长，应由维护接口显式触发。
@@ -764,27 +797,22 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 	}
 	out.SchemaVersion = v
 
-	counts := []struct {
-		query string
-		dst   *int64
-	}{
-		{`SELECT COUNT(*) FROM plugin_keys`, &out.Keys},
-		{`SELECT COUNT(*) FROM callers`, &out.Callers},
-		{`SELECT COUNT(*) FROM pricing_rules`, &out.PricingRules},
-		{`SELECT COUNT(*) FROM requests`, &out.Requests},
-		{`SELECT COUNT(*) FROM usage_rollups`, &out.Rollups},
-		{`SELECT COUNT(*) FROM audit_events`, &out.AuditEvents},
-		{`SELECT COUNT(*) FROM reservations WHERE status = 'held'`, &out.HeldReserves},
-	}
-	if err := s.Read(ctx, func(q Querier) error {
-		for _, c := range counts {
-			if err := q.QueryRowContext(ctx, c.query).Scan(c.dst); err != nil {
-				return fmt.Errorf("统计失败 (%s): %w", c.query, err)
-			}
-		}
-		return nil
-	}); err != nil {
-		return Stats{}, err
+	// 七个计数合并为一条查询单次往返：系统页一次打开不再付七次读池调度
+	// 与七次全表扫描的往返开销（各 COUNT 仍分别为一次全表扫描，代价不变）。
+	err = s.Read(ctx, func(q Querier) error {
+		return q.QueryRowContext(ctx, `SELECT
+			(SELECT COUNT(*) FROM plugin_keys),
+			(SELECT COUNT(*) FROM callers),
+			(SELECT COUNT(*) FROM pricing_rules),
+			(SELECT COUNT(*) FROM requests),
+			(SELECT COUNT(*) FROM usage_rollups),
+			(SELECT COUNT(*) FROM audit_events),
+			(SELECT COUNT(*) FROM reservations WHERE status = 'held')`).
+			Scan(&out.Keys, &out.Callers, &out.PricingRules, &out.Requests,
+				&out.Rollups, &out.AuditEvents, &out.HeldReserves)
+	})
+	if err != nil {
+		return Stats{}, fmt.Errorf("统计失败: %w", err)
 	}
 	if fi, err := os.Stat(s.opts.Path); err == nil {
 		out.FileBytes = fi.Size()
