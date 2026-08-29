@@ -143,6 +143,31 @@ func TestResolveChainCooldownFilterOrder(t *testing.T) {
 	}
 }
 
+func TestMarkRouteSuccessClearsCooldown(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	row := insertRoute(t, s, "auto2", `-> priority ["a", "b"]`)
+	prog, err := routelang.Compile(row.Rule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
+	env := &routelang.Env{Vars: map[string]any{"input_tokens": int64(1), "body_len": int64(2), "model": "auto2", "stream": false, "thinking_effort": "", "source": "openai"}}
+	s.MarkRouteFail(row.ID, "a", row.CooldownSeconds)
+	s.MarkRouteFail(row.ID, "b", row.CooldownSeconds)
+	if _, _, err := s.ResolveChain(ctx, m, env, nil, nil); !errors.Is(err, ErrAllTargetsCooling) {
+		t.Fatalf("全冷却应返回哨兵: %v", err)
+	}
+	// a 尝试成功即恢复：不再干等冷却到期，b 仍冷却。
+	s.MarkRouteSuccess(row.ID, "A")
+	chain, _, err := s.ResolveChain(ctx, m, env, nil, nil)
+	if err != nil || len(chain) != 1 || chain[0] != "a" {
+		t.Fatalf("成功后应只恢复 a: %v %v", chain, err)
+	}
+	// 未冷却目标的清除是无害 no-op。
+	s.MarkRouteSuccess(row.ID, "nope")
+}
+
 func TestJudgeSettingsRoundtrip(t *testing.T) {
 	s, _ := testService(t)
 	ctx := context.Background()

@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,32 @@ import (
 	"github.com/drowsylazy/cpa-usage-manager/internal/service"
 	"github.com/drowsylazy/cpa-usage-manager/internal/store"
 )
+
+func TestCooldownSecondsForRetryAfter(t *testing.T) {
+	if got := cooldownSecondsFor(60, 500, nil); got != 60 {
+		t.Fatalf("非 429 应取默认值: %v", got)
+	}
+	if got := cooldownSecondsFor(60, 429, http.Header{}); got != 60 {
+		t.Fatalf("无 Retry-After 应取默认值: %v", got)
+	}
+	h := http.Header{"Retry-After": []string{"120"}}
+	if got := cooldownSecondsFor(60, 429, h); got < 119 || got > 120 {
+		t.Fatalf("秒数形式应取 Retry-After: %v", got)
+	}
+	h.Set("Retry-After", time.Now().UTC().Add(90*time.Second).Format(http.TimeFormat))
+	if got := cooldownSecondsFor(60, 429, h); got < 88 || got > 90 {
+		t.Fatalf("HTTP 日期形式应取剩余时长: %v", got)
+	}
+	// 异常大值钳到 10 分钟，坏格式回落默认。
+	h.Set("Retry-After", "999999")
+	if got := cooldownSecondsFor(60, 429, h); got > 600 {
+		t.Fatalf("应钳到 600s: %v", got)
+	}
+	h.Set("Retry-After", "soon")
+	if got := cooldownSecondsFor(60, 429, h); got != 60 {
+		t.Fatalf("坏格式应取默认值: %v", got)
+	}
+}
 
 func TestRouteFailureEligible(t *testing.T) {
 	cases := []struct {

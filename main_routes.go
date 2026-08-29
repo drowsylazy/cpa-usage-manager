@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -271,6 +272,35 @@ func routeFailureEligible(status int, errText string, err error) bool {
 	return false
 }
 
+// cooldownSecondsFor 返回本次失败应记的冷却时长：429 且上游带了可解析的
+// Retry-After（秒数或 HTTP 日期）时采用之（钳到 1s~10min，防异常大值把
+// 目标永久摘除），否则用路由配置的 cooldown_seconds。
+func cooldownSecondsFor(defaultSec int64, status int, headers http.Header) int64 {
+	if status != 429 || len(headers) == 0 {
+		return defaultSec
+	}
+	ra := strings.TrimSpace(headers.Get("Retry-After"))
+	if ra == "" {
+		return defaultSec
+	}
+	var until time.Time
+	if secs, err := strconv.ParseInt(ra, 10, 64); err == nil {
+		until = time.Now().Add(time.Duration(secs) * time.Second)
+	} else if t, err := http.ParseTime(ra); err == nil {
+		until = t
+	} else {
+		return defaultSec
+	}
+	d := time.Until(until)
+	if d < time.Second {
+		d = time.Second
+	}
+	if d > 10*time.Minute {
+		d = 10 * time.Minute
+	}
+	return int64(d.Seconds())
+}
+
 // auditRouteFailover 记录一次目标转移审计（中间尝试不入 requests 行，
 // 这里是唯一的故障轨迹）。
 func auditRouteFailover(svc *service.Service, routeID int64, alias, from, to string, status int, cause string) {
@@ -300,12 +330,13 @@ func executeRoutedLoop(ctx context.Context, re *routedExecution, req rpcExecutor
 		hostBody, headers, status, errHost := hostModelExecute(req.HostCallbackID, req, finalTgt, payload, false)
 		upstream := service.FirstNonEmpty(usageparse.SniffModel(hostBody), bareTargetName(finalTgt))
 		if errHost == nil && status < 400 {
+			svc.MarkRouteSuccess(route.ID, tgt)
 			parsed, _ := usageparse.Parse(hostBody)
 			settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), status, parsed, upstream, re.claim)
 			return okEnvelope(rpcExecutorResponse{Payload: hostBody, Headers: headers})
 		}
 		if i < len(re.chain)-1 && routeFailureEligible(status, routeFailureCause(status, errHost), errHost) {
-			svc.MarkRouteFail(route.ID, tgt, route.CooldownSeconds)
+			svc.MarkRouteFail(route.ID, tgt, cooldownSecondsFor(route.CooldownSeconds, status, headers))
 			auditRouteFailover(svc, route.ID, route.Alias, tgt, re.chain[i+1], status, routeFailureCause(status, errHost))
 			continue
 		}
@@ -368,12 +399,14 @@ func dialHostStream(re *routedExecution, req rpcExecutorRequest, rw *bodyRewrite
 	if stream.StatusCode >= 400 {
 		_ = closeHostModelStream(stream.StreamID)
 		if index < len(re.chain)-1 && routeFailureEligible(stream.StatusCode, "", nil) {
-			re.svc.MarkRouteFail(re.match.Route.ID, tgt, re.match.Route.CooldownSeconds)
+			re.svc.MarkRouteFail(re.match.Route.ID, tgt, cooldownSecondsFor(re.match.Route.CooldownSeconds, stream.StatusCode, stream.Headers))
 			auditRouteFailover(re.svc, re.match.Route.ID, re.match.Route.Alias, tgt, re.chain[index+1], stream.StatusCode, "")
 			return rpcHostModelStreamResponse{}, dialTransfer, nil
 		}
 		return stream, dialFailed, errHostStatus(stream.StatusCode)
 	}
+	// 流建立即成功：上游已 2xx 受理，清除可能残留的冷却，不必等流结束。
+	re.svc.MarkRouteSuccess(re.match.Route.ID, tgt)
 	return stream, dialOK, nil
 }
 

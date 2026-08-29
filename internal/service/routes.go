@@ -183,6 +183,14 @@ func (s *Service) MarkRouteFail(routeID int64, target string, cooldownSeconds in
 	s.coolMu.Unlock()
 }
 
+// MarkRouteSuccess 清除目标的冷却：目标尝试成功说明上游已恢复，
+// 不必干等 cooldown_seconds 到期（半途失败过一次的目标恢复后继续参与选举）。
+func (s *Service) MarkRouteSuccess(routeID int64, target string) {
+	s.coolMu.Lock()
+	delete(s.cooldowns, cooldownKey(routeID, target))
+	s.coolMu.Unlock()
+}
+
 // CooldownUntil 返回目标的冷却截止时刻（面板展示与测试断言用）。
 func (s *Service) CooldownUntil(routeID int64, target string) (time.Time, bool) {
 	s.coolMu.Lock()
