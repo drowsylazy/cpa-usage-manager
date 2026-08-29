@@ -662,12 +662,20 @@ func placeholders(n int) string {
 }
 
 // requestColumns 是 requests 表的完整列清单。
-const requestColumns = `id, ts, key_id, caller_id, model, provider, source,
+const requestColumns = `id, ts, key_id, caller_id, model, provider, source, upstream_model,
 	auth_id, auth_label, auth_type, tier, result,
 	input_tokens, output_tokens, reasoning_tokens, cached_tokens,
 	cache_read_tokens, cache_creation_tokens, total_tokens,
 	latency_ms, ttft_ms, generation_ms, tps_milli,
 	thinking_intensity, cost_micro_usd, currency, cost_native_micro, priced, reservation_id`
+
+// RequestColumns 是 requests 表完整列清单的包外只读副本：服务层的请求
+// 明细查询必须引用它而不是手抄列清单——v12 曾因副本漏列导致明细接口
+// 丢字段（currency/cost_native_micro）。
+const RequestColumns = requestColumns
+
+// ScanRequest 从一行（列序必须与 RequestColumns 一致）扫描请求记录。
+func ScanRequest(sc interface{ Scan(...any) error }) (Request, error) { return scanRequest(sc) }
 
 // nativeCurrency 归一请求行的币种：空值视为 USD。
 func nativeCurrency(r Request) string {
@@ -710,7 +718,7 @@ func scanRequest(sc interface{ Scan(...any) error }) (Request, error) {
 	var ts, cost, costNative int64
 	var priced int
 	err := sc.Scan(
-		&r.ID, &ts, &r.KeyID, &r.CallerID, &r.Model, &r.Provider, &r.Source,
+		&r.ID, &ts, &r.KeyID, &r.CallerID, &r.Model, &r.Provider, &r.Source, &r.UpstreamModel,
 		&r.AuthID, &r.AuthLabel, &r.AuthType, &r.Tier, &r.Result,
 		&r.InputTokens, &r.OutputTokens, &r.ReasoningTokens, &r.CachedTokens,
 		&r.CacheReadTokens, &r.CacheCreationTokens, &r.TotalTokens,
