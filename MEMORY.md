@@ -8,6 +8,7 @@
 
 - 发版流程（**v0.6.2 起改为双提交**，用户明确指示）：①代码提交在前，message 不带版本号（前缀按变更类型 `feat:` / `fix:` / `perf:` 等）；②发版单独一个提交，message 固定为 `release: vX.Y.Z`（内容 = registry.json 版本号 + AGENTS.md 版本历史/范围 + 本流程规则），打 `vX.Y.Z` 标签推送 → CI 自动构建四平台并创建 GitHub Release。推送后**不**监控 CI（仓库约定）。
 - 仓库文档与用户沟通使用中文。
+- **审计功能已整体弃用（2026-08 用户明确指示）**：本项目不需要审计功能。不再新增任何审计向功能（审计面板页、audit 导出/归档/保留期清理等一律不做）；存量 `audit_events` 表仅承载内部机制的既有留痕（route.ai_fallback / route.failover / 密钥操作回执等），维持现状，不在其上扩展。
 - **UI 改动禁止跑 playwright/浏览器自动化验证**（用户两次明确叫停：先投诉链式调用卡死，后直接要求「停止做这种测试」）。交付前只做 `$env:GOROOT='D:\Go'; go build ./...` + `node --check internal/web/console.js`，页面效果交用户自己打开目验（需要时提示 `go run scripts/devserver.go` → 127.0.0.1:18080/console，密钥 dev-secret）。写新交互代码时要静态自查事件绑定是否覆盖所有容器（教训：复制委托只挂了 #key-rows，抽屉里的同款按钮成死键）、flex 容器的滚动区要显式 flex:1+min-height:0（教训：抽屉底栏不贴底）。
 
 ## Architecture decisions
@@ -17,6 +18,18 @@
 - 面板 Token 显示用 `fmtTok`（K/M/B 自动升级，阈值取 999.5 倍数避免 1000K）；概览「总消耗 Token」主值完整显示精确到个位。非 token 数字仍用 `fmtInt`（万/亿）。
 
 ## Discovered durable knowledge
+
+- **2026-08 修复批的持久结论**（三提交 65a32b0/cabe08e/d45353e，均带测试钉）：
+  - `ResolveChain` 在 ai_judge 失败时返回（兜底链, true, AI错误）——**链与错误非互斥**，main 层判失败必须用 `cerr != nil && chain == nil`，否则回落语义被破坏（首轮实锤 bug）。测试 TestResolveRoutingAIFallback。
+  - `usageClaim` 有 `released` 标志（c.mu 内先置位再摘桶）：attach/openFor 都要查它，保证「选择命中→交付」窗口里 release(0) 后宿主回调回落被动入库而不是被吞。settle 失败且 rec 已 attach 的极端情况只能丢弃+warnf（handleUsage 已返回 claimed，无法追溯被动入库）。
+  - `Service.Close()` 停 reservationBeatLoop（beatsStop 通道）；reconfigure 对旧 svc 必调，configure 失败路径还要把 runtimeState 四字段清空（nil svc 时各 handler 已有干净的 service_unavailable 分支）+ 停旧 notifyStop。
+  - `FindKeyByCallerScope` 只取 Usable 语义的 Key（enabled/unrevoked/unexpired，SQL 过滤），兜底鉴权不能被已撤销的最新 Key 遮蔽。
+  - 流式读泵有 `streamIdleTimeout`（10 分钟）无进度守护：startStreamIdleWatchdog 刷 atomic 时间戳，超时 closeHostModelStream 解除阻塞中的 stream_read——宿主回调是 C ABI 同步调用无取消语义，这是唯一能解卡死的手段。直连与路由两个泵都要接。
+  - `requestBodyWithStreamUsage` 是字节级定点注入（json.Decoder 定位顶层 stream_options 字节区间，解码器 InputOffset−RawMessage 长度=值起点）：**不要再改回整包 map 往返**——Marshal 会重排序键并 HTML 转义 `<>&`，对宿主是可见的请求体变异。TestRequestBodyWithStreamUsage 七分支锁定。
+  - `ResetStatistics` 的 KeyCounters 必须金额与 token 八列同步清；`snapshotTables` 现含 model_routes/notify_endpoints/report_configs，RestoreFrom 提交后触发 notifyPricingChanged+notifyRoutesChanged（validateSnapshot 的 schema 版本强校验保证旧备份不会因新表缺列误入）。
+  - 趋势周粒度桶表达式是 `date(x,'unixepoch','-6 days','weekday 1')`：SQLite `weekday N` 在日期已是 N 时不前进，先 weekday 再 -7 days 会把周一退到上周（实锤过）。TestTrendsWeekBucketMonday。
+  - `ApplyRetention` 每批一个独立写事务（retentionBatchSize=20000，deleteBatchesTx）；usage_rollups 是 WITHOUT ROWID 表，删除按复合主键元组 IN 子查询写。
+  - Stats 的七个计数合并为一条标量子查询单往返。
 
 - **gzip 池化 writer 的空流泄漏（v0.4.0 回归，2026-02 修复）**：`sync.Pool` 取出的 `gzip.Writer` 若 Reset 后从未被写入，`Close()` 仍会向目标输出一整个「空 gzip 流」的二进制字节——在 lazyGzipWriter 的明文分支（响应小于 min_bytes）恰好追加到 JSON 尾部，浏览器 `r.json()` 报 "Unexpected non-whitespace character after JSON"，DevTools 里表现为可读 JSON 后一个 � 替换符。修复：仅 `lw.useGz` 为真才 Close。判据函数 `jsonBytesValid`（httpapi/lazygzip_test.go）与浏览器同口径，可复用于任何「body 必须是单值 JSON」的断言。
 
