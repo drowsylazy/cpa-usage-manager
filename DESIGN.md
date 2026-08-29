@@ -390,7 +390,7 @@ response_compression_min_bytes: 1024
 
 ### 12.1 数据与语言
 
-- SQLite `model_routes` 表（schema v8）：`alias` NOCASE 唯一、`rule` 脚本文本、`cooldown_seconds`（0=不冷却；面板表单默认预填 60）、`pricing_mode`（target|alias）、`enabled`。写后回调失效服务层内存快照（atomic.Pointer + 60s TTL 兜底跨进程改写）。
+- SQLite `model_routes` 表（schema v8，v10 加 `cooldown_policy`）：`alias` NOCASE 唯一、`rule` 脚本文本、`cooldown_seconds`（0=不冷却；面板表单默认预填 60）、`cooldown_policy`（block=全冷却拒绝请求，默认；force=忽略冷却按原链照打——冷却只是进程内启发式，宁可赌一次）、`pricing_mode`（target|alias）、`enabled`。写后回调失效服务层内存快照（atomic.Pointer + 60s TTL 兜底跨进程改写）。
 - 规则脚本由 `internal/routelang` 解释（纯 Go 手写 lexer/parser/eval，零依赖）：`when <条件> -> <候选链>` 分支式；候选链构造器 `"模型"` / `priority [...]`（声明序即回退链）/ `weighted {...}`（加权随机，选中者排首其余按权重降序跟随）；无条件兜底分支必填且只能是最后一条；无循环无赋值 ⇒ 求值天然终止。语法错误带行列号供面板定位。
 
 ### 12.2 运行时行为

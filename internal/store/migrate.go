@@ -8,7 +8,7 @@ import (
 
 // SchemaVersion 是本代码期望的数据库 schema 版本。
 // 打开库时若发现库版本更高，说明是被更新版插件写过的库，拒绝降级使用。
-const SchemaVersion = 9
+const SchemaVersion = 10
 
 // migration 是一次版本化迁移。
 type migration struct {
@@ -391,6 +391,17 @@ var migrations = []migration{
 			`ALTER TABLE plugin_keys ADD COLUMN monthly_requests_limit INTEGER`,
 			`ALTER TABLE plugin_keys ADD COLUMN daily_requests_used INTEGER NOT NULL DEFAULT 0`,
 			`ALTER TABLE plugin_keys ADD COLUMN monthly_requests_used INTEGER NOT NULL DEFAULT 0`,
+		},
+	},
+	{
+		version: 10,
+		name:    "route_cooldown_policy",
+		stmts: []string{
+			// ---- 全冷却兜底策略 ----
+			// block（默认，保持既有行为）= 全冷却拒绝请求；
+			// force = 忽略冷却按原链照打——冷却只是进程内启发式，重启丢失、
+			// 多实例各自独立，宁可赌一次也不把用户请求直接打死。
+			`ALTER TABLE model_routes ADD COLUMN cooldown_policy TEXT NOT NULL DEFAULT 'block'`,
 		},
 	},
 }

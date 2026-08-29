@@ -15,8 +15,12 @@ type ModelRoute struct {
 	Alias           string `json:"alias"`
 	Rule            string `json:"rule"`
 	CooldownSeconds int64  `json:"cooldown_seconds"`
-	PricingMode     string `json:"pricing_mode"` // target|alias
-	Enabled         bool   `json:"enabled"`
+	// CooldownPolicy 决定候选目标全部冷却时的行为：
+	// block（默认）= 拒绝请求（upstream_error）；
+	// force = 忽略冷却按原链顺序照打（冷却只是进程内启发式，宁可赌一次）。
+	CooldownPolicy string `json:"cooldown_policy"`
+	PricingMode    string `json:"pricing_mode"` // target|alias
+	Enabled        bool   `json:"enabled"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -26,14 +30,17 @@ type ModelRoute struct {
 	Refs []string `json:"refs,omitempty"`
 }
 
-const modelRouteColumns = `id,alias,rule,cooldown_seconds,pricing_mode,enabled,created_at,updated_at`
+const modelRouteColumns = `id,alias,rule,cooldown_seconds,cooldown_policy,pricing_mode,enabled,created_at,updated_at`
 
 func scanModelRoute(sc interface{ Scan(...any) error }) (ModelRoute, error) {
 	var r ModelRoute
 	var enabled int
 	var created, updated int64
-	if err := sc.Scan(&r.ID, &r.Alias, &r.Rule, &r.CooldownSeconds, &r.PricingMode, &enabled, &created, &updated); err != nil {
+	if err := sc.Scan(&r.ID, &r.Alias, &r.Rule, &r.CooldownSeconds, &r.CooldownPolicy, &r.PricingMode, &enabled, &created, &updated); err != nil {
 		return ModelRoute{}, err
+	}
+	if r.CooldownPolicy == "" {
+		r.CooldownPolicy = "block"
 	}
 	r.Enabled = enabled == 1
 	r.CreatedAt = time.UnixMilli(created).UTC()
@@ -93,8 +100,8 @@ func (s *Store) InsertModelRoute(ctx context.Context, r ModelRoute) (int64, erro
 	var id int64
 	err := s.Write(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
-			`INSERT INTO model_routes (alias,rule,cooldown_seconds,pricing_mode,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?)`,
-			r.Alias, r.Rule, r.CooldownSeconds, r.PricingMode, en, ts, ts)
+			`INSERT INTO model_routes (alias,rule,cooldown_seconds,cooldown_policy,pricing_mode,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)`,
+			r.Alias, r.Rule, r.CooldownSeconds, r.CooldownPolicy, r.PricingMode, en, ts, ts)
 		if err != nil {
 			return err
 		}
@@ -116,8 +123,8 @@ func (s *Store) UpdateModelRoute(ctx context.Context, id int64, r ModelRoute) er
 	}
 	err := s.Write(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
-			`UPDATE model_routes SET alias=?, rule=?, cooldown_seconds=?, pricing_mode=?, enabled=?, updated_at=? WHERE id=?`,
-			r.Alias, r.Rule, r.CooldownSeconds, r.PricingMode, en, nowMillis(), id)
+			`UPDATE model_routes SET alias=?, rule=?, cooldown_seconds=?, cooldown_policy=?, pricing_mode=?, enabled=?, updated_at=? WHERE id=?`,
+			r.Alias, r.Rule, r.CooldownSeconds, r.CooldownPolicy, r.PricingMode, en, nowMillis(), id)
 		if err != nil {
 			return err
 		}

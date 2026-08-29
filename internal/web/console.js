@@ -2798,6 +2798,8 @@ function routeFormBody(r) {
       + '<option value="alias"' + (r && r.pricing_mode === 'alias' ? ' selected' : '') + '>按别名自身计价</option></select>')
     + fieldRow(labelWithTip('冷却秒数', '目标失败后的进程内冷却时长；冷却期内该目标被跳过，到期自动恢复。0 为不冷却。'),
       '<input id="rt-cooldown" type="number" min="0" max="86400" value="' + (r ? (r.cooldown_seconds || 0) : 60) + '">')
+    + fieldRow('全冷却时', '<select id="rt-policy"><option value="block"' + (!r || r.cooldown_policy !== 'force' ? ' selected' : '') + '>拒绝请求</option>'
+      + '<option value="force"' + (r && r.cooldown_policy === 'force' ? ' selected' : '') + '>忽略冷却照打</option></select>')
     + '</div>'
     + fieldRow(labelWithTip('规则脚本', TIPS_routeRule),
       '<textarea id="rt-rule" class="mono-area" spellcheck="false" placeholder=\'-> "gpt-4o-mini"\'>'
@@ -2811,6 +2813,7 @@ function collectRouteForm() {
     enabled: $('rt-enabled').value === 'true',
     pricing_mode: $('rt-mode').value,
     cooldown_seconds: Math.max(0, Math.min(86400, parseInt($('rt-cooldown').value, 10) || 0)),
+    cooldown_policy: $('rt-policy').value,
     rule: $('rt-rule').value,
   };
 }
@@ -2869,6 +2872,7 @@ $('route-rows').addEventListener('click', e => {
     post('/model-routes/save', {
       id: r.id, alias: r.alias, rule: r.rule,
       cooldown_seconds: r.cooldown_seconds, pricing_mode: r.pricing_mode,
+      cooldown_policy: r.cooldown_policy || 'block',
       enabled: !r.enabled, actor: 'console',
     }).then(() => loaders.routes().catch(() => {}))
       .catch(err => toast(err.message, 'err'));

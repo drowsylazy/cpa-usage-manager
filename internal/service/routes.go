@@ -255,6 +255,12 @@ func (s *Service) ResolveChain(ctx context.Context, m RouteMatch, env *routelang
 	}
 	filtered := s.filterCooldown(m.Route.ID, chain)
 	if len(filtered) == 0 {
+		// cooldown_policy=force：全冷却时忽略冷却按原链照打。冷却只是进程内
+		// 启发式（重启丢失、多实例独立），宁可赌一次也不把请求直接打死；
+		// block（默认）维持既有行为，拒绝请求。
+		if m.Route.CooldownPolicy == "force" {
+			return chain, fellBack, err
+		}
 		return nil, fellBack, ErrAllTargetsCooling
 	}
 	return filtered, fellBack, err

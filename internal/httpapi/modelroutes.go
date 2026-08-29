@@ -53,6 +53,7 @@ func (a *API) modelRouteSave(w http.ResponseWriter, r *http.Request) {
 		Alias           string `json:"alias"`
 		Rule            string `json:"rule"`
 		CooldownSeconds int64  `json:"cooldown_seconds"`
+		CooldownPolicy  string `json:"cooldown_policy"`
 		PricingMode     string `json:"pricing_mode"`
 		Enabled         *bool  `json:"enabled"`
 		Actor           string `json:"actor"`
@@ -63,6 +64,13 @@ func (a *API) modelRouteSave(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.PricingMode != "target" && in.PricingMode != "alias" {
 		jsonOut(w, map[string]string{"error": "pricing_mode 只能是 target 或 alias"}, 400)
+		return
+	}
+	if in.CooldownPolicy == "" {
+		in.CooldownPolicy = "block"
+	}
+	if in.CooldownPolicy != "block" && in.CooldownPolicy != "force" {
+		jsonOut(w, map[string]string{"error": "cooldown_policy 只能是 block 或 force"}, 400)
 		return
 	}
 	if in.CooldownSeconds < 0 || in.CooldownSeconds > 86400 {
@@ -81,7 +89,7 @@ func (a *API) modelRouteSave(w http.ResponseWriter, r *http.Request) {
 		jsonOut(w, map[string]string{"error": verr.Error()}, 400)
 		return
 	}
-	rec := store.ModelRoute{ID: in.ID, Alias: in.Alias, Rule: in.Rule, CooldownSeconds: in.CooldownSeconds, PricingMode: in.PricingMode, Enabled: enabled, Refs: refs}
+	rec := store.ModelRoute{ID: in.ID, Alias: in.Alias, Rule: in.Rule, CooldownSeconds: in.CooldownSeconds, CooldownPolicy: in.CooldownPolicy, PricingMode: in.PricingMode, Enabled: enabled, Refs: refs}
 	var id int64
 	var err error
 	action := "route.save"

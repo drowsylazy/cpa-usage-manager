@@ -644,3 +644,28 @@ func TestJudgeAttribution(t *testing.T) {
 		t.Fatal("窗口过期后不应归属")
 	}
 }
+
+func TestCooldownPolicyForceIgnoresCooling(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	// insertRoute 只填默认列：先插 block 版验证拒绝，再改库为 force 验证放行。
+	row := insertRoute(t, s, "autop", `-> priority ["a", "b"]`)
+	prog, err := routelang.Compile(row.Rule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
+	env := &routelang.Env{Vars: map[string]any{"input_tokens": int64(1), "body_len": int64(2), "model": "autop", "stream": false, "thinking_effort": "", "source": "openai"}}
+	s.MarkRouteFail(row.ID, "a", row.CooldownSeconds)
+	s.MarkRouteFail(row.ID, "b", row.CooldownSeconds)
+	if _, _, err := s.ResolveChain(ctx, m, env, nil, nil); !errors.Is(err, ErrAllTargetsCooling) {
+		t.Fatalf("block 策略全冷却应拒绝: %v", err)
+	}
+	// 改为 force：全冷却时按原链照打。
+	row.CooldownPolicy = "force"
+	m = RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
+	chain, _, err := s.ResolveChain(ctx, m, env, nil, nil)
+	if err != nil || len(chain) != 2 || chain[0] != "a" || chain[1] != "b" {
+		t.Fatalf("force 策略应返回原链: chain=%v err=%v", chain, err)
+	}
+}
