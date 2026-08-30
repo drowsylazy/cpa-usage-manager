@@ -285,49 +285,17 @@ func (s *Service) Trends(ctx context.Context, f UsageFilter, grain string) ([]Tr
 	return out, err
 }
 
-// UnpricedModel 是「有流量但未命中任何计价规则」的模型：计价覆盖体检的
-// 一行（面板据此提示用户补价，避免流量默默落在免费兜底）。
-type UnpricedModel struct {
-	Model       string `json:"model"`
-	Requests    int64  `json:"requests"`
-	TotalTokens int64  `json:"total_tokens"`
-}
-
 type CostCoverage struct {
 	Requests       int64 `json:"requests"`
 	PricedRequests int64 `json:"priced_requests"`
 	CostMicroUSD   int64 `json:"cost_micro_usd"`
-	// UnpricedModels 按请求降序，最多 10 条；无未计价流量时缺省。
-	UnpricedModels []UnpricedModel `json:"unpriced_models,omitempty"`
 }
 
 func (s *Service) Costs(ctx context.Context, f UsageFilter) (CostCoverage, error) {
 	clause, args := requestFilter(f)
 	var out CostCoverage
 	err := s.st.Read(ctx, func(q store.Querier) error {
-		if err := q.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(priced),0),COALESCE(SUM(cost_micro_usd),0) FROM requests`+clause, args...).Scan(&out.Requests, &out.PricedRequests, &out.CostMicroUSD); err != nil {
-			return err
-		}
-		// 未计价模型清单：与覆盖统计同筛选口径，按请求降序取前 10。
-		unpricedWhere := clause
-		if unpricedWhere == "" {
-			unpricedWhere = ` WHERE priced = 0`
-		} else {
-			unpricedWhere += ` AND priced = 0`
-		}
-		rows, err := q.QueryContext(ctx, `SELECT model, COUNT(*), COALESCE(SUM(total_tokens),0) FROM requests`+unpricedWhere+` GROUP BY model ORDER BY COUNT(*) DESC, model LIMIT 10`, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var u UnpricedModel
-			if err := rows.Scan(&u.Model, &u.Requests, &u.TotalTokens); err != nil {
-				return err
-			}
-			out.UnpricedModels = append(out.UnpricedModels, u)
-		}
-		return rows.Err()
+		return q.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(priced),0),COALESCE(SUM(cost_micro_usd),0) FROM requests`+clause, args...).Scan(&out.Requests, &out.PricedRequests, &out.CostMicroUSD)
 	})
 	return out, err
 }

@@ -2415,35 +2415,10 @@ function renderCostCoverage(costs) {
     + kv('已计价请求', fmtInt(costs.priced_requests))
     + kv('价格覆盖率', '<span class="pill ' + (cover >= 90 ? 'live' : cover >= 60 ? 'warn' : 'alarm') + ' mono">' + cover + '%</span>')
     + kv('总费用', '<b class="mono">' + fmtCur(costs.cost_micro_usd) + '</b>')
-    + kv('约合人民币', cny)
-    + '</div><p class="note" style="margin-top:10px">未命中价格的请求不计费用；汇率来源 '
-    + esc(rate ? rate.source + (rate.fallback ? '（兜底）' : '') : '未知') + '。</p>';
-  // 计价覆盖体检：有流量但落在免费兜底的模型清单，点击跳转请求明细；
-  // 到「价格」页补一条规则即可纳入计费。行条按未计价请求量归一（可比 scans）。
-  const up = costs.unpriced_models || [];
-  if (up.length) {
-    const maxReq = Math.max(...up.map(u => u.requests), 1);
-    html += '<div class="up-head"><span class="up-dot" aria-hidden="true"></span>未计价模型'
-      + '<span class="up-count">Top ' + up.length + '</span></div>'
-      + '<div class="up-list">' + up.map(u =>
-        '<button type="button" class="up-item" data-model="' + esc(u.model) + '"'
-        + ' title="' + esc(u.model) + ' · 点击查看该模型的请求明细">'
-        + '<span class="up-main"><span class="up-name mono">' + esc(u.model) + '</span>'
-        + '<span class="up-meta mono">' + fmtInt(u.requests) + ' 次 · ' + fmtTok(u.total_tokens) + '</span></span>'
-        + '<span class="up-track" aria-hidden="true"><span class="up-fill" style="width:'
-        + Math.max(4, Math.round(u.requests / maxReq * 100)) + '%"></span></span></button>').join('')
-      + '</div><p class="note up-note">以上模型有流量但未命中任何计价规则（免费兜底）；点击模型查看明细，到「价格」页补规则即可纳入计费。</p>';
-  }
+      + kv('约合人民币', cny)
+      + '</div><p class="note" style="margin-top:10px">未命中价格的请求不计费用；汇率来源 '
+      + esc(rate ? rate.source + (rate.fallback ? '（兜底）' : '') : '未知') + '。</p>';
   $('ov-cost-body').innerHTML = html;
-  $('ov-cost-body').querySelectorAll('[data-model]').forEach(b => {
-    b.onclick = () => {
-      const inp = document.querySelector('#req-model input');
-      if (inp) inp.value = b.dataset.model;
-      reqView.model = b.dataset.model;
-      reqView.page = 0;
-      switchTab('usage');
-    };
-  });
 }
 async function loadRequests() {
   const q = new URLSearchParams({

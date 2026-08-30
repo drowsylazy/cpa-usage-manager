@@ -48,7 +48,7 @@
 - **2026-08 功能批持久结论**（154483f）：
   - **HTTP 响应头必须先于首写设置**（实测实锤：导出端点原「先写体再设头」的顺序在真实 HTTP 下 Content-Type/Content-Disposition 全被首写快照丢弃，浏览器拿不到文件名）。导出类处理器一律先用 `svc.ExportTarget(req, png)` 拿文件名+Content-Type 预置头再写体；文件名由 `exportFileName` 统一构造（kind+时间范围标记 `_YYYYMMDD-HHMM[_-终点]|_all`+UTC 时间戳）。中途出错头已提交无法回改成 JSON，只能记日志。
   - 面板偏好跨设备同步约定：本地键经 `savePref` 双写 localStorage 与 /preferences 的 **`ui_` 前缀键**（勿与 notify_* 冲突）；登录后 `syncPrefsFromServer` 以服务器为准回灌本地并整页重载一次（sessionStorage `ui-prefs-reloaded` 防循环；custom 时间范围无起止不同步）。MultiSelect 等 closure 组件没有程序化设值接口，重载是有意的最稳方案。
-  - /costs 响应含 `unpriced_models`（有流量但 priced=0 的模型 Top 10，按请求降序），概览计价覆盖卡内嵌清单、点击跳转请求明细（置 req-model input + reqView.model + switchTab('usage')，Combo 无 setter 直接操作 DOM input 是既有口径）。
+  - **未计价模型清单（unpriced_models）已整体移除（2026-08 用户裁决「太丑」后先改版仍否决）**：/costs 不再返回 unpriced_models，面板计价覆盖卡只剩四项统计；勿再往该卡内嵌清单/排行类组件——用户对窄卡里塞列表的形态接受度差。
   - 触顶预估 `keyEtaText`：日速率=今日已用/今日已过比例（UTC），档位选取与 usdPick/tokPick 同口径；今日无消耗或已过 <5% 不外推。只用于详情弹窗 kd-note，卡片布局不动。
 
 - **2026-08 修复批的持久结论**（三提交 65a32b0/cabe08e/d45353e，均带测试钉）：
