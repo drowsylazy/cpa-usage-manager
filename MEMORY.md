@@ -19,6 +19,8 @@
 
 ## Discovered durable knowledge
 
+- **Source 字段泄露上游 API Key（2026-08 修复，用户实测导出实锤）**：宿主 `resolveUsageSource`（usage_helpers.go:412，已对照宿主源码）在 auth 无邮箱/账号信息时**回落把上游 api_key 原样填进 usage Record.Source**——插件侧任何直接外显 Source 的路径都是泄露面。修复分四层：①`RedactSource` 启发式强化——原版只拦 `sk-` 前缀与 ≥32 位纯字母数字，带 `-_.` 分隔符或较短的 Key 全漏；现改为**任一空白分隔 token** 长度 ≥20、字符集仅 `[A-Za-z0-9._-]`、且同时含字母与数字即判凭据整串清空（邮箱有 @、URL 有 / 被字符集排除，正常保留）；②store 写入收口——`insertRequestTx`（requests 唯一 INSERT 点）/`upsertRollupTx`/`fillKeeperZeroTx` 三处自带清洗，任何未来调用方不可能绕过；③执行器 `buildRequest` 对 SourceFormat 也清洗；④`GroupByDimension` 的 source 维度读侧清洗（历史脏 rollup 行随保留期老化，不做 DB 迁移，与 TPS 脏数据同一策略）。测试钉：redact_test.go 新规则表、TestRedactSourceAtWrite（写入收口）、TestGroupByDimensionSourceRedacted（维度读侧）。**启发式残余风险**：无分隔符且不含数字的短 Key（<20 位）识别不了；带数字的合法长标签（如 openai-compatible-v2）会被误杀，属「宁可误杀」的有意取舍。
+
 - **console.js 顶层执行顺序 TDZ 陷阱（v0.7.3 白屏实锤，用户浏览器复现）**：`const dispCurSel = new Select(...)` 写在 fmtMoney 附近（76 行），而 `Select`/`CARET`/`savePref` 定义在后面（142/452 行）——顶层代码立即执行时 const 处于暂时性死区，ReferenceError 让整个脚本加载即崩，页面只剩背景。`node --check` 只查语法查不出这种错；gofmt 同理。**规则：所有组件实例化（new Select/Combo）与 DOM 事件绑定必须放在「页签调度」段之前（组件定义全部就绪之后），顶层只放纯数据初始化。** 修复后用 devserver + 浏览器实测登录前后渲染正常（用户明确要求时可用浏览器验证，不受「禁止 playwright」默认规则约束）。
 
 - **2026-08 数据表精简（schema v13）**：

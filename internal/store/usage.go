@@ -44,6 +44,9 @@ func insertRequestTx(ctx context.Context, s *Store, tx *sql.Tx, r Request) error
 	if r.Result == "" {
 		r.Result = ResultOK
 	}
+	// 写入收口清洗：requests 表唯一的 INSERT 点，任何调用方带来的
+	// 上游凭据（宿主会把 api_key 填进 Source）都到不了库。
+	r.Source = RedactSource(r.Source)
 	res, err := s.execHotTx(ctx, tx,
 		`INSERT INTO requests (
 			id, ts, key_id, caller_id, model, provider, source, upstream_model,
@@ -78,6 +81,8 @@ func upsertRollupTx(ctx context.Context, s *Store, tx *sql.Tx, r Request) error 
 	if r.Result == "" {
 		r.Result = ResultOK
 	}
+	// rollup 的 source 是维度分组值，会经 /usage/dimension 原样外显，同口径清洗。
+	r.Source = RedactSource(r.Source)
 	bucket := BucketMinute(r.TS)
 	fail := 0
 	if r.Result != ResultOK {
@@ -429,6 +434,7 @@ func mergeRequestPairTx(ctx context.Context, tx *sql.Tx, s *Store, keeper, drope
 // fillKeeperZeroTx 把 d 行的非空展示/用量字段补进 keeper 行的空缺位。
 // 被 mergeRequestPairTx（行已在库）与 absorbIntoExecutorTx（行未入库）共享。
 func fillKeeperZeroTx(ctx context.Context, tx *sql.Tx, s *Store, d Request, keeperID string) error {
+	d.Source = RedactSource(d.Source)
 	_, err := s.execHotTx(ctx, tx,
 		`UPDATE requests SET
 		    input_tokens         = CASE WHEN input_tokens = 0         THEN ? ELSE input_tokens END,
@@ -686,21 +692,58 @@ func nativeCurrency(r Request) string {
 }
 
 // RedactSource 清洗疑似上游凭据的来源字段。
-// 部分兼容渠道会把上游 API Key 填进 Source；这类值绝不入库/外显：
-// - sk- 前缀的凭据；
-// - 32 位以上纯字母数字单 token（正常来源是 openai、openai-compatible-xxx 等短标签）。
+// 部分兼容渠道会把上游 API Key 填进 Source（宿主 resolveUsageSource 在 auth
+// 无邮箱/账号信息时回落取 api_key）；这类值绝不入库/外显。
+// 正常来源是 openai、openai-compatible-xxx、邮箱、GCP 项目 ID 等短标签。
+// 整值或任一空白分隔 token 形似凭据即整串清空。
 func RedactSource(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return ""
 	}
-	if strings.HasPrefix(s, "sk-") && len(s) >= 16 {
+	if isCredentialToken(s) {
 		return ""
 	}
-	if len(s) >= 32 && !strings.ContainsAny(s, "-./_ ") && isAlnum(s) {
-		return ""
+	for _, tok := range strings.Fields(s) {
+		if isCredentialToken(tok) {
+			return ""
+		}
 	}
 	return s
+}
+
+// isCredentialToken 判断单个 token 是否形似上游凭据。
+// 凭据字符集为字母数字与 -_.（API Key/JWT 常见字符），@ / : = 等是邮箱、
+// URL、键值对的特征，出现即排除；长度 ≥20 且同时含字母与数字即判定为
+// 凭据——正常来源标签要么很短、要么不含数字，无法覆盖的只剩
+// 无分隔符且不含数字的短 Key，宁可误杀不放过。
+func isCredentialToken(tok string) bool {
+	tok = strings.TrimSpace(tok)
+	if tok == "" {
+		return false
+	}
+	if strings.HasPrefix(tok, "sk-") && len(tok) >= 16 {
+		return true
+	}
+	if len(tok) >= 32 && !strings.ContainsAny(tok, "-./_ ") && isAlnum(tok) {
+		return true
+	}
+	if len(tok) < 20 {
+		return false
+	}
+	hasLetter, hasDigit := false, false
+	for _, r := range tok {
+		switch {
+		case r >= '0' && r <= '9':
+			hasDigit = true
+		case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z':
+			hasLetter = true
+		case r == '-' || r == '_' || r == '.':
+		default:
+			return false
+		}
+	}
+	return hasLetter && hasDigit
 }
 
 func isAlnum(s string) bool {

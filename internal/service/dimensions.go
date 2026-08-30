@@ -141,6 +141,11 @@ func (s *Service) GroupByDimension(ctx context.Context, f UsageFilter, dimension
 			if err != nil {
 				return err
 			}
+			// source 维度的分组值会原样外显（面板/CSV），历史脏行
+			// （rollup 落库时未清洗）在读侧同口径清洗，随保留期老化。
+			if dimension == "source" {
+				r.Value = store.RedactSource(r.Value)
+			}
 			out.Rows = append(out.Rows, r)
 			accumulate(&out.Total, r, sums)
 		}

@@ -1251,7 +1251,7 @@ func buildRequest(svc *service.Service, reservation store.Reservation, req rpcEx
 		CallerID:          reservation.CallerID,
 		Model:             reservation.Model,
 		Provider:          req.AuthProvider,
-		Source:            req.SourceFormat,
+		Source:            store.RedactSource(req.SourceFormat),
 		AuthID:            req.AuthID,
 		AuthType:          req.AuthType,
 		Tier:              meta.ResolvedTier,
