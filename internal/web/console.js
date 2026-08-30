@@ -756,6 +756,21 @@ const dispCurSel = new Select('disp-cur', [
   else reloadActive();
 }, { value: dispCur, head: '金额显示币种' });
 
+// ---------- 显示设置弹层（齿轮） ----------
+// 币种/自动刷新从顶栏收纳进齿轮弹层；刷新与退出仍是一步可达的图标按钮。
+function closeSettingsPop() {
+  $('settings-pop').hidden = true;
+  $('settings-btn').setAttribute('aria-expanded', 'false');
+}
+$('settings-btn').addEventListener('click', () => {
+  const pop = $('settings-pop');
+  pop.hidden = !pop.hidden;
+  $('settings-btn').setAttribute('aria-expanded', String(!pop.hidden));
+});
+document.addEventListener('click', e => {
+  if (!$('settings-pop').hidden && !e.target.closest('.tb-settings')) closeSettingsPop();
+});
+
 // ---------- 顶栏自动刷新 ----------
 // 按用户自定义间隔重载当前页签的数据加载器；页面隐藏或未登录时跳过。
 // 替代此前请求明细面板里的固定 30s 开关（ui_req-auto 偏好作废，不再读取）。
@@ -766,7 +781,9 @@ function parseAutoRefreshSecs() {
 }
 function setupAutoRefresh() {
   if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
-  if (!$('auto-refresh').checked) return;
+  const on = $('auto-refresh').checked;
+  $('set-secs-row').classList.toggle('off', !on);
+  if (!on) return;
   const secs = parseAutoRefreshSecs();
   if (!secs) return;
   autoRefreshTimer = setInterval(() => {
@@ -825,6 +842,11 @@ $('tabs').addEventListener('keydown', e => {
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   if (openSel) { closeAnySel(true); return; }
+  if (!$('settings-pop').hidden) {
+    closeSettingsPop();
+    $('settings-btn').focus();
+    return;
+  }
   if (!$('range-pop').hidden) {
     closeRangePop();
     $('range-btn').focus();

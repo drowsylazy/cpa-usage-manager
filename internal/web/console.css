@@ -118,9 +118,15 @@ h1,h2,h3,p{margin:0}
 .brand-sub{color:var(--fg3);font-size:11px;letter-spacing:.02em}
 /* 工具组紧跟品牌靠左，避开宿主 management.html 右上角的操作按钮区 */
 .bar-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-right:auto}
-.tb-group{display:flex;align-items:center;gap:6px}
-.tb-label{font-size:12px;color:var(--fg3);white-space:nowrap}
-.tb-chk{display:flex;align-items:center;gap:4px;cursor:pointer}
+/* 显示设置弹层（齿轮）：币种/自动刷新收纳于此，顶栏只留图标 */
+.tb-settings{position:relative}
+.set-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:5px 6px;min-height:30px}
+.set-row input[type=checkbox]{accent-color:var(--signal)}
+.set-row.off{opacity:.45;pointer-events:none}
+.set-label{font-size:12.5px;color:var(--fg)}
+.set-inline{display:flex;align-items:center;gap:5px}
+.set-unit{font-size:12px;color:var(--fg3)}
+.set-row .sel-btn{min-width:150px;justify-content:space-between}
 #auto-refresh-secs{width:62px;padding:5px 8px;border:1px solid var(--line);border-radius:8px;background:var(--sunken);color:var(--fg);font:inherit;font-size:12px}
 #disp-cur .sel-btn{padding:5px 10px;font-size:12px}
 
@@ -842,7 +848,9 @@ table.data th .info{vertical-align:0}
   .bar-tools{width:100%}
   .bar-tools .range{flex:1}
   .range-btn{width:100%}
-  .pop{right:auto;left:0;width:min(300px,calc(100vw - 28px))}
+  .range .pop{right:auto;left:0;width:min(300px,calc(100vw - 28px))}
+  /* 设置弹层贴着顶栏右缘，窄屏仍按 right 对齐避免向右溢出 */
+  .tb-settings .pop{width:min(300px,calc(100vw - 28px))}
   .tabs-meta{display:none}
   .panel-head{padding:12px 14px}
   .panel-body{padding:12px 14px}
