@@ -53,7 +53,8 @@ function fmtMoney(micro, sym) {
   s = s.replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
   return (neg ? '-' + sym : sym) + s;
 }
-const fmtPrice = p => (Number(p) || 0) === 0 ? '0' : fmtUSD(p);
+// 价格位恒带 $ 单位（价格表与 models.dev 搜索列表共用）；0 也显示 $0 明确币种。
+const fmtPrice = p => fmtUSD(Number(p) || 0);
 
 // ---------- 显示币种 ----------
 // dispCur 只影响面板展示（账本与限额口径恒为 USD）；cny 按启动时拉取的
@@ -924,9 +925,6 @@ function cacheHitRate(t) {
 function renderReadouts(total, costs) {
   const failRate = total.requests ? (total.failures / total.requests * 100).toFixed(1) + '%' : '0%';
   const cover = costs.requests ? Math.round(costs.priced_requests / costs.requests * 100) : 0;
-  const rate = S.fx;
-  const cny = dispCur !== 'cny' && rate && total.cost_micro_usd
-    ? ' ≈ ¥' + fmtUSD(Math.round(total.cost_micro_usd * rate.usd_to_cny_micro / 1e6)).slice(1) : '';
   const hitPct = cacheHitRate(total);
   $('ov-readouts').innerHTML =
     readout('请求总数', fmtInt(total.requests),
@@ -936,7 +934,7 @@ function renderReadouts(total, costs) {
       '输入 <b>' + fmtTok(total.input_tokens) + '</b> · 输出 <b>' + fmtTok(total.output_tokens)
       + '</b> · 缓存命中 <b>' + fmtTok(cacheHit(total)) + '</b>')
     + readout('总费用', fmtCur(total.cost_micro_usd),
-      '计价覆盖 <b>' + cover + '%</b>' + esc(cny))
+      '计价覆盖 <b>' + cover + '%</b>')
     + readout('缓存命中率', hitPct < 0 ? '—' : hitPct.toFixed(1) + '%',
       '读 <b>' + fmtTok(cacheReadOf(total)) + '</b> · 写 <b>' + fmtTok(total.cache_creation_tokens)
       + '</b>' + ((total.cached_tokens || 0) > (total.cache_read_tokens || 0) + (total.cache_creation_tokens || 0)
@@ -2407,17 +2405,12 @@ function kv(name, value) { return '<div class="kv-row"><dt>' + name + '</dt><dd>
 // renderCostCoverage 渲染概览第三卡（计价覆盖）；costs 由 overview loader 统一拉取。
 function renderCostCoverage(costs) {
   const cover = costs.requests ? Math.round(costs.priced_requests / costs.requests * 100) : 0;
-  const rate = S.fx;
-  const cny = rate && costs.cost_micro_usd
-    ? (dispCur === 'cny' ? fmtCur(costs.cost_micro_usd) : '¥' + fmtUSD(Math.round(costs.cost_micro_usd * rate.usd_to_cny_micro / 1e6)).slice(1)) : '-';
   let html = '<div class="kv">'
     + kv('请求总数', fmtInt(costs.requests))
     + kv('已计价请求', fmtInt(costs.priced_requests))
     + kv('价格覆盖率', '<span class="pill ' + (cover >= 90 ? 'live' : cover >= 60 ? 'warn' : 'alarm') + ' mono">' + cover + '%</span>')
     + kv('总费用', '<b class="mono">' + fmtCur(costs.cost_micro_usd) + '</b>')
-      + kv('约合人民币', cny)
-      + '</div><p class="note" style="margin-top:10px">未命中价格的请求不计费用；汇率来源 '
-      + esc(rate ? rate.source + (rate.fallback ? '（兜底）' : '') : '未知') + '。</p>';
+    + '</div><p class="note" style="margin-top:10px">未命中价格的请求不计费用；金额按顶栏显示币种折算。</p>';
   $('ov-cost-body').innerHTML = html;
 }
 async function loadRequests() {
@@ -2607,9 +2600,9 @@ function renderPricing() {
     + '<th>来源</th><th class="w-act"></th>';
   const pages = Math.max(1, Math.ceil(items.length / PRICING_PAGE_SIZE));
   const rows = items.slice(pricingPage * PRICING_PAGE_SIZE, (pricingPage + 1) * PRICING_PAGE_SIZE);
-  // CNY 规则的价格列以人民币显示；悬浮给出保存时锁定的汇率。
+  // 价格列带币种单位：CNY 行 ¥、USD 行 $；CNY 悬浮给出锁定的美元等值折算率。
   const priceCell = (p, v) => p.currency === 'CNY'
-    ? '<td class="num" title="按 1 USD = ' + ((p.fx_rate_milli || 0) / 1000) + ' CNY 入账">' + fmtMoney(v, '¥') + '</td>'
+    ? '<td class="num" title="按 1 USD = ' + ((p.fx_rate_milli || 0) / 1000) + ' CNY 折算美元等值">' + fmtMoney(v, '¥') + '</td>'
     : '<td class="num">' + fmtPrice(v) + '</td>';
   $('pricing-rows').innerHTML = rows.map(p => '<tr>'
     + '<td class="num cell-mono">' + p.priority + '</td>'
@@ -2620,7 +2613,7 @@ function renderPricing() {
     + priceCell(p, p.price_output)
     + priceCell(p, p.price_cache_read)
     + priceCell(p, p.price_cache_creation)
-    + '<td class="cell-dim">' + (p.currency === 'CNY' ? '<span class="pill trace" title="按 ' + ((p.fx_rate_milli || 0) / 1000) + ' CNY/USD 入账">CNY</span> ' : '')
+    + '<td class="cell-dim">' + (p.currency === 'CNY' ? '<span class="pill trace" title="按 1 USD = ' + ((p.fx_rate_milli || 0) / 1000) + ' CNY 折算美元等值">CNY</span> ' : '')
     + esc(p.source === 'models_dev' ? 'models.dev' : '手动') + '</td>'
     + '<td class="w-act"><button type="button" class="btn small" data-edit="' + p.id + '">编辑</button>'
     + '<button type="button" class="btn small danger" data-id="' + p.id + '">删除</button></td></tr>').join('')
@@ -2665,7 +2658,7 @@ function pricingFormBody(p) {
       + '<option value="false"' + (p && !p.enabled ? ' selected' : '') + '>停用</option></select>')
     + fieldRow('计价币种', '<select id="p-cur"><option value="USD"' + (cur === 'USD' ? ' selected' : '') + '>USD 美元</option>'
       + '<option value="CNY"' + (cur === 'CNY' ? ' selected' : '') + '>CNY 人民币</option></select>')
-    + fieldRow(labelWithTip('锁定汇率', '保存时按此汇率把人民币价格折算成美元入账，之后不随行情变化；改价或换汇率先重存本规则。'),
+    + fieldRow(labelWithTip('锁定汇率', '人民币规则按原值入账；此汇率只用于把价格折算成美元等值，供额度扣减与跨币种聚合（额度上限恒为美元口径）。保存后锁定不随行情变化，改价或换汇率需重存本规则；留空用当前汇率。'),
       '<input id="p-rate" inputmode="decimal" value="' + esc(rate) + '" placeholder="留空用当前汇率">')
     + '<div class="form-sep wide">单价（每百万 token）</div>'
     + fieldRow(labelWithTip('输入', TIPS.input), '<input id="p-in" inputmode="decimal" value="' + (p ? priceInputVal(p.price_input) : '') + '" placeholder="0">')
@@ -2695,7 +2688,7 @@ $('pricing-add').addEventListener('click', () => {
   openSheet({
     title: '新增计价规则', okText: '保存',
     body: pricingFormBody(null),
-    note: '单价为每百万 Token 金额，币种可选美元或人民币（人民币按锁定汇率折算成美元入账）；同匹配方式同模式重复添加将覆盖原规则。',
+    note: '单价为每百万 Token 金额，币种可选美元或人民币；人民币按原值入账，美元等值按锁定汇率折算（额度扣减恒按美元）。同匹配方式同模式重复添加将覆盖原规则。',
     onOk: async () => {
       await post('/pricing', pricingSubmit());
       toast('规则已保存', 'ok');
