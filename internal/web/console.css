@@ -964,13 +964,22 @@ table.data th .info{vertical-align:0}
 .doc-link{font-size:12px;color:var(--signal);text-decoration:none;white-space:nowrap}
 .doc-link:hover{text-decoration:underline}
 
-/* 计价覆盖体检：未计价模型清单（概览第三卡内嵌） */
-.up-head{margin-top:12px;font-size:12px;font-weight:600;color:var(--fg2)}
-.up-list{display:flex;flex-direction:column;gap:4px;margin-top:6px}
+/* 计价覆盖体检：未计价模型清单（概览第三卡内嵌）。
+   无边框紧凑行 + warn 色比例细条，与维度表的 bar-cell 语言对齐 */
+.up-head{display:flex;align-items:center;gap:6px;margin-top:12px;font-size:12px;font-weight:600;color:var(--fg2)}
+.up-dot{width:6px;height:6px;border-radius:50%;background:var(--warn);flex:none}
+.up-count{margin-left:auto;font-size:11px;font-weight:500;color:var(--fg4)}
+.up-list{display:flex;flex-direction:column;margin-top:2px}
 .up-item{
-  display:flex;justify-content:space-between;align-items:center;gap:12px;width:100%;
-  padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:transparent;
-  color:inherit;font-size:12.5px;text-align:left;cursor:pointer;
+  display:grid;gap:5px;width:100%;padding:7px 2px;background:transparent;border:0;
+  border-bottom:1px solid var(--line);color:inherit;text-align:left;cursor:pointer;
 }
-.up-item:hover{border-color:var(--signal)}
-.up-item:focus-visible{outline:2px solid var(--focus);outline-offset:1px}
+.up-list .up-item:last-child{border-bottom:0}
+.up-item:hover .up-name{color:var(--signal)}
+.up-item:focus-visible{outline:2px solid var(--focus);outline-offset:-2px;border-radius:6px}
+.up-main{display:flex;justify-content:space-between;align-items:baseline;gap:12px;min-width:0}
+.up-name{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.up-meta{font-size:11px;color:var(--fg3);flex:none;font-variant-numeric:tabular-nums}
+.up-track{display:block;height:3px;border-radius:2px;background:var(--sunken);overflow:hidden}
+.up-fill{display:block;height:100%;border-radius:2px;background:var(--warn)}
+.up-note{margin-top:6px}
