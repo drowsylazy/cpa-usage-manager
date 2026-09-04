@@ -341,6 +341,12 @@ type Request struct {
 	// Priced 标记该请求是否命中了非兜底计价规则（用于价格覆盖率统计）。
 	Priced        bool   `json:"priced"`
 	ReservationID string `json:"reservation_id,omitempty"`
+
+	// StatusCode 是失败请求的上游 HTTP 状态码（执行器路径观测；0=未记录）。
+	StatusCode int `json:"status_code,omitempty"`
+	// ErrorNote 是失败原因摘要（截断至 errorNoteMaxLen，写入前经凭据清洗；
+	// 路由中间尝试以 "目标→目标" 轨迹形式追加）。空串表示无异常。
+	ErrorNote string `json:"error_note,omitempty"`
 }
 
 // AuditEvent 是一条审计事件。

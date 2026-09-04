@@ -47,6 +47,7 @@ func insertRequestTx(ctx context.Context, s *Store, tx *sql.Tx, r Request) error
 	// 写入收口清洗：requests 表唯一的 INSERT 点，任何调用方带来的
 	// 上游凭据（宿主会把 api_key 填进 Source）都到不了库。
 	r.Source = RedactSource(r.Source)
+	r.ErrorNote = SanitizeErrorNote(r.ErrorNote)
 	res, err := s.execHotTx(ctx, tx,
 		`INSERT INTO requests (
 			id, ts, key_id, caller_id, model, provider, source, upstream_model,
@@ -54,15 +55,17 @@ func insertRequestTx(ctx context.Context, s *Store, tx *sql.Tx, r Request) error
 			input_tokens, output_tokens, reasoning_tokens, cached_tokens,
 			cache_read_tokens, cache_creation_tokens, total_tokens,
 			latency_ms, ttft_ms, generation_ms, tps_milli,
-			thinking_intensity, cost_micro_usd, currency, cost_native_micro, priced, reservation_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			thinking_intensity, cost_micro_usd, currency, cost_native_micro, priced, reservation_id,
+			status_code, error_note
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING`,
 		r.ID, r.TS.UTC().UnixMilli(), r.KeyID, r.CallerID, r.Model, r.Provider, r.Source, r.UpstreamModel,
 		r.AuthID, r.AuthLabel, r.AuthType, r.Tier, r.Result,
 		r.InputTokens, r.OutputTokens, r.ReasoningTokens, r.CachedTokens,
 		r.CacheReadTokens, r.CacheCreationTokens, r.TotalTokens,
 		r.LatencyMS, r.TTFTMS, r.GenerationMS, r.TPSMilli,
-		r.ThinkingIntensity, int64(r.CostMicroUSD), nativeCurrency(r), int64(r.CostNativeMicro), boolInt(r.Priced), r.ReservationID)
+		r.ThinkingIntensity, int64(r.CostMicroUSD), nativeCurrency(r), int64(r.CostNativeMicro), boolInt(r.Priced), r.ReservationID,
+		r.StatusCode, r.ErrorNote)
 	if err != nil {
 		return fmt.Errorf("写入请求记录 %s 失败: %w", r.ID, err)
 	}
@@ -744,7 +747,8 @@ const requestColumns = `id, ts, key_id, caller_id, model, provider, source, upst
 	input_tokens, output_tokens, reasoning_tokens, cached_tokens,
 	cache_read_tokens, cache_creation_tokens, total_tokens,
 	latency_ms, ttft_ms, generation_ms, tps_milli,
-	thinking_intensity, cost_micro_usd, currency, cost_native_micro, priced, reservation_id`
+	thinking_intensity, cost_micro_usd, currency, cost_native_micro, priced, reservation_id,
+	status_code, error_note`
 
 // RequestColumns 是 requests 表完整列清单的包外只读副本：服务层的请求
 // 明细查询必须引用它而不是手抄列清单——v12 曾因副本漏列导致明细接口
@@ -838,6 +842,7 @@ func scanRequest(sc interface{ Scan(...any) error }) (Request, error) {
 		&r.CacheReadTokens, &r.CacheCreationTokens, &r.TotalTokens,
 		&r.LatencyMS, &r.TTFTMS, &r.GenerationMS, &r.TPSMilli,
 		&r.ThinkingIntensity, &cost, &r.Currency, &costNative, &priced, &r.ReservationID,
+		&r.StatusCode, &r.ErrorNote,
 	)
 	if err != nil {
 		return Request{}, err
@@ -853,5 +858,24 @@ func scanRequest(sc interface{ Scan(...any) error }) (Request, error) {
 	}
 	r.Priced = priced != 0
 	r.Source = RedactSource(r.Source)
+	r.ErrorNote = RedactSource(r.ErrorNote)
 	return r, nil
+}
+
+// errorNoteMaxLen 是 error_note 的截断长度：足够定位问题，又不至于把上游
+// 的整段错误 HTML 塞进库与面板。
+const errorNoteMaxLen = 200
+
+// SanitizeErrorNote 清洗并截断失败原因摘要（导出供执行器路径写入前使用）。
+// 上游错误信息可能回显请求头或凭据（与 Source 字段同一泄露面），经
+// RedactSource 同款启发式清洗。
+func SanitizeErrorNote(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if len(s) > errorNoteMaxLen {
+		s = s[:errorNoteMaxLen]
+	}
+	return RedactSource(s)
 }

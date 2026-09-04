@@ -94,6 +94,10 @@ type Config struct {
 	DatabaseFile  string   `yaml:"database_file"`
 	BusyTimeout   Duration `yaml:"busy_timeout"`
 	RetentionDays int      `yaml:"retention_days"`
+	// AuditRetentionDays 是内部审计留痕（audit_events）的保留天数。
+	// route.* 高频审计已退役，表只承载低频管理操作留痕；设为 0 表示
+	// 与 retention_days 同步清理。默认 90 天。
+	AuditRetentionDays int `yaml:"audit_retention_days"`
 
 	Quota   QuotaConfig   `yaml:"quota"`
 	Pricing PricingConfig `yaml:"pricing"`
@@ -164,7 +168,23 @@ type BackupConfig struct {
 	// Hour 是每日触发的本地小时（0..23）。启动时若当天时刻已过且尚未备份，
 	// 会立即补一份（重启不漏当天的备份）。
 	Hour int `yaml:"hour"`
+	// MaxBytes 是备份导出/恢复允许的单文件上限（备份与恢复共用同一上限，
+	// 恢复的快照不可能比导出的更大）。0 或负值按默认 256MiB 处理。
+	// 历史默认曾是 64MiB——默认保留期一年、高频部署的 requests 表完全
+	// 可能超过它，届时备份与恢复双双失败，而那正是最需要备份的时候。
+	MaxBytes int64 `yaml:"max_bytes"`
 }
+
+// MaxBytesOrDefault 返回生效的备份上限（max_bytes 归一）。
+func (b BackupConfig) MaxBytesOrDefault() int64 {
+	if b.MaxBytes <= 0 {
+		return DefaultBackupMaxBytes
+	}
+	return b.MaxBytes
+}
+
+// DefaultBackupMaxBytes 是备份/恢复单文件的默认上限（256MiB）。
+const DefaultBackupMaxBytes int64 = 256 << 20
 
 // ModelsDevSyncConfig 是 models.dev 价格同步配置。
 type ModelsDevSyncConfig struct {
@@ -177,10 +197,11 @@ type ModelsDevSyncConfig struct {
 // Default 返回内置默认配置，与 DESIGN.md 第 6 节一致。
 func Default() Config {
 	return Config{
-		DataDir:       filepath.FromSlash("./data/cpa-usage-manager"),
-		DatabaseFile:  "cpa-usage-manager.db",
-		BusyTimeout:   Duration(5 * time.Second),
-		RetentionDays: 365,
+		DataDir:            filepath.FromSlash("./data/cpa-usage-manager"),
+		DatabaseFile:       "cpa-usage-manager.db",
+		BusyTimeout:        Duration(5 * time.Second),
+		RetentionDays:      365,
+		AuditRetentionDays: 90,
 		Quota: QuotaConfig{
 			Enabled: true,
 			Keys: KeysConfig{
@@ -215,8 +236,7 @@ func Default() Config {
 			Dir:     "backups",
 			Keep:    7,
 			Hour:    4,
-		},
-		ResponseCompression:         true,
+		}, ResponseCompression: true,
 		ResponseCompressionMinBytes: 1024,
 	}
 }
@@ -350,6 +370,9 @@ func (c *Config) Validate() error {
 	}
 	if c.RetentionDays < 1 || c.RetentionDays > 3650 {
 		errs = append(errs, fmt.Errorf("retention_days 须在 1..3650 之间，当前 %d", c.RetentionDays))
+	}
+	if c.AuditRetentionDays < 0 || c.AuditRetentionDays > 3650 {
+		errs = append(errs, fmt.Errorf("audit_retention_days 须在 0..3650 之间，当前 %d", c.AuditRetentionDays))
 	}
 	if c.Quota.Limits.MaxTokenEstimate < 1 {
 		errs = append(errs, fmt.Errorf("quota.limits.max_token_estimate 必须为正，当前 %d", c.Quota.Limits.MaxTokenEstimate))

@@ -670,15 +670,21 @@ type RetentionResult struct {
 	Requests     int64 `json:"requests"`
 	Rollups      int64 `json:"rollups"`
 	Reservations int64 `json:"reservations"`
+	AuditEvents  int64 `json:"audit_events"`
 	Deduped      int   `json:"deduped"`
 }
 
 // ApplyRetention 按保留天数清理 requests 与 usage_rollups，
-// 并回收早已终结的 reservations。plugin_keys / callers /
-// pricing_rules / audit_events 长期保留，不在此清理。
-func (s *Store) ApplyRetention(ctx context.Context, retentionDays int, now time.Time) (RetentionResult, error) {
+// 回收早已终结的 reservations，并按 auditDays 清理 audit_events
+// （route.* 高频审计已退役，表只承载低频管理留痕，仍设独立保留期防
+// 长期膨胀）。plugin_keys / callers / pricing_rules 长期保留，不在此清理。
+// auditDays <= 0 时跟随 retentionDays。
+func (s *Store) ApplyRetention(ctx context.Context, retentionDays, auditDays int, now time.Time) (RetentionResult, error) {
 	if retentionDays < 1 {
 		return RetentionResult{}, fmt.Errorf("retention_days 须为正，得到 %d", retentionDays)
+	}
+	if auditDays < 1 {
+		auditDays = retentionDays
 	}
 	cutoff := now.UTC().Add(-time.Duration(retentionDays) * 24 * time.Hour)
 	cutoffMillis := cutoff.UnixMilli()
@@ -712,6 +718,14 @@ func (s *Store) ApplyRetention(ctx context.Context, retentionDays int, now time.
 		cutoffMillis)
 	if err != nil {
 		return res, fmt.Errorf("清理 reservations 失败: %w", err)
+	}
+
+	// 内部审计留痕按独立保留期清理（audit_retention_days）。
+	res.AuditEvents, err = s.deleteBatchesTx(ctx,
+		`DELETE FROM audit_events WHERE id IN (SELECT id FROM audit_events WHERE ts < ? LIMIT ?)`,
+		now.UTC().Add(-time.Duration(auditDays)*24*time.Hour).UnixMilli())
+	if err != nil {
+		return res, fmt.Errorf("清理 audit_events 失败: %w", err)
 	}
 	return res, nil
 }

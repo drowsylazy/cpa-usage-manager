@@ -61,6 +61,9 @@ type CompiledRoute struct {
 type RouteMatch struct {
 	Route  CompiledRoute
 	Suffix string
+	// AIFallbackErr 在 ai_judge 失败回落兜底分支时带出判定错误文本
+	// （ResolveChain 按指针写入；调用方随结算行落 error_note）。
+	AIFallbackErr string
 }
 
 type routeSnapshot struct {
@@ -224,13 +227,15 @@ func (s *Service) filterCooldown(routeID int64, chain []string) []string {
 // ---------- 候选链求值 ----------
 
 // ResolveChain 求值路由规则得到有序候选链，再过滤冷却目标。
-// fellBack 为真表示 ai_judge 失败已自动回落兜底分支（此处落审计事件）；
+// fellBack 为真表示 ai_judge 失败已自动回落兜底分支；判定失败的错误文本
+// 存入 m.AIFallbackErr，由执行器随结算行写入 error_note（route.ai_fallback
+// 审计已退役——请求路径的高频写入不应进长期保留的 audit_events 表）；
 // 除 ErrAllTargetsCooling 外的错误表示规则运行期异常（变量缺失等），无链返回。
 //
 // digestFn 惰性提供请求摘要（ai_judge 的提示词素材）：Go 实参急切求值，
 // 若按值传入，不含 ai_judge 的规则也要白付一次整包解析——因此只在
 // UsesAI 时由调用方构造闭包（配合 sync.OnceValues），且首次调用才真正解析。
-func (s *Service) ResolveChain(ctx context.Context, m RouteMatch, env *routelang.Env, digestFn func() (string, error), attr *JudgeAttribution) ([]string, bool, error) {
+func (s *Service) ResolveChain(ctx context.Context, m *RouteMatch, env *routelang.Env, digestFn func() (string, error), attr *JudgeAttribution) ([]string, bool, error) {
 	if m.Route.Prog.UsesAI() {
 		if digestFn == nil {
 			digestFn = func() (string, error) { return "", nil }
@@ -241,17 +246,12 @@ func (s *Service) ResolveChain(ctx context.Context, m RouteMatch, env *routelang
 	if err != nil && chain == nil {
 		return nil, false, err
 	}
-	if fellBack && m.Route.ID != 0 {
-		// ID=0 是规则测试的临时路由，不落审计。
-		_ = s.st.AppendAudit(ctx, store.AuditEvent{
-			Action:     "route.ai_fallback",
-			EntityType: "model_route",
-			EntityID:   strconv.FormatInt(m.Route.ID, 10),
-			Detail: map[string]any{
-				"alias": m.Route.Alias,
-				"error": err.Error(),
-			},
-		})
+	if fellBack {
+		// 回落事实记入 RouteMatch 供结算行引用；ID=0（规则测试）不落库。
+		m.AIFallbackErr = ""
+		if err != nil && m.Route.ID != 0 {
+			m.AIFallbackErr = err.Error()
+		}
 	}
 	filtered := s.filterCooldown(m.Route.ID, chain)
 	if len(filtered) == 0 {
@@ -403,10 +403,10 @@ func HasThinkingSuffix(model string) bool {
 // 内容（rule 优先于已保存版本，支持未保存草稿）；prompt 合成为最小对话体，
 // 供 body_len/input_tokens 与 ai_judge 摘要使用。
 type TestRouteRequest struct {
-	ID     int64  `json:"id"`     // 编辑中的路由 ID；0=未保存草稿（不做冷却过滤）
+	ID     int64  `json:"id"` // 编辑中的路由 ID；0=未保存草稿（不做冷却过滤）
 	Alias  string `json:"alias"`
 	Rule   string `json:"rule"`
-	Model  string `json:"model"`  // 模拟请求模型名；空=用 alias
+	Model  string `json:"model"` // 模拟请求模型名；空=用 alias
 	Stream bool   `json:"stream"`
 	Source string `json:"source"` // 空=openai
 	Prompt string `json:"prompt"`

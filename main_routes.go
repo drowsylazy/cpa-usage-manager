@@ -30,6 +30,10 @@ type routedExecution struct {
 	plan        service.ReservePlan
 	reservation store.Reservation
 	claim       *usageClaim
+	// failoverTrail 收集本次请求的目标转移轨迹（"tgt→next(原因)"），
+	// 随最终结算行写入 error_note——中间尝试不入 requests 行，这里是唯一
+	// 的故障轨迹；此前落 audit_events（请求路径高频写、表却长期保留），已退役。
+	failoverTrail []string
 }
 
 // routeFailure 是路由路径上预占/求值阶段的结构化失败：非流式入口转
@@ -60,9 +64,10 @@ func resolveRouting(ctx context.Context, svc *service.Service, key *store.Plugin
 	// 评判子调用归属到触发请求的插件 Key：宿主随后的被动用量回调据此
 	// 改记密钥，不再以无主「-」行出现在明细里。
 	attr := &service.JudgeAttribution{KID: key.KID, CallerID: key.CallerID}
-	chain, fellBack, cerr := svc.ResolveChain(ctx, match, env, digestFn, attr)
-	// cerr 非空但 chain 也非空：ai_judge 失败已回落兜底分支（route.ai_fallback
-	// 审计在 ResolveChain 内落库），请求本身不受阻，按 DESIGN §12.2 继续执行。
+	chain, fellBack, cerr := svc.ResolveChain(ctx, &match, env, digestFn, attr)
+	// cerr 非空但 chain 也非空：ai_judge 失败已回落兜底分支（错误文本经
+	// match.AIFallbackErr 随结算行落 error_note），请求本身不受阻，
+	// 按 DESIGN §12.2 继续执行。
 	if cerr != nil && chain == nil {
 		if errors.Is(cerr, service.ErrAllTargetsCooling) {
 			return nil, &routeFailure{"upstream_error", "模型集合 " + baseAlias + " 的候选目标全部冷却中，请稍后重试"}
@@ -301,14 +306,33 @@ func cooldownSecondsFor(defaultSec int64, status int, headers http.Header) int64
 	return int64(d.Seconds())
 }
 
-// auditRouteFailover 记录一次目标转移审计（中间尝试不入 requests 行，
-// 这里是唯一的故障轨迹）。
-func auditRouteFailover(svc *service.Service, routeID int64, alias, from, to string, status int, cause string) {
-	detail := map[string]any{"alias": alias, "from": from, "to": to, "status": status, "cause": cause}
-	_ = svc.Store().AppendAudit(context.Background(), store.AuditEvent{
-		Action: "route.failover", EntityType: "model_route",
-		EntityID: strconv.FormatInt(routeID, 10), Detail: detail,
-	})
+// appendFailoverTrail 记录一次目标转移轨迹（中间尝试不入 requests 行，
+// 轨迹随最终结算行落 error_note；route.failover 审计已退役——请求路径的
+// 高频写入不应进长期保留的 audit_events 表）。
+func (re *routedExecution) appendFailoverTrail(from, to string, status int, cause string) {
+	if len(cause) > 60 {
+		cause = cause[:60]
+	}
+	if cause == "" {
+		cause = "status_" + strconv.Itoa(status)
+	}
+	if len(re.failoverTrail) < 4 { // 轨迹上限：超长链只留前 4 跳
+		re.failoverTrail = append(re.failoverTrail, from+"→"+to+"("+cause+")")
+	}
+}
+
+// failoverNote 汇总本次请求的异常轨迹为 error_note 文本：ai_judge 回落
+// 事实（若有）+ 目标转移链。无任何异常时返回空串。
+func (re *routedExecution) failoverNote() string {
+	parts := make([]string, 0, len(re.failoverTrail)+1)
+	if msg := re.match.AIFallbackErr; msg != "" {
+		if len(msg) > 80 {
+			msg = msg[:80]
+		}
+		parts = append(parts, "ai_judge 回落: "+msg)
+	}
+	parts = append(parts, re.failoverTrail...)
+	return strings.Join(parts, "; ")
 }
 
 func routeFailureCause(status int, err error) string {
@@ -332,12 +356,12 @@ func executeRoutedLoop(ctx context.Context, re *routedExecution, req rpcExecutor
 		if errHost == nil && status < 400 {
 			svc.MarkRouteSuccess(route.ID, tgt)
 			parsed, _ := usageparse.Parse(hostBody)
-			settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), status, parsed, upstream, re.claim)
+			settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), status, parsed, upstream, re.failoverNote(), re.claim)
 			return okEnvelope(rpcExecutorResponse{Payload: hostBody, Headers: headers})
 		}
 		if i < len(re.chain)-1 && routeFailureEligible(status, routeFailureCause(status, errHost), errHost) {
 			svc.MarkRouteFail(route.ID, tgt, cooldownSecondsFor(route.CooldownSeconds, status, headers))
-			auditRouteFailover(svc, route.ID, route.Alias, tgt, re.chain[i+1], status, routeFailureCause(status, errHost))
+			re.appendFailoverTrail(tgt, re.chain[i+1], status, routeFailureCause(status, errHost))
 			continue
 		}
 		// 终局：沿用直连语义——传输层失败不落行释放预占；HTTP 错误体透传并落行。
@@ -347,7 +371,7 @@ func executeRoutedLoop(ctx context.Context, re *routedExecution, req rpcExecutor
 			return errorEnvelope("upstream_error", errHost.Error()), nil
 		}
 		parsed, _ := usageparse.Parse(hostBody)
-		settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), status, parsed, upstream, re.claim)
+		settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), status, parsed, upstream, re.failoverNote(), re.claim)
 		return okEnvelope(rpcExecutorResponse{Payload: hostBody, Headers: headers})
 	}
 	// 不可达：ResolveChain 保证链非空，末次迭代必为终局分支。
@@ -391,7 +415,7 @@ func dialHostStream(re *routedExecution, req rpcExecutorRequest, rw *bodyRewrite
 	if err != nil {
 		if index < len(re.chain)-1 && routeFailureEligible(0, err.Error(), err) {
 			re.svc.MarkRouteFail(re.match.Route.ID, tgt, re.match.Route.CooldownSeconds)
-			auditRouteFailover(re.svc, re.match.Route.ID, re.match.Route.Alias, tgt, re.chain[index+1], 0, err.Error())
+			re.appendFailoverTrail(tgt, re.chain[index+1], 0, err.Error())
 			return stream, dialTransfer, nil
 		}
 		return stream, dialFailed, err
@@ -400,7 +424,7 @@ func dialHostStream(re *routedExecution, req rpcExecutorRequest, rw *bodyRewrite
 		_ = closeHostModelStream(stream.StreamID)
 		if index < len(re.chain)-1 && routeFailureEligible(stream.StatusCode, "", nil) {
 			re.svc.MarkRouteFail(re.match.Route.ID, tgt, cooldownSecondsFor(re.match.Route.CooldownSeconds, stream.StatusCode, stream.Headers))
-			auditRouteFailover(re.svc, re.match.Route.ID, re.match.Route.Alias, tgt, re.chain[index+1], stream.StatusCode, "")
+			re.appendFailoverTrail(tgt, re.chain[index+1], stream.StatusCode, "")
 			return rpcHostModelStreamResponse{}, dialTransfer, nil
 		}
 		return stream, dialFailed, errHostStatus(stream.StatusCode)
@@ -432,20 +456,20 @@ func pumpRoutedStream(re *routedExecution, req rpcExecutorRequest, startedAt tim
 		if errRead != nil {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), re.claim)
+			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), errRead.Error(), re.claim)
 			return errRead
 		}
 		var chunk rpcHostModelStreamReadResponse
 		if err := json.Unmarshal(chunkRaw, &chunk); err != nil {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), re.claim)
+			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), err.Error(), re.claim)
 			return err
 		}
 		if chunk.Error != "" {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), re.claim)
+			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), chunk.Error, re.claim)
 			return errors.New(chunk.Error)
 		}
 		if len(chunk.Payload) > 0 {
@@ -457,7 +481,7 @@ func pumpRoutedStream(re *routedExecution, req rpcExecutorRequest, startedAt tim
 			if err := emitPluginStreamChunk(pluginStreamID, chunk.Payload); err != nil {
 				completedAt = time.Now()
 				parsed, _ := acc.Result()
-				settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 499, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), re.claim)
+				settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 499, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), err.Error(), re.claim)
 				return err
 			}
 		}

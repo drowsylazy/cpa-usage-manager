@@ -62,12 +62,18 @@ func (s *Service) SetCallerEnabled(ctx context.Context, id string, enabled bool,
 
 // ---------- 维护动作 ----------
 
-// BackupMaxBytes 是备份接口允许导出的上限（DESIGN §5.1）。
-const BackupMaxBytes int64 = 64 << 20
+// backupMaxBytes 返回当前配置生效的备份/恢复单文件上限。
+// 上限由 backup.max_bytes 配置（默认 256MiB），备份导出与恢复上传共用。
+func (s *Service) backupMaxBytes() int64 {
+	return s.cfg.Backup.MaxBytesOrDefault()
+}
+
+// BackupMaxLimit 供 httpapi 在恢复上传的 LimitReader 上使用同一上限。
+func (s *Service) BackupMaxLimit() int64 { return s.backupMaxBytes() }
 
 // Backup 把数据库写入 w，并记审计。
 func (s *Service) Backup(ctx context.Context, w io.Writer, actor string) (store.BackupResult, error) {
-	res, err := s.st.BackupTo(ctx, w, store.BackupOptions{MaxBytes: BackupMaxBytes})
+	res, err := s.st.BackupTo(ctx, w, store.BackupOptions{MaxBytes: s.backupMaxBytes()})
 	if err != nil {
 		return store.BackupResult{}, err
 	}
@@ -90,7 +96,7 @@ func (s *Service) RunAutoBackup(ctx context.Context, dir string, keep int) (stri
 	}
 	tmpPath := tmp.Name()
 	cleanup := func() { _ = tmp.Close(); _ = os.Remove(tmpPath) }
-	res, err := s.st.BackupTo(ctx, tmp, store.BackupOptions{MaxBytes: BackupMaxBytes})
+	res, err := s.st.BackupTo(ctx, tmp, store.BackupOptions{MaxBytes: s.backupMaxBytes()})
 	if err != nil {
 		cleanup()
 		return "", fmt.Errorf("备份快照写出失败: %w", err)
@@ -138,7 +144,7 @@ func (s *Service) rotateAutoBackups(dir string, keep int) {
 // 注意：备份文件不含 key-peppers。恢复到另一台机器时必须同时带上
 // data_dir/key-peppers，否则 Key 密文无法解密（哈希校验仍可用）。
 func (s *Service) Restore(ctx context.Context, src io.Reader, actor string) (store.RestoreResult, error) {
-	res, err := s.st.RestoreFrom(ctx, src, BackupMaxBytes)
+	res, err := s.st.RestoreFrom(ctx, src, s.backupMaxBytes())
 	if err != nil {
 		return store.RestoreResult{}, err
 	}
@@ -176,7 +182,7 @@ func (s *Service) Reset(ctx context.Context, opts store.ResetOptions, actor stri
 func (s *Service) Maintain(ctx context.Context, vacuum bool, actor string) (store.RetentionResult, error) {
 	cfg := s.Config()
 	now := time.Now().UTC()
-	res, err := s.st.ApplyRetention(ctx, cfg.RetentionDays, now)
+	res, err := s.st.ApplyRetention(ctx, cfg.RetentionDays, cfg.AuditRetentionDays, now)
 	if err != nil {
 		return store.RetentionResult{}, err
 	}
@@ -392,7 +398,8 @@ func writeCSV(cw *csv.Writer, header []string, n int, row func(i int) []string) 
 }
 
 var requestCSVHeader = []string{"id", "ts", "key_id", "caller_id", "model", "upstream_model", "provider", "source",
-	"auth_label", "auth_type", "tier", "result", "input_tokens", "output_tokens", "reasoning_tokens",
+	"auth_label", "auth_type", "tier", "result", "status_code", "error_note",
+	"input_tokens", "output_tokens", "reasoning_tokens",
 	"cached_tokens", "cache_read_tokens", "cache_creation_tokens", "total_tokens",
 	"latency_ms", "ttft_ms", "tps", "thinking_intensity", "cost", "currency", "cost_usd", "priced"}
 
@@ -402,7 +409,7 @@ func requestCSVRow(r store.Request) []string {
 		currency = "USD"
 	}
 	return []string{r.ID, r.TS.Format(time.RFC3339), r.KeyID, r.CallerID, r.Model, r.UpstreamModel, r.Provider, r.Source,
-		r.AuthLabel, r.AuthType, r.Tier, r.Result,
+		r.AuthLabel, r.AuthType, r.Tier, r.Result, itoa(int64(r.StatusCode)), r.ErrorNote,
 		itoa(r.InputTokens), itoa(r.OutputTokens), itoa(r.ReasoningTokens), itoa(r.CachedTokens),
 		itoa(r.CacheReadTokens), itoa(r.CacheCreationTokens), itoa(r.TotalTokens),
 		itoa(r.LatencyMS), itoa(r.TTFTMS), milliString(r.TPSMilli), r.ThinkingIntensity,

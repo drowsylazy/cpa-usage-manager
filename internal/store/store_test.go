@@ -207,7 +207,7 @@ func TestApplyRetention(t *testing.T) {
 		t.Fatalf("准备 retention 数据失败: %v", err)
 	}
 
-	got, err := s.ApplyRetention(ctx, 1, now)
+	got, err := s.ApplyRetention(ctx, 1, 0, now)
 	if err != nil {
 		t.Fatalf("ApplyRetention 失败: %v", err)
 	}

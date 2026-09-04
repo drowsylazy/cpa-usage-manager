@@ -936,7 +936,7 @@ func (a *API) restore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	noStore(w)
-	res, e := a.svc.Restore(r.Context(), io.LimitReader(r.Body, service.BackupMaxBytes+1), r.URL.Query().Get("actor"))
+	res, e := a.svc.Restore(r.Context(), io.LimitReader(r.Body, a.svc.BackupMaxLimit()+1), r.URL.Query().Get("actor"))
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 400)
 		return

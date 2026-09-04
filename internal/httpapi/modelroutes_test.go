@@ -157,8 +157,8 @@ func TestModelRouteEntityDecode(t *testing.T) {
 	w = do(t, a, "GET", base+"/model-routes", "")
 	var list struct {
 		Items []struct {
-			Alias string `json:"alias"`
-			Rule  string `json:"rule"`
+			Alias string   `json:"alias"`
+			Rule  string   `json:"rule"`
 			Refs  []string `json:"refs"`
 		} `json:"items"`
 	}

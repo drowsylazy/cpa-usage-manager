@@ -8,7 +8,7 @@ import (
 
 // SchemaVersion 是本代码期望的数据库 schema 版本。
 // 打开库时若发现库版本更高，说明是被更新版插件写过的库，拒绝降级使用。
-const SchemaVersion = 13
+const SchemaVersion = 14
 
 // migration 是一次版本化迁移。
 type migration struct {
@@ -437,6 +437,20 @@ var migrations = []migration{
 			// 整体删除表与全链路死代码。
 			`DROP TABLE IF EXISTS auth_quota_window_baselines`,
 			`DROP TABLE IF EXISTS auth_quota_snapshots`,
+		},
+	},
+	{
+		version: 14,
+		name:    "request_failure_detail",
+		stmts: []string{
+			// ---- 失败请求的原因留痕 ----
+			// 此前失败行只有 result='error' 一个词，429/401/超时无从分辨，
+			// 排查只能靠宿主日志。status_code 记上游 HTTP 状态（执行器路径），
+			// error_note 记截断后的错误摘要（写入前经 RedactSource 同款清洗，
+			// 上游错误信息可能回显凭据）。历史行为空，面板显示 "-"。
+			`ALTER TABLE requests ADD COLUMN status_code INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE requests ADD COLUMN error_note TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX idx_requests_status_ts ON requests(status_code, ts DESC)`,
 		},
 	},
 }

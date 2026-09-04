@@ -714,6 +714,8 @@ func pluginRegistration(schema uint32) rpcRegistration {
 				{Name: "database_file", Type: "string", Description: "data_dir 下的 SQLite 文件名（默认 cpa-usage-manager.db）。"},
 				{Name: "busy_timeout", Type: "string", Description: "SQLite 忙等超时，如 5s。"},
 				{Name: "retention_days", Type: "integer", Description: "逐请求明细与分钟聚合保留天数（1..3650）。"},
+				{Name: "audit_retention_days", Type: "integer", Description: "内部审计留痕保留天数（0=跟随 retention_days，默认 90）。"},
+				{Name: "backup.max_bytes", Type: "integer", Description: "备份导出/恢复的单文件上限字节（默认 256MiB）。"},
 				{Name: "quota.enabled", Type: "boolean", Description: "false 退回纯统计（被动 usage 记录），不接管前端鉴权。"},
 				{Name: "quota.keys.pepper_env", Type: "string", Description: "pepper 环境变量名（默认 CPA_USAGE_MANAGER_KEY_PEPPERS）。"},
 				{Name: "quota.keys.pepper_file", Type: "string", Description: "data_dir 下的 pepper 文件（默认 key-peppers，0600）。"},
@@ -987,7 +989,7 @@ func execute(body []byte) ([]byte, error) {
 	// 非流式响应体几乎总带 usage，这里只做非阻塞探测：宿主记账发生在
 	// 本次调用返回之后，同步等待只会白等一个超时。缺失的明细由认领在
 	// 宽限期内按请求 ID 回填。
-	settleReservation(svc, plan, reservation, req, startedAt, time.Time{}, completedAt, status, parsed, usageparse.SniffModel(hostBody), claim)
+	settleReservation(svc, plan, reservation, req, startedAt, time.Time{}, completedAt, status, parsed, usageparse.SniffModel(hostBody), hostErrorNote(status, hostBody), claim)
 	return okEnvelope(rpcExecutorResponse{Payload: hostBody, Headers: headers})
 }
 
@@ -1054,7 +1056,7 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 			case dialFailed:
 				if statusErr, ok := dialErr.(errHostStatus); ok {
 					// HTTP 错误：落行结算（与直连语义一致），错误文本关流。
-					settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), int(statusErr), usageparse.Usage{}, targetWithSuffix(re.chain[i], re.match.Suffix), re.claim)
+					settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), int(statusErr), usageparse.Usage{}, targetWithSuffix(re.chain[i], re.match.Suffix), re.failoverNote(), re.claim)
 					return dialErr
 				}
 				re.claim.release(0)
@@ -1106,7 +1108,7 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 	}
 	if stream.StatusCode >= 400 {
 		_ = closeHostModelStream(stream.StreamID)
-		settleReservation(svc, plan, reservation, req, startedAt, time.Time{}, time.Now(), stream.StatusCode, usageparse.Usage{}, "", claim)
+		settleReservation(svc, plan, reservation, req, startedAt, time.Time{}, time.Now(), stream.StatusCode, usageparse.Usage{}, "", http.StatusText(stream.StatusCode), claim)
 		return fmt.Errorf("host model status %d", stream.StatusCode)
 	}
 	if strings.TrimSpace(stream.StreamID) == "" {
@@ -1127,20 +1129,20 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 		if errRead != nil {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), claim)
+			settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), errRead.Error(), claim)
 			return errRead
 		}
 		var chunk rpcHostModelStreamReadResponse
 		if err := json.Unmarshal(chunkRaw, &chunk); err != nil {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), claim)
+			settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), err.Error(), claim)
 			return err
 		}
 		if chunk.Error != "" {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), claim)
+			settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), chunk.Error, claim)
 			return fmt.Errorf("%s", chunk.Error)
 		}
 		if len(chunk.Payload) > 0 {
@@ -1154,7 +1156,7 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 			if err := emitPluginStreamChunk(pluginStreamID, chunk.Payload); err != nil {
 				completedAt = time.Now()
 				parsed, _ := acc.Result()
-				settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 499, parsed, acc.Model(), claim)
+				settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 499, parsed, acc.Model(), err.Error(), claim)
 				return err
 			}
 		}
@@ -1184,9 +1186,12 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 
 // settleReservation 解析 usage 结算预占并写请求记录；结算失败时释放预占兜底。
 // upstreamModel 是执行器从上游响应里嗅探到的真实模型名（可为空）。
-func settleReservation(svc *service.Service, plan service.ReservePlan, reservation store.Reservation, req rpcExecutorRequest, startedAt, firstChunkAt, completedAt time.Time, status int, usage usageparse.Usage, upstreamModel string, claim *usageClaim) {
+// errNote 是失败原因摘要（路由流量的目标转移轨迹也在此），
+// 写入前经 store.SanitizeErrorNote 清洗截断。
+func settleReservation(svc *service.Service, plan service.ReservePlan, reservation store.Reservation, req rpcExecutorRequest, startedAt, firstChunkAt, completedAt time.Time, status int, usage usageparse.Usage, upstreamModel, errNote string, claim *usageClaim) {
 	r := buildRequest(svc, reservation, req, plan.Meta, startedAt, firstChunkAt, completedAt, status)
 	r.UpstreamModel = upstreamModel
+	r.ErrorNote = errNote
 	// 认领已在结算前收到宿主口径（少见但可能）：结算前补齐展示字段，
 	// 使请求行与它的分钟聚合维度一致。
 	if rec, ok := claim.wait(0); ok {
@@ -1264,6 +1269,7 @@ func buildRequest(svc *service.Service, reservation store.Reservation, req rpcEx
 	}
 	if status >= http.StatusBadRequest {
 		r.Result = store.ResultError
+		r.StatusCode = status
 	} else {
 		r.Result = store.ResultOK
 	}
@@ -1275,6 +1281,26 @@ func millisBetween(from, to time.Time) int64 {
 		return 0
 	}
 	return to.Sub(from).Milliseconds()
+}
+
+// hostErrorNote 从宿主响应构造失败摘要：HTTP 错误行（状态码+原因短语），
+// 传输层失败时为空串（错误文本在错误信封里，客户端已可见；行内记状态码
+// 已足够定位）。最终清洗截断由 store.SanitizeErrorNote 在写入点完成。
+func hostErrorNote(status int, hostBody []byte) string {
+	if status < http.StatusBadRequest {
+		return ""
+	}
+	note := fmt.Sprintf("HTTP %d %s", status, http.StatusText(status))
+	// 上游错误体里的 message 字段比状态短语更有定位价值，浅取一层。
+	var dec struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(hostBody, &dec) == nil && dec.Error.Message != "" {
+		note += ": " + dec.Error.Message
+	}
+	return note
 }
 
 func requestBody(req rpcExecutorRequest) []byte {

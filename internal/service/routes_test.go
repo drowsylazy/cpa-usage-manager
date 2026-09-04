@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -109,7 +108,7 @@ func TestResolveChainCooldownFilterOrder(t *testing.T) {
 	m := RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
 	env := &routelang.Env{Vars: map[string]any{"input_tokens": int64(1), "body_len": int64(2), "model": "auto", "stream": false, "thinking_effort": "", "source": "openai"}}
 
-	chain, fellBack, err := s.ResolveChain(ctx, m, env, nil, nil)
+	chain, fellBack, err := s.ResolveChain(ctx, &m, env, nil, nil)
 	if err != nil || fellBack {
 		t.Fatalf("首次求值失败: %v fellBack=%v", err, fellBack)
 	}
@@ -118,7 +117,7 @@ func TestResolveChainCooldownFilterOrder(t *testing.T) {
 	}
 	// 冷却 b：过滤保序摘除。
 	s.MarkRouteFail(row.ID, "B", row.CooldownSeconds)
-	chain, _, err = s.ResolveChain(ctx, m, env, nil, nil)
+	chain, _, err = s.ResolveChain(ctx, &m, env, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +127,7 @@ func TestResolveChainCooldownFilterOrder(t *testing.T) {
 	// 全冷却 → 哨兵。
 	s.MarkRouteFail(row.ID, "a", row.CooldownSeconds)
 	s.MarkRouteFail(row.ID, "c", row.CooldownSeconds)
-	if _, _, err := s.ResolveChain(ctx, m, env, nil, nil); !errors.Is(err, ErrAllTargetsCooling) {
+	if _, _, err := s.ResolveChain(ctx, &m, env, nil, nil); !errors.Is(err, ErrAllTargetsCooling) {
 		t.Fatalf("全冷却应返回哨兵: %v", err)
 	}
 	// 到期自然恢复：把截止时刻拨回过去（同包内直接操作状态器，避免真实睡眠）。
@@ -137,7 +136,7 @@ func TestResolveChainCooldownFilterOrder(t *testing.T) {
 		s.cooldowns[k] = time.Now().Add(-time.Second)
 	}
 	s.coolMu.Unlock()
-	chain, _, err = s.ResolveChain(ctx, m, env, nil, nil)
+	chain, _, err = s.ResolveChain(ctx, &m, env, nil, nil)
 	if err != nil || len(chain) != 3 {
 		t.Fatalf("到期后应恢复全链: %v %v", chain, err)
 	}
@@ -155,12 +154,12 @@ func TestMarkRouteSuccessClearsCooldown(t *testing.T) {
 	env := &routelang.Env{Vars: map[string]any{"input_tokens": int64(1), "body_len": int64(2), "model": "auto2", "stream": false, "thinking_effort": "", "source": "openai"}}
 	s.MarkRouteFail(row.ID, "a", row.CooldownSeconds)
 	s.MarkRouteFail(row.ID, "b", row.CooldownSeconds)
-	if _, _, err := s.ResolveChain(ctx, m, env, nil, nil); !errors.Is(err, ErrAllTargetsCooling) {
+	if _, _, err := s.ResolveChain(ctx, &m, env, nil, nil); !errors.Is(err, ErrAllTargetsCooling) {
 		t.Fatalf("全冷却应返回哨兵: %v", err)
 	}
 	// a 尝试成功即恢复：不再干等冷却到期，b 仍冷却。
 	s.MarkRouteSuccess(row.ID, "A")
-	chain, _, err := s.ResolveChain(ctx, m, env, nil, nil)
+	chain, _, err := s.ResolveChain(ctx, &m, env, nil, nil)
 	if err != nil || len(chain) != 1 || chain[0] != "a" {
 		t.Fatalf("成功后应只恢复 a: %v %v", chain, err)
 	}
@@ -232,7 +231,7 @@ func TestAIJudgeEvalWithCache(t *testing.T) {
 	env := judgeEnv(s, "smart")
 
 	digestFn := sync.OnceValues(func() (string, error) { return "帮我写个排序算法", nil })
-	chain, fellBack, err := s.ResolveChain(ctx, m, env, digestFn, nil)
+	chain, fellBack, err := s.ResolveChain(ctx, &m, env, digestFn, nil)
 	if err != nil || fellBack {
 		t.Fatalf("求值失败: %v fellBack=%v", err, fellBack)
 	}
@@ -241,7 +240,7 @@ func TestAIJudgeEvalWithCache(t *testing.T) {
 	}
 	// 相同变量组合再次求值 → 缓存命中，不再发起调用。
 	env2 := judgeEnv(s, "smart")
-	if _, _, err := s.ResolveChain(ctx, m, env2, nil, nil); err != nil {
+	if _, _, err := s.ResolveChain(ctx, &m, env2, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if n := calls.Load(); n != 1 {
@@ -267,7 +266,7 @@ func TestAIJudgeFailureFallsBackWithAudit(t *testing.T) {
 	}
 	m := RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
 
-	chain, fellBack, err := s.ResolveChain(ctx, m, judgeEnv(s, "smart"), nil, nil)
+	chain, fellBack, err := s.ResolveChain(ctx, &m, judgeEnv(s, "smart"), nil, nil)
 	if !fellBack {
 		t.Fatalf("AI 失败应回落兜底: err=%v fellBack=%v", err, fellBack)
 	}
@@ -278,18 +277,20 @@ func TestAIJudgeFailureFallsBackWithAudit(t *testing.T) {
 	if len(chain) != 1 || chain[0] != "mini" {
 		t.Fatalf("兜底链应为 [mini]: %v", chain)
 	}
-	events, aerr := st.ListAudit(ctx, 10, 0)
+	// v0.8 起 ai_fallback 不再落 audit_events（请求路径高频写+表长期保留
+	// 的组合不可持续），判定错误经 RouteMatch.AIFallbackErr 带出、由执行器
+	// 随结算行写 error_note。
+	if m.AIFallbackErr == "" {
+		t.Fatal("AIFallbackErr 应带出判定错误文本")
+	}
+	events, aerr := st.ListAudit(ctx, 50, 0)
 	if aerr != nil {
 		t.Fatal(aerr)
 	}
-	found := false
 	for _, e := range events {
-		if e.Action == "route.ai_fallback" && e.EntityID == strconv.FormatInt(row.ID, 10) {
-			found = true
+		if e.Action == "route.ai_fallback" {
+			t.Fatalf("route.ai_fallback 审计应已退役，仍发现事件: %+v", e)
 		}
-	}
-	if !found {
-		t.Fatal("缺少 route.ai_fallback 审计事件")
 	}
 }
 
@@ -410,7 +411,7 @@ func TestJudgeSingleFlightMergesConcurrentCalls(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _, _ = s.ResolveChain(ctx, m, judgeEnv(s, "sf"), nil, nil)
+			_, _, _ = s.ResolveChain(ctx, &m, judgeEnv(s, "sf"), nil, nil)
 		}()
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -478,7 +479,7 @@ func TestResolveChainDigestLazy(t *testing.T) {
 	}
 	m := RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
 	env := &routelang.Env{Vars: map[string]any{"input_tokens": int64(1), "body_len": int64(2), "model": "plain", "stream": false, "thinking_effort": "", "source": "openai"}}
-	if _, _, err := s.ResolveChain(ctx, m, env, digestFn, nil); err != nil {
+	if _, _, err := s.ResolveChain(ctx, &m, env, digestFn, nil); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 0 {
@@ -498,7 +499,7 @@ func TestResolveChainDigestLazy(t *testing.T) {
 		t.Fatal(err)
 	}
 	m2 := RouteMatch{Route: CompiledRoute{ModelRoute: row2, Prog: prog2}}
-	if _, _, err := s.ResolveChain(ctx, m2, judgeEnv(s, "smart"), digestFn, nil); err != nil {
+	if _, _, err := s.ResolveChain(ctx, &m2, judgeEnv(s, "smart"), digestFn, nil); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 1 {
@@ -658,13 +659,13 @@ func TestCooldownPolicyForceIgnoresCooling(t *testing.T) {
 	env := &routelang.Env{Vars: map[string]any{"input_tokens": int64(1), "body_len": int64(2), "model": "autop", "stream": false, "thinking_effort": "", "source": "openai"}}
 	s.MarkRouteFail(row.ID, "a", row.CooldownSeconds)
 	s.MarkRouteFail(row.ID, "b", row.CooldownSeconds)
-	if _, _, err := s.ResolveChain(ctx, m, env, nil, nil); !errors.Is(err, ErrAllTargetsCooling) {
+	if _, _, err := s.ResolveChain(ctx, &m, env, nil, nil); !errors.Is(err, ErrAllTargetsCooling) {
 		t.Fatalf("block 策略全冷却应拒绝: %v", err)
 	}
 	// 改为 force：全冷却时按原链照打。
 	row.CooldownPolicy = "force"
 	m = RouteMatch{Route: CompiledRoute{ModelRoute: row, Prog: prog}}
-	chain, _, err := s.ResolveChain(ctx, m, env, nil, nil)
+	chain, _, err := s.ResolveChain(ctx, &m, env, nil, nil)
 	if err != nil || len(chain) != 2 || chain[0] != "a" || chain[1] != "b" {
 		t.Fatalf("force 策略应返回原链: chain=%v err=%v", chain, err)
 	}
