@@ -796,6 +796,7 @@ type Stats struct {
 	AuditEvents   int64 `json:"audit_events"`
 	HeldReserves  int64 `json:"held_reservations"`
 	FileBytes     int64 `json:"file_bytes"`
+	WalBytes      int64 `json:"wal_bytes"`
 	Writable      bool  `json:"writable"`
 	// IORetries 是本进程累计的瞬时故障重试次数。持续增长说明数据目录
 	// 正被外部程序（杀毒/同步盘）干扰，即使请求最终成功也值得处理。
@@ -830,6 +831,11 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 	}
 	if fi, err := os.Stat(s.opts.Path); err == nil {
 		out.FileBytes = fi.Size()
+	}
+	// WAL 体积单独汇报：持续增长说明 checkpoint 没跟上（长读事务占着
+	// 快照），是库膨胀问题的第一信号。
+	if fi, err := os.Stat(s.opts.Path + "-wal"); err == nil {
+		out.WalBytes = fi.Size()
 	}
 	// 重试计数取最新值：上面的统计本身也可能触发重试。
 	out.IORetries = s.Retries()

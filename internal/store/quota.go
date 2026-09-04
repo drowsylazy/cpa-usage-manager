@@ -509,3 +509,49 @@ func (s *Store) ListAudit(ctx context.Context, limit, offset int) ([]AuditEvent,
 	}
 	return out, nil
 }
+
+// HeldReservation 是在途预占的展示行（GET /reservations/held）。
+type HeldReservation struct {
+	ID             string      `json:"id"`
+	KeyID          string      `json:"key_id"`
+	Model          string      `json:"model"`
+	HeldMicroUSD   money.Micro `json:"held_micro_usd"`
+	ReservedTokens int64       `json:"reserved_tokens"`
+	CreatedAt      time.Time   `json:"created_at"`
+	HeartbeatAt    time.Time   `json:"heartbeat_at"`
+	AgeSec         int64       `json:"age_sec"`
+	// StaleMark 标记心跳已超时但行仍在（stale 清扫的候选）。
+	StaleMark bool `json:"stale"`
+}
+
+// ListHeldReservations 返回全部在途（status='held'）预占，按创建时间倒序，
+// 供系统页「进行中请求」面板。走 idx_reservations_key_status 的 status 前缀。
+func (s *Store) ListHeldReservations(ctx context.Context, staleBefore time.Time, now time.Time, limit int) ([]HeldReservation, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	out := make([]HeldReservation, 0) // 非 nil：JSON 序列化为 [] 而不是 null
+	err := s.Read(ctx, func(q Querier) error {
+		rows, err := q.QueryContext(ctx,
+			`SELECT id, key_id, model, held_micro_usd, reserved_tokens, created_at, heartbeat_at
+			 FROM reservations WHERE status = 'held'
+			 ORDER BY created_at DESC LIMIT ?`, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var h HeldReservation
+			var held int64
+			if err := rows.Scan(&h.ID, &h.KeyID, &h.Model, &held, &h.ReservedTokens, &h.CreatedAt, &h.HeartbeatAt); err != nil {
+				return err
+			}
+			h.HeldMicroUSD = money.Micro(held)
+			h.AgeSec = int64(now.Sub(h.CreatedAt).Seconds())
+			h.StaleMark = !h.HeartbeatAt.After(staleBefore)
+			out = append(out, h)
+		}
+		return rows.Err()
+	})
+	return out, err
+}

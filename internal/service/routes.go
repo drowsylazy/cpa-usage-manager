@@ -1009,3 +1009,66 @@ func (c *judgeLRU) put(key, val string) {
 	el := c.ll.PushFront(&lruItem{key: key, val: val, exp: time.Now().Add(judgeCacheTTL)})
 	c.items[key] = el
 }
+
+// ---------- 目标健康快照 ----------
+
+// RouteTargetHealth 是单个路由目标在面板健康视图中的读数。
+type RouteTargetHealth struct {
+	Alias       string `json:"alias"`
+	Target      string `json:"target"`
+	Cooling     bool   `json:"cooling"`
+	CooldownSec int64  `json:"cooldown_remaining_sec"`
+	// Fail60m / Total60m 是最近 60 分钟该目标（按 upstream_model 裸名）的
+	// 失败与总请求数，来自分钟聚合。
+	Fail60m  int64 `json:"fail_60m"`
+	Total60m int64 `json:"total_60m"`
+}
+
+// RoutesHealth 汇总启用路由的全部目标健康状态（进程内冷却 + 近期失败统计）。
+func (s *Service) RoutesHealth(ctx context.Context) ([]RouteTargetHealth, error) {
+	// 编译版列表：Refs（引用目标集）只在编译后可得；坏规则优雅降级为
+	// 无 Refs（面板显示空目标），不让整个健康面板 500。
+	routes, err := s.ListRoutesCompiled(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	windowStart := now.UTC().Add(-60*time.Minute).Unix() / 60
+
+	// 近 60 分钟按 (model, result) 聚合（rollups 的 model 列即别名）。
+	totals := map[string]int64{}
+	rows, err := s.st.RecentRouteStats(ctx, windowStart)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		totals[r.Model+"|"+r.Result] = r.Count
+	}
+
+	out := make([]RouteTargetHealth, 0, 16)
+	for _, rt := range routes {
+		if !rt.Enabled {
+			continue
+		}
+		for _, tgt := range rt.Refs {
+			h := RouteTargetHealth{Alias: rt.Alias, Target: tgt}
+			if until, ok := s.CooldownUntil(rt.ID, tgt); ok && until.After(now) {
+				h.Cooling = true
+				h.CooldownSec = int64(time.Until(until).Seconds())
+			}
+			// rollups 的 model 列即别名列：路由流量结算时 model=别名。
+			h.Total60m = totals[rt.Alias+"|ok"] + totals[rt.Alias+"|error"]
+			h.Fail60m = totals[rt.Alias+"|error"]
+			out = append(out, h)
+		}
+	}
+	return out, nil
+}
+
+// bareOf 剥「渠道/」前缀（与认领桶归一同思路）。
+func bareOf(m string) string {
+	if i := strings.LastIndex(m, "/"); i >= 0 && i+1 < len(m) {
+		return m[i+1:]
+	}
+	return m
+}

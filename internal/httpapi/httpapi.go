@@ -78,6 +78,8 @@ func (a *API) register() {
 
 	a.route("/keys", a.keys)
 	a.route("/keys/candidates", a.keyCandidates)
+	a.route("/reservations/held", a.heldReservations)
+	a.route("/model-routes/health", a.modelRoutesHealth)
 	a.route("/keys/issue", a.issue)
 	a.route("/keys/update", a.updateKey)
 	a.route("/keys/rotate", a.rotate)
@@ -343,6 +345,7 @@ func (a *API) keys(w http.ResponseWriter, r *http.Request) {
 	}
 	jsonOut(w, map[string]any{"items": items, "total": total, "status_counts": counts}, 200)
 }
+
 // keyCandidates 是请求明细密钥筛选的轻量候选接口：全量 Key 的 kid+label，
 // 不含额度/统计字段。服务端分页后 /keys 只覆盖当前页，联想候选改走这里。
 func (a *API) keyCandidates(w http.ResponseWriter, r *http.Request) {
@@ -364,6 +367,22 @@ func (a *API) keyCandidates(w http.ResponseWriter, r *http.Request) {
 		out = append(out, cand{KID: k.KID, Label: k.Label})
 	}
 	jsonOut(w, map[string]any{"items": out}, 200)
+}
+
+// heldReservations 返回在途预占（进行中请求）视图：kid、模型、已耗时、
+// 预占金额、最近心跳；心跳超时的行标记 stale。供系统页「进行中请求」面板。
+func (a *API) heldReservations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.WriteHeader(405)
+		return
+	}
+	staleBefore := time.Now().Add(-a.svc.Config().Quota.Stream.StaleReservationTimeout.Std())
+	items, e := a.st.ListHeldReservations(r.Context(), staleBefore, time.Now(), 100)
+	if e != nil {
+		jsonOut(w, map[string]string{"error": e.Error()}, 500)
+		return
+	}
+	jsonOut(w, map[string]any{"items": items, "count": len(items)}, 200)
 }
 
 func (a *API) issue(w http.ResponseWriter, r *http.Request) {

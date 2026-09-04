@@ -35,9 +35,23 @@ type NotifySettings struct {
 	SingleCostMicroUSD int64 `json:"single_cost_micro_usd"`
 	// 单请求计费 Token 阈值，0=不按 Token 判定。
 	SingleTokenThreshold int64 `json:"single_token_threshold"`
+
+	// ErrorRateAlert 开启后，滑动窗口内失败请求占比超过阈值即推送
+	// （服务整体坏没坏的最基本信号；恢复后自动重新武装）。
+	ErrorRateAlert bool `json:"error_rate_alert"`
+	// 错误率判定窗口（分钟，1..60）。
+	ErrorRateWindowMin int `json:"error_rate_window_min"`
+	// 错误率阈值百分比（1..100），窗口内 失败/总数 ≥ 该值触发。
+	ErrorRatePct int `json:"error_rate_pct"`
+
+	// ExpireWarnDays 是密钥临期预警天数（0=关闭；>0 时启用中密钥将在
+	// 到期前 N 天推送一次，与过期告警互相独立）。
+	ExpireWarnDays int `json:"expire_warn_days"`
 }
 
-func defaultNotifySettings() NotifySettings { return NotifySettings{Enabled: false, WarnPct: 20} }
+func defaultNotifySettings() NotifySettings {
+	return NotifySettings{Enabled: false, WarnPct: 20, ErrorRateWindowMin: 10, ErrorRatePct: 50}
+}
 
 const notifySettingsKey = "notify_settings"
 
@@ -67,6 +81,24 @@ func (n *NotifySettings) normalize() {
 	}
 	if n.SingleTokenThreshold < 0 {
 		n.SingleTokenThreshold = 0
+	}
+	if n.ErrorRateWindowMin < 1 {
+		n.ErrorRateWindowMin = 10
+	}
+	if n.ErrorRateWindowMin > 60 {
+		n.ErrorRateWindowMin = 60
+	}
+	if n.ErrorRatePct < 1 {
+		n.ErrorRatePct = 50
+	}
+	if n.ErrorRatePct > 100 {
+		n.ErrorRatePct = 100
+	}
+	if n.ExpireWarnDays < 0 {
+		n.ExpireWarnDays = 0
+	}
+	if n.ExpireWarnDays > 90 {
+		n.ExpireWarnDays = 90
 	}
 }
 
@@ -506,6 +538,16 @@ func (s *Service) RunNotifySweep(ctx context.Context) (int, error) {
 				severity = types.Error
 				lines = append(lines, "密钥已过期（"+k.ExpiresAt.UTC().Format("2006-01-02 15:04 UTC")+"）")
 			}
+		} else if cfg.ExpireWarnDays > 0 && k.ExpiresAt != nil {
+			// 临期预警：到期前 N 天推一次；过期告警接管后本档自然消失。
+			days := int(time.Until(*k.ExpiresAt).Hours()/24 + 0.5)
+			if days < cfg.ExpireWarnDays {
+				flags["expiring"] = true
+				if !prev[k.KID]["expiring"] {
+					lines = append(lines, fmt.Sprintf("密钥将于 %s 到期（剩 %d 天）",
+						k.ExpiresAt.UTC().Format("2006-01-02"), days))
+				}
+			}
 		}
 		state[k.KID] = flags
 		if len(lines) > 0 {
@@ -518,6 +560,9 @@ func (s *Service) RunNotifySweep(ctx context.Context) (int, error) {
 		alive[k.KID] = true
 	}
 	for kid := range state {
+		if kid == "__global__" {
+			continue // 全局错误率状态行不随 Key 存亡清理
+		}
 		if !alive[kid] {
 			delete(state, kid)
 		}
@@ -554,6 +599,34 @@ func (s *Service) RunNotifySweep(ctx context.Context) (int, error) {
 			}
 		}
 	}
+	// 全局错误率告警：滑动窗口（分钟聚合）内失败占比超阈值，边沿触发。
+	// 全局而非按 Key —— 「服务坏了」通常是上游/路由整体故障。
+	if cfg.ErrorRateAlert {
+		reqs, fails, ferr := s.st.RecentFailureRate(ctx, now, cfg.ErrorRateWindowMin)
+		if ferr == nil && reqs > 0 {
+			stateKey := "__global__"
+			tripped := fails*100 >= reqs*int64(cfg.ErrorRatePct)
+			if tripped && !prev[stateKey]["errrate"] {
+				pct := fails * 100 / reqs
+				title := "CPA 错误率告警（严重）"
+				body := fmt.Sprintf("最近 %d 分钟内 %d 笔请求失败 %d 笔（%d%%，阈值 %d%%）",
+					cfg.ErrorRateWindowMin, reqs, fails, pct, cfg.ErrorRatePct)
+				for _, e := range endpoints {
+					if !e.Enabled || ctx.Err() != nil {
+						continue
+					}
+					if url, err := s.decryptURL(e.URLEnc); err == nil {
+						if err := shoutrrrSend(url, title, body); err == nil {
+							sent++
+						}
+					}
+				}
+			}
+			stateEntry := map[string]bool{"errrate": tripped}
+			state[stateKey] = stateEntry // 全局状态行不参与 alive 清理
+		}
+	}
+
 	// 状态未变化时跳过写事务：扫描每分钟一轮，绝大多数轮次没有任何
 	// 边沿事件，逐轮全量改写 preferences 是纯粹的写放大。
 	if !notifyStatesEqual(prev, state) {

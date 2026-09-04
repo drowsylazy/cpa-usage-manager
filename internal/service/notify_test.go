@@ -4,14 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/drowsylazy/cpa-usage-manager/internal/money"
-	"github.com/drowsylazy/cpa-usage-manager/internal/usageparse"
 	"github.com/drowsylazy/cpa-usage-manager/internal/store"
+	"github.com/drowsylazy/cpa-usage-manager/internal/usageparse"
 )
 
 type ntCall struct {
@@ -420,5 +421,107 @@ func TestNotifySingleUsageAlert(t *testing.T) {
 	mu.Unlock()
 	if n2 != 1 {
 		t.Fatalf("开关关闭不应发送: %d", n2)
+	}
+}
+
+// TestNotifyErrorRateAlert 错误率告警：滑动窗口内失败占比超阈值边沿触发，
+// 恢复后重新武装；窗口取分钟聚合口径。
+func TestNotifyErrorRateAlert(t *testing.T) {
+	s, st := testService(t)
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	var calls []ntCall
+	orig := shoutrrrSend
+	shoutrrrSend = func(url, title, body string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, ntCall{url, title, body})
+		return nil
+	}
+	t.Cleanup(func() { shoutrrrSend = orig })
+
+	if err := s.SaveNotifySettings(ctx, NotifySettings{
+		Enabled: true, WarnPct: 20,
+		ErrorRateAlert: true, ErrorRateWindowMin: 10, ErrorRatePct: 50,
+	}, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SaveNotifyEndpoint(ctx, 0, "测试通道", "logger://test", true, "t"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 窗口内 10 笔全失败 → 100% ≥ 50%，触发一次。
+	now := time.Now().UTC()
+	for i := 0; i < 10; i++ {
+		r := store.Request{
+			ID: fmt.Sprintf("err-%d", i), TS: now.Add(-time.Duration(i) * time.Second),
+			CallerID: store.DefaultCallerID, Model: "gpt-test", Result: store.ResultError,
+		}
+		if err := st.RecordUsage(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := s.RunNotifySweep(ctx); err != nil || n != 1 {
+		t.Fatalf("错误率超阈值应发送一条: n=%d err=%v", n, err)
+	}
+	mu.Lock()
+	c := calls[len(calls)-1]
+	mu.Unlock()
+	if !strings.Contains(c.title, "错误率") || !strings.Contains(c.body, "10 笔请求失败 10 笔") {
+		t.Fatalf("错误率告警内容异常: %+v", c)
+	}
+
+	// 条件持续：不重复发。
+	if n, _ := s.RunNotifySweep(ctx); n != 0 {
+		t.Fatalf("同一状态不应重复发: n=%d", n)
+	}
+}
+
+// TestNotifyExpiringSoonAlert 临期预警：到期前 N 天推一次，不与过期告警重叠。
+func TestNotifyExpiringSoonAlert(t *testing.T) {
+	s, st := testService(t)
+	ctx := context.Background()
+	_ = st
+
+	var mu sync.Mutex
+	var calls []ntCall
+	orig := shoutrrrSend
+	shoutrrrSend = func(url, title, body string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, ntCall{url, title, body})
+		return nil
+	}
+	t.Cleanup(func() { shoutrrrSend = orig })
+
+	if err := s.SaveNotifySettings(ctx, NotifySettings{
+		Enabled: true, WarnPct: 20, ExpireWarnDays: 7,
+	}, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SaveNotifyEndpoint(ctx, 0, "测试通道", "logger://test", true, "t"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3 天后到期：落在 7 天预警窗口内，触发一次。
+	exp := time.Now().UTC().Add(72 * time.Hour)
+	issued, err := s.IssueKey(ctx, IssueRequest{CallerID: store.DefaultCallerID, Label: "临期键", ExpiresAt: &exp, Actor: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = issued
+	if n, err := s.RunNotifySweep(ctx); err != nil || n != 1 {
+		t.Fatalf("临期应发送一条: n=%d err=%v", n, err)
+	}
+	mu.Lock()
+	c := calls[len(calls)-1]
+	mu.Unlock()
+	if !strings.Contains(c.body, "到期") || !strings.Contains(c.body, "3 天") {
+		t.Fatalf("临期告警内容异常: %+v", c)
+	}
+	// 条件持续：不重复发。
+	if n, _ := s.RunNotifySweep(ctx); n != 0 {
+		t.Fatalf("同一状态不应重复发: n=%d", n)
 	}
 }

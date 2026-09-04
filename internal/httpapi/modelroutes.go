@@ -169,3 +169,18 @@ func (a *API) modelRouteTest(w http.ResponseWriter, r *http.Request) {
 	noStore(w)
 	jsonOut(w, a.svc.TestRoute(r.Context(), in), 200)
 }
+
+// GET /model-routes/health：启用路由的目标健康快照——进程内冷却状态 +
+// 最近 60 分钟失败统计。回答「路由为什么绕开了 X」。
+func (a *API) modelRoutesHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.WriteHeader(405)
+		return
+	}
+	items, e := a.svc.RoutesHealth(r.Context())
+	if e != nil {
+		jsonOut(w, map[string]string{"error": e.Error()}, 500)
+		return
+	}
+	jsonOut(w, map[string]any{"items": items}, 200)
+}

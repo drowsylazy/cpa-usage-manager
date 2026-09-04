@@ -299,3 +299,52 @@ func (s *Store) isClosed() bool {
 	defer s.mu.RUnlock()
 	return s.closed
 }
+
+// RecentFailureRate 统计最近 windowMin 分钟的请求数与失败数（分钟聚合口径）。
+// 供错误率告警的滑动窗口判定；返回 (总请求, 失败, 错误)。
+func (s *Store) RecentFailureRate(ctx context.Context, now time.Time, windowMin int) (int64, int64, error) {
+	if windowMin < 1 {
+		windowMin = 1
+	}
+	cutoff := now.UTC().Add(-time.Duration(windowMin)*time.Minute).Unix() / 60
+	var reqs, fails int64
+	err := s.Read(ctx, func(q Querier) error {
+		return q.QueryRowContext(ctx,
+			`SELECT COALESCE(SUM(req_count),0), COALESCE(SUM(fail_count),0)
+			 FROM usage_rollups WHERE bucket_minute >= ?`, cutoff).Scan(&reqs, &fails)
+	})
+	return reqs, fails, err
+}
+
+// RouteStatRow 是近期路由流量统计的一行（分钟聚合口径）。
+type RouteStatRow struct {
+	Model  string
+	Result string
+	Count  int64
+}
+
+// RecentRouteStats 汇总自 fromMinute 起每 (model, result) 的请求数，供目标
+// 健康面板统计近期失败。usage_rollups 无 upstream_model 列（二次路由真名
+// 只在逐请求表），按 model（别名列）聚合即可覆盖路由流量的失败统计。
+func (s *Store) RecentRouteStats(ctx context.Context, fromMinute int64) ([]RouteStatRow, error) {
+	var out []RouteStatRow
+	err := s.Read(ctx, func(q Querier) error {
+		rows, err := q.QueryContext(ctx,
+			`SELECT model, result, SUM(req_count)
+			 FROM usage_rollups WHERE bucket_minute >= ? AND model <> ''
+			 GROUP BY model, result`, fromMinute)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r RouteStatRow
+			if err := rows.Scan(&r.Model, &r.Result, &r.Count); err != nil {
+				return err
+			}
+			out = append(out, r)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
