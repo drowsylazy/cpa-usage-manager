@@ -249,6 +249,13 @@ func (s *Service) buildReport(ctx context.Context, cfg store.ReportConfig, key s
 		fmt.Fprintf(&b, "请求 %s 次 · 费用 $%s · Token %s · 成功率 %s · 缓存命中 %s\n",
 			comma(sum.Requests), money.Micro(sum.CostMicroUSD).USDString(), fmtTok(sum.TotalTokens),
 			pctOf(sum.Requests-sum.Failures, sum.Requests), cacheHitPct(sum))
+		// 环比：与上一个等长周期比较（上期无记录时省略，不给「新增」噪音）。
+		if prevSum, perr := s.UsageSummary(ctx, UsageFilter{From: from.Add(-(to.Sub(from))), To: from}); perr == nil && prevSum.Requests > 0 {
+			fmt.Fprintf(&b, "环比：请求 %s · 费用 %s · Token %s\n",
+				deltaPct(sum.Requests, prevSum.Requests),
+				deltaPct(int64(sum.CostMicroUSD), int64(prevSum.CostMicroUSD)),
+				deltaPct(sum.TotalTokens, prevSum.TotalTokens))
+		}
 	}
 	appendTop := func(name string, t *ReportTop, dimension string, rename func(string) string) error {
 		if t == nil || !t.On {
@@ -551,4 +558,23 @@ func (s *Service) TestReport(ctx context.Context, id int64, actor string) error 
 	s.st.AppendAudit(ctx, store.AuditEvent{Actor: actor, Action: "report.test",
 		EntityType: "report", EntityID: fmt.Sprint(cfg.ID), Detail: map[string]any{"ok": sendErr == nil}})
 	return sendErr
+}
+
+// deltaPct 计算环比百分比文本（当前 vs 上期）。
+func deltaPct(cur, prev int64) string {
+	if prev == 0 {
+		if cur == 0 {
+			return "持平"
+		}
+		return "新增"
+	}
+	d := (cur - prev) * 100 / prev
+	if d == 0 {
+		return "持平"
+	}
+	sign := "+"
+	if d < 0 {
+		sign = ""
+	}
+	return fmt.Sprintf("%s%d%%", sign, d)
 }
