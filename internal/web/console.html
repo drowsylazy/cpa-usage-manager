@@ -243,6 +243,7 @@
         <button type="button" class="btn" id="fx-refresh">刷新汇率</button>
         <input class="btn input" id="pricing-search-input" type="search" placeholder="搜索 models.dev 模型" spellcheck="false">
         <button type="button" class="btn" id="pricing-search-btn">搜索</button>
+        <button type="button" class="btn" id="pricing-calc">试算</button>
         <button type="button" class="btn" id="pricing-reset">清空规则</button>
         <button type="button" class="btn primary" id="pricing-add">
           <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
@@ -280,11 +281,43 @@
     <div class="ky-grid" id="route-rows" role="list" aria-label="模型集合列表"></div>
     <datalist id="route-model-list"></datalist>
   </article>
+
+  <article class="panel">
+    <div class="panel-head"><div><h2 class="panel-title">目标健康</h2><p class="panel-sub">启用集合的全部目标：进程内冷却状态与最近 60 分钟失败统计；回答「路由为什么绕开了某个目标」</p></div>
+      <div class="panel-tools"><button type="button" class="btn" id="rh-refresh">刷新</button></div>
+    </div>
+    <div class="panel-body">
+      <div class="table-wrap fixed5">
+        <table class="tbl">
+          <thead><tr><th>集合</th><th>目标</th><th>状态</th><th class="num">近 60 分钟</th><th class="num">失败</th></tr></thead>
+          <tbody id="rh-rows"></tbody>
+        </table>
+      </div>
+      <p class="note" id="rh-note">暂无启用中的集合。</p>
+    </div>
+  </article>
 </section>
 
 <!-- ── 系统 ─────────────────────────────────────────────────────── -->
 <section class="view" id="view-system" role="tabpanel" aria-labelledby="tab-system" hidden>
   <div class="readouts" id="sys-readouts"></div>
+
+  <article class="panel">
+    <div class="panel-head"><div><h2 class="panel-title">进行中请求</h2><p class="panel-sub">在途预占的实时视图；心跳超时的行已标记，等待 stale 清扫或维护动作回收</p></div>
+      <div class="panel-tools"><button type="button" class="btn" id="held-refresh">刷新</button></div>
+    </div>
+    <div class="panel-body">
+      <div class="table-wrap fixed5">
+        <table class="tbl">
+          <thead><tr>
+            <th>密钥</th><th>模型</th><th class="num">预占金额</th><th class="num">预占 Token</th><th class="num">已耗时</th><th>状态</th>
+          </tr></thead>
+          <tbody id="held-rows"></tbody>
+        </table>
+      </div>
+      <p class="note" id="held-note">在途为空。</p>
+    </div>
+  </article>
 
   <div class="split even">
     <article class="panel">
@@ -329,6 +362,12 @@
         <label class="check-row"><input type="checkbox" id="nt-single"> 单请求异常告警</label>
         <label class="check-row">费用 ≥ <input type="number" id="nt-single-usd" min="0" step="0.01" placeholder="不限"> $</label>
         <label class="check-row">Token ≥ <input type="number" id="nt-single-tok" min="0" step="1" placeholder="不限"></label>
+      </div>
+      <div class="btn-row">
+        <label class="check-row"><input type="checkbox" id="nt-errrate"> 错误率告警</label>
+        <label class="check-row">窗口 <input type="number" id="nt-errrate-win" min="1" max="60" step="1" value="10"> 分钟</label>
+        <label class="check-row">失败 ≥ <input type="number" id="nt-errrate-pct" min="1" max="100" step="1" value="50"> %</label>
+        <label class="check-row">密钥临期预警 <input type="number" id="nt-expire-days" min="0" max="90" step="1" placeholder="关" title="到期前 N 天推送一次；0=关闭"> 天</label>
         <button type="button" class="btn primary" id="nt-save-btn">保存设置</button>
         <button type="button" class="btn" id="nt-add-btn">新增端点</button>
       </div>

@@ -2153,6 +2153,20 @@ const REQ_COLS = [
       + (x.result === 'ok' ? 'live' : x.result === 'blocked' ? 'warn' : 'alarm') + '">' + esc(x.result) + '</span></td>',
   },
   {
+    // 失败原因：状态码 + 错误摘要（含路由目标转移轨迹）。低频列，默认收起。
+    id: 'cause', label: '原因', off: true,
+    tip: '失败请求的上游状态码与错误摘要；路由流量含目标转移轨迹（a→b(原因)）。',
+    cell: x => {
+      if (x.result === 'ok' && !x.error_note) return '<td class="cell-dim">-</td>';
+      const code = +x.status_code ? x.status_code : '';
+      const note = x.error_note || '';
+      const title = (code ? 'HTTP ' + code + (note ? ' · ' : '') : '') + note;
+      return '<td class="cell-mono cell-clip" title="' + esc(title) + '">'
+        + (code ? '<span class="pill alarm mono">' + esc(code) + '</span> ' : '')
+        + esc(note || (code ? '' : '-')) + '</td>';
+    },
+  },
+  {
     id: 'toks', label: '输入 / 输出 / 缓存读', num: true,
     tip: '三段分别为 输入 / 输出 / 缓存读。' + TIPS.cacheRead,
     cell: x => '<td class="num"><span class="cell-toks" title="输入 ' + esc(fmtTok(x.input_tokens))
@@ -2828,8 +2842,35 @@ loaders.routes = async () => {
   if (routeCache.judge) routeCache.judge.model = unescapeEntities(routeCache.judge.model);
   renderRouteJudgeState();
   renderRouteCards();
+  await loadRoutesHealth();
   stamp();
 };
+// loadRoutesHealth 渲染「目标健康」面板：冷却状态 + 近 60 分钟失败统计。
+async function loadRoutesHealth() {
+  const rows = $('rh-rows'), note = $('rh-note');
+  try {
+    const r = await api('/model-routes/health');
+    const items = r.items || [];
+    rows.innerHTML = items.map(h =>
+      '<tr><td class="cell-mono cell-clip" title="' + esc(h.alias) + '">' + esc(h.alias || '-') + '</td>'
+      + '<td class="cell-mono cell-clip" title="' + esc(h.target) + '">' + esc(h.target) + '</td>'
+      + '<td>' + (h.cooling
+        ? '<span class="pill warn" title="冷却剩余 ' + h.cooldown_remaining_sec + ' 秒">冷却 ' + fmtDur(h.cooldown_remaining_sec) + '</span>'
+        : '<span class="pill live">可用</span>')
+      + '</td>'
+      + '<td class="num">' + fmtInt(h.total_60m || 0) + '</td>'
+      + '<td class="num">' + (h.fail_60m > 0
+        ? '<span class="pill alarm">' + fmtInt(h.fail_60m) + '</span>'
+        : '<span class="cell-dim">0</span>')
+      + '</td></tr>').join('');
+    note.textContent = items.length
+      ? '冷却是进程内启发式：重启丢失、多实例各自独立；失败目标恢复成功后立即回到可用池。'
+      : '暂无启用中的集合。';
+  } catch (e) {
+    note.textContent = '加载失败：' + e.message;
+  }
+}
+$('rh-refresh').addEventListener('click', () => { loadRoutesHealth().catch(() => {}); });
 function renderRouteJudgeState() {
   const badge = $('route-judge-state');
   if (badge) badge.hidden = !!routeCache.judge.model;
@@ -3102,7 +3143,8 @@ loaders.system = async () => {
   S.stats = s;
   $('sys-readouts').innerHTML =
     readout('数据库文件', fmtBytes(s.file_bytes),
-      'schema v' + s.schema_version + ' · ' + (s.writable ? '可写' : '只读'), !s.writable)
+      'schema v' + s.schema_version + ' · ' + (s.writable ? '可写' : '只读') + ' · WAL ' + fmtBytes(s.wal_bytes || 0),
+      !s.writable)
     + readout('请求明细', fmtInt(s.requests), '逐请求记录')
     + readout('分钟聚合', fmtInt(s.rollups), '趋势与维度查询的数据源')
     + readout('在途预占', fmtInt(s.held_reservations), '未结算的额度预占', s.held_reservations > 0)
@@ -3115,11 +3157,45 @@ loaders.system = async () => {
   $('db-note').textContent = s.writable
     ? '备份为单文件 SQLite 快照；恢复前服务端会做一致性检查。'
     : '当前实例处于只读模式（可能存在跨进程写者），备份可用，恢复不可用。';
+  await loadHeld();
   await loadNotify();
   await loadReports();
   updateBadges();
   stamp();
 };
+// loadHeld 拉取并渲染在途预占（进行中请求）面板。
+async function loadHeld() {
+  const rows = $('held-rows'), note = $('held-note');
+  try {
+    const r = await api('/reservations/held');
+    const items = r.items || [];
+    rows.innerHTML = items.map(h =>
+      '<tr><td class="cell-mono" title="' + esc(h.key_id || '') + '">' + esc(keyLabelOf(h.key_id) || h.key_id || '-') + '</td>'
+      + '<td class="cell-mono cell-clip" title="' + esc(h.model || '') + '">' + esc(h.model || '-') + '</td>'
+      + '<td class="num">' + fmtCur(h.held_micro_usd || 0) + '</td>'
+      + '<td class="num">' + fmtTok(h.reserved_tokens || 0) + '</td>'
+      + '<td class="num">' + fmtDur(h.age_sec) + '</td>'
+      + '<td>' + (h.stale
+        ? '<span class="pill alarm">心跳超时</span>'
+        : (h.age_sec > 300 ? '<span class="pill warn">超过 5 分钟</span>' : '<span class="pill live">活跃</span>'))
+      + '</td></tr>').join('');
+    note.textContent = items.length
+      ? '共 ' + items.length + ' 条在途。心跳超时的行会在下一次维护动作或预占清扫时回收。'
+      : '在途为空。';
+  } catch (e) {
+    note.textContent = '加载失败：' + e.message;
+  }
+}
+$('held-refresh').addEventListener('click', () => { loadHeld().catch(() => {}); });
+
+// fmtDur 把秒数渲染为可读时长。
+function fmtDur(sec) {
+  sec = Math.max(0, +sec || 0);
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.floor(sec / 60) + 'm' + (sec % 60 ? sec % 60 + 's' : '');
+  return Math.floor(sec / 3600) + 'h' + Math.floor((sec % 3600) / 60) + 'm';
+}
+
 $('backup-btn').addEventListener('click', async () => {
   try {
     const r = await api('/backup');
@@ -3223,6 +3299,10 @@ function renderNotify() {
   $('nt-single').checked = !!st.single_cost_alert;
   $('nt-single-usd').value = st.single_cost_micro_usd > 0 ? (st.single_cost_micro_usd / 1e6) : '';
   $('nt-single-tok').value = st.single_token_threshold > 0 ? st.single_token_threshold : '';
+  $('nt-errrate').checked = !!st.error_rate_alert;
+  $('nt-errrate-win').value = st.error_rate_window_min ?? 10;
+  $('nt-errrate-pct').value = st.error_rate_pct ?? 50;
+  $('nt-expire-days').value = st.expire_warn_days > 0 ? st.expire_warn_days : '';
   const eps = notifyCache.endpoints;
   if (!eps.length) {
     $('nt-list').innerHTML = '<p class="note">尚未配置通知端点。</p>';
@@ -3281,6 +3361,9 @@ $('nt-save-btn').addEventListener('click', async () => {
   const warn = Math.round(Number($('nt-warn').value));
   const su = Number($('nt-single-usd').value);
   const stk = Number($('nt-single-tok').value);
+  const erw = Math.round(Number($('nt-errrate-win').value));
+  const erp = Math.round(Number($('nt-errrate-pct').value));
+  const ewd = Math.round(Number($('nt-expire-days').value));
   try {
     const r = await post('/notify/settings', {
       enabled: $('nt-enabled').checked,
@@ -3289,6 +3372,10 @@ $('nt-save-btn').addEventListener('click', async () => {
       single_cost_alert: $('nt-single').checked,
       single_cost_micro_usd: Number.isFinite(su) && su > 0 ? Math.round(su * 1e6) : 0,
       single_token_threshold: Number.isFinite(stk) && stk > 0 ? Math.round(stk) : 0,
+      error_rate_alert: $('nt-errrate').checked,
+      error_rate_window_min: Number.isFinite(erw) && erw > 0 ? erw : 10,
+      error_rate_pct: Number.isFinite(erp) && erp > 0 ? erp : 50,
+      expire_warn_days: Number.isFinite(ewd) && ewd > 0 ? ewd : 0,
       actor: 'console',
     });
     notifyCache.settings = r;
@@ -3587,6 +3674,46 @@ async function syncPrefsFromServer() {
     }
   } catch (_) { /* 同步失败不影响本地使用 */ }
 }
+
+
+// ---------- 计价试算器 ----------
+// priceCalcMicro 按一条规则的四档单价（micro 原生币种/百万 token）算出
+// 指定 token 用量的费用（micro 原生币种）：各档 (量×价+999999)/1e6 向上取整后相加，
+// 与服务端 costForRule 的取整口径一致。
+function priceCalcMicro(p, inTok, outTok, crTok, cwTok) {
+  const ceil = (n, price) => price > 0 ? (BigInt(Math.round(n)) * BigInt(price) + 999999n) / 1000000n : 0n;
+  return ceil(inTok, p.price_input || 0) + ceil(outTok, p.price_output || 0)
+    + ceil(crTok, p.price_cache_read || 0) + ceil(cwTok, p.price_cache_creation || 0);
+}
+$('pricing-calc').addEventListener('click', () => {
+  const items = pricingCache.items || [];
+  if (!items.length) { toast('没有可用规则，请先添加计价规则', 'err'); return; }
+  openSheet({
+    title: '计价试算', okText: '重新计算',
+    body: '<div class="stack">'
+      + fieldRow('规则', '<select id="pc-rule" class="input">' + items.map(p =>
+        '<option value="' + p.id + '">' + esc(p.pattern) + '（' + esc(p.match_kind) + (p.currency === 'CNY' ? ' · CNY' : '') + '）</option>').join('') + '</select>')
+      + fieldRow('输入 Token', '<input type="number" id="pc-in" class="input" min="0" step="1000" value="100000">')
+      + fieldRow('输出 Token', '<input type="number" id="pc-out" class="input" min="0" step="1000" value="20000">')
+      + fieldRow('缓存读 Token', '<input type="number" id="pc-cr" class="input" min="0" step="1000" value="0">')
+      + fieldRow('缓存写 Token', '<input type="number" id="pc-cw" class="input" min="0" step="1000" value="0">')
+      + '<p class="note" id="pc-result">填入用量后点击下方按钮计算。</p></div>',
+    onOk: () => {
+      const id = Number($('pc-rule').value);
+      const p = items.find(x => x.id === id);
+      if (!p) return;
+      const micro = priceCalcMicro(p,
+        Number($('pc-in').value) || 0, Number($('pc-out').value) || 0,
+        Number($('pc-cr').value) || 0, Number($('pc-cw').value) || 0);
+      const num = Number(micro);
+      let text = p.currency === 'CNY'
+        ? '费用：' + fmtMoney(num, '¥') + '（人民币规则；美元等值按保存时锁定汇率折算）'
+        : '费用：$' + (num / 1e6).toFixed(4);
+      $('pc-result').textContent = text;
+      return false; // 保持弹窗打开，便于反复调参对比
+    },
+  });
+});
 
 // ---------- 启动 ----------
 applyTheme();
