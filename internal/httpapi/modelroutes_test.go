@@ -196,8 +196,8 @@ func TestModelRouteTestEndpoint(t *testing.T) {
 	w = do(t, a, "POST", base+"/model-routes/test",
 		`{"id":0,"alias":"auto","rule":"-&gt; priority [&quot;a&quot;,&quot;b&quot;]","model":"AUTO-HIGH","source":"gemini","prompt":"hi","run_ai":false}`)
 	var out struct {
-		Chain     []string       `json:"chain"`
-		Skipped   []struct {
+		Chain   []string `json:"chain"`
+		Skipped []struct {
 			Target string `json:"target"`
 		} `json:"skipped"`
 		FellBack  bool           `json:"fell_back"`

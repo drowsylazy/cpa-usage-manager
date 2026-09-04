@@ -35,6 +35,10 @@ func (a *API) notifySettings(w http.ResponseWriter, r *http.Request) {
 		SingleCostAlert      bool   `json:"single_cost_alert"`
 		SingleCostMicroUSD   int64  `json:"single_cost_micro_usd"`
 		SingleTokenThreshold int64  `json:"single_token_threshold"`
+		ErrorRateAlert       bool   `json:"error_rate_alert"`
+		ErrorRateWindowMin   int    `json:"error_rate_window_min"`
+		ErrorRatePct         int    `json:"error_rate_pct"`
+		ExpireWarnDays       int    `json:"expire_warn_days"`
 		Actor                string `json:"actor"`
 	}
 	if e := decode(r, &in); e != nil {
@@ -45,6 +49,8 @@ func (a *API) notifySettings(w http.ResponseWriter, r *http.Request) {
 		Enabled: in.Enabled, WarnPct: in.WarnPct, ErrorAlerts: in.ErrorAlerts,
 		SingleCostAlert: in.SingleCostAlert, SingleCostMicroUSD: in.SingleCostMicroUSD,
 		SingleTokenThreshold: in.SingleTokenThreshold,
+		ErrorRateAlert:       in.ErrorRateAlert, ErrorRateWindowMin: in.ErrorRateWindowMin,
+		ErrorRatePct: in.ErrorRatePct, ExpireWarnDays: in.ExpireWarnDays,
 	}, in.Actor); err != nil {
 		jsonOut(w, map[string]string{"error": err.Error()}, 400)
 		return
