@@ -157,11 +157,11 @@ func (p *InsertKeyParams) Validate() error {
 		}
 	}
 	for name, t := range map[string]*int64{
-		"token_limit":           p.TokenLimit,
-		"daily_token_limit":     p.DailyTokenLimit,
-		"weekly_token_limit":    p.WeeklyTokenLimit,
-		"monthly_token_limit":   p.MonthlyTokenLimit,
-		"daily_requests_limit":  p.DailyRequestsLimit,
+		"token_limit":            p.TokenLimit,
+		"daily_token_limit":      p.DailyTokenLimit,
+		"weekly_token_limit":     p.WeeklyTokenLimit,
+		"monthly_token_limit":    p.MonthlyTokenLimit,
+		"daily_requests_limit":   p.DailyRequestsLimit,
 		"monthly_requests_limit": p.MonthlyRequestsLimit,
 	} {
 		if t != nil && *t < 0 {

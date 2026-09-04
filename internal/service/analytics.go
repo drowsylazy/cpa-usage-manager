@@ -94,7 +94,7 @@ func (s *Service) ListRequests(ctx context.Context, f UsageFilter, limit, offset
 	}); err != nil {
 		return RequestPage{}, err
 	}
-	query := `SELECT `+store.RequestColumns+` FROM requests` + clause + ` ORDER BY ` + requestSortClause(sortBy, order) + ` LIMIT ? OFFSET ?`
+	query := `SELECT ` + store.RequestColumns + ` FROM requests` + clause + ` ORDER BY ` + requestSortClause(sortBy, order) + ` LIMIT ? OFFSET ?`
 	args = append(args, limit, max(0, offset))
 	var items []store.Request
 	err := s.st.Read(ctx, func(q store.Querier) error {
@@ -120,7 +120,7 @@ func (s *Service) ListRequests(ctx context.Context, f UsageFilter, limit, offset
 // 它替代先全量装载再逐行写出，峰值内存 O(1)。limit 由调用方决定。
 func (s *Service) IterateRequests(ctx context.Context, f UsageFilter, limit int, sortBy, order string, fn func(store.Request) error) error {
 	clause, args := requestFilter(f)
-	query := `SELECT `+store.RequestColumns+` FROM requests` + clause + ` ORDER BY ` + requestSortClause(sortBy, order) + ` LIMIT ?`
+	query := `SELECT ` + store.RequestColumns + ` FROM requests` + clause + ` ORDER BY ` + requestSortClause(sortBy, order) + ` LIMIT ?`
 	args = append(args, max(0, limit))
 	return s.st.Read(ctx, func(q store.Querier) error {
 		rows, err := q.QueryContext(ctx, query, args...)
