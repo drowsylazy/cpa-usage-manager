@@ -2105,7 +2105,8 @@ func handleUsage(body []byte) ([]byte, error) {
 		// APIKey 不是插件 Key 的回调（部分兼容渠道把上游凭据放进该字段）：
 		// 若能按 时间+延迟+模型 关联到执行器已入库的记录，视为同一请求，
 		// 不再被动入库（否则统计翻倍），仅回填缺失用量。
-		if id, dup, err := svc.FindDuplicateExecutor(ctx, models, u.RequestedAt, u.Latency.Milliseconds()); err == nil && dup {
+		if id, dup, err := svc.FindDuplicateExecutor(ctx, models, u.RequestedAt, u.Latency.Milliseconds(),
+			u.Detail.TotalTokens, u.Detail.InputTokens); err == nil && dup {
 			if hasDetail {
 				if err := svc.BackfillRequestUsageByID(ctx, id, bf); err != nil {
 					warnf("回填请求 %s 的宿主用量失败: %v", id, err)
@@ -2124,9 +2125,11 @@ func handleUsage(body []byte) ([]byte, error) {
 	// 双写重复在落库瞬间被消除，无需任何事后对账。上方的只读预检
 	// 只是省一次写事务的快路径，这里的原子探测才是正确性保证。
 	hint := store.PassiveDedupeHint{
-		Models:    modelCandidates(u.Model, u.Alias),
-		Near:      u.RequestedAt,
-		LatencyMS: u.Latency.Milliseconds(),
+		Models:      modelCandidates(u.Model, u.Alias),
+		Near:        u.RequestedAt,
+		LatencyMS:   u.Latency.Milliseconds(),
+		TotalTokens: u.Detail.TotalTokens,
+		InputTokens: u.Detail.InputTokens,
 	}
 	if err := st.RecordPassiveUsage(ctx, req, hint); err != nil {
 		// 用量记录失败不应让宿主把整次请求判为插件错误。

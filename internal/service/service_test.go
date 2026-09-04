@@ -131,13 +131,19 @@ func TestFindDuplicateAndBackfillByID(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 延迟差 3ms、模型用裸名（宿主上报口径）→ 应命中执行器记录。
-	id, dup, err := s.FindDuplicateExecutor(ctx, []string{"step-3.7-flash"}, ts, 2808)
+	id, dup, err := s.FindDuplicateExecutor(ctx, []string{"step-3.7-flash"}, ts, 2808, 0, 0)
 	if err != nil || !dup || id != "req-exec" {
 		t.Fatalf("判重失败: id=%q dup=%v err=%v", id, dup, err)
 	}
-	// 延迟差异过大 → 不应命中。
-	if _, dup, err := s.FindDuplicateExecutor(ctx, []string{"step-3.7-flash"}, ts, 9999); err != nil || dup {
-		t.Fatalf("延迟不匹配不应判重: dup=%v err=%v", dup, err)
+	// 宿主延迟显著大于执行器延迟（宿主 Latency 含鉴权/翻译/重试全链路开销，
+	// 对照宿主源码核实），但完成时刻仍对齐 → 应命中（旧谓词在此漏判，
+	// 是重复行残留的根因场景之一）。
+	if id, dup, err := s.FindDuplicateExecutor(ctx, []string{"step-3.7-flash"}, ts, 9999, 0, 0); err != nil || !dup || id != "req-exec" {
+		t.Fatalf("宿主全链路延迟仍应判重: id=%q dup=%v err=%v", id, dup, err)
+	}
+	// 完成时刻不对齐（宿主观测的请求晚得多，落在执行器请求区间之外）→ 不应命中。
+	if _, dup, err := s.FindDuplicateExecutor(ctx, []string{"step-3.7-flash"}, ts.Add(50*time.Second), 2808, 0, 0); err != nil || dup {
+		t.Fatalf("时间区间外不应判重: dup=%v err=%v", dup, err)
 	}
 	bf := store.UsageBackfill{InputTokens: 14, OutputTokens: 91, TotalTokens: 105, TTFTMS: 867}
 	if err := s.BackfillRequestUsageByID(ctx, id, bf); err != nil {

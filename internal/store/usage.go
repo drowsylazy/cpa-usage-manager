@@ -181,11 +181,33 @@ func (s *Store) DistinctObservedModels(ctx context.Context, limit int) ([]string
 	return out, nil
 }
 
-// 双写判重容差。宿主 usage.handle 与执行器结算描述同一次上游调用：
-// 两者观测到的时刻相差不超过一次回调往返，延迟读数相差仅几毫秒。
+// 双写判重容差。宿主 usage.handle 与执行器结算描述同一次上游调用，但两侧的
+// 时刻与延迟并不同源，直接比较窗口必然失配（以下均已对照宿主源码核实）：
+//
+//   - 宿主 RequestedAt 是请求开始时刻，执行器行 ts 也是 startedAt——两者本就
+//     相差「宿主鉴权/翻译/选择目标」的入口开销，慢网关下可达数秒；
+//   - 宿主 Latency 从 reporter 构造起量，含宿主全链路（重试、协议翻译）；
+//     执行器 latency 只量 host.model.execute 调用本身。同一请求两侧延迟差
+//     可远超 150ms——旧谓词按延迟±150ms 配对，慢请求直接漏判，重复行残留。
+//
+// 结构化解法：同一次请求的宿主观测必然满足——
+//
+//	执行器.ts ≤ 宿主.ts（宿主先收到请求才转给执行器）
+//	宿主.ts ≤ 执行器.ts + 执行器延迟 + 宿主侧尾延迟（宿主最晚在拿到响应后记账）
+//
+// 用「区间包含」替代「双侧窗口对称比较」：宿主 ts 必须落在执行器请求的
+// 起止区间内（前界放宽 dupTSWindow 容纳入口开销），并用「完成时刻对齐」
+// （两侧 ts+latency 之差）代替裸延迟比较——两侧延迟都锚定同一响应到达，
+// 完成时刻的差只剩记账时点差，与两侧延迟定义不同源无关。
 const (
-	dupTSWindow      = 15 * time.Second
-	dupLatencyWindow = int64(150) // 毫秒
+	dupTSWindow = 15 * time.Second
+	// dupCompleteWindow 是两侧完成时刻（ts+latency）允许的偏差。
+	dupCompleteWindow = int64(10_000) // 毫秒
+	// dupHostTailWindow 是宿主完成时刻允许落后执行器完成时刻的附加余量：
+	// 宿主 usage 回调走单 worker 后台队列，积压时记账可晚于响应完成很久。
+	dupHostTailWindow = int64(30_000) // 毫秒
+	// dupTokenTolerance 是配对时两侧 token 计数的允许偏差（见 tokenCountsClose）。
+	dupTokenTolerance = int64(64)
 )
 
 // modelMatchFragment 生成「model IN (…) OR model LIKE '%/模型'」的匹配片段。
@@ -269,19 +291,17 @@ func (s *Store) BackfillRequestUsage(ctx context.Context, kid string, models []s
 	return true, nil
 }
 
-// FindDuplicateExecutor 按 时间±dupTSWindow + 延迟±dupLatencyWindow + 模型候选
-// 关联执行器已入库的记录。
+// FindDuplicateExecutor 按结构化区间谓词关联执行器已入库的记录（判重快路径）。
 // 宿主 usage.handle 的 APIKey 字段在部分兼容渠道里是上游凭据而非插件 Key，
-// 无法用 kid 判重；同一请求的两次回调延迟仅差几毫秒，该组合足以唯一对应。
-// 只读快路径：命中可省去 RecordPassiveUsage 的写事务；未命中由其事务内
-// 探测兜底（防 TOCTOU）。
-func (s *Store) FindDuplicateExecutor(ctx context.Context, models []string, near time.Time, latencyMS int64) (string, bool, error) {
+// 无法用 kid 判重。只读快路径：命中可省去 RecordPassiveUsage 的写事务；
+// 未命中由其事务内探测兜底（防 TOCTOU）。
+func (s *Store) FindDuplicateExecutor(ctx context.Context, models []string, near time.Time, latencyMS, totalTokens, inputTokens int64) (string, bool, error) {
 	var (
 		id    string
 		found bool
 	)
 	err := s.Read(ctx, func(q Querier) error {
-		twin, ok, err := duplicateProbeTx(ctx, q, models, near, latencyMS, true)
+		twin, ok, err := duplicateProbeTx(ctx, q, models, near, latencyMS, totalTokens, inputTokens, true)
 		if err != nil || !ok {
 			return err
 		}
@@ -301,11 +321,20 @@ func (s *Store) BackfillRequestUsageByID(ctx context.Context, id string, b Usage
 	})
 }
 
-// duplicateProbeTx 在写事务内按双写判重谓词查找另一口径的重复行。
-// executorRow=true 找执行器行（key_id<>”），false 找被动行（key_id=”）。
-// 单写者串行化保证「事务内探测→插入」原子成立：两个写入方必然一先一后
-// 提交，后者一定能看到前者已提交的行——这是入库时防重（替代事后对账）的根基。
-func duplicateProbeTx(ctx context.Context, q Querier, models []string, near time.Time, latencyMS int64, executorRow bool) (Request, bool, error) {
+// duplicateProbeTx 按双写判重谓词查找另一口径的重复行。
+// executorRow=true 找执行器行（key_id<>”）供被动侧探测；false 找被动行
+// （key_id=”）供结算侧探测。单写者串行化保证「事务内探测→插入」原子成立：
+// 两个写入方必然一先一后提交，后者一定能看到前者已提交的行。
+//
+// 谓词（结构化区间版，见常量块注释）：同模型族 + 时间区间包含 + 完成时刻对齐
+// + token 计数相容。候选行记 e（列 ts/latency_ms），本次观测记 h（参数组）：
+//
+//	h.ts >= e.ts - dupTSWindow                      宿主收到请求不早于执行器启动减入口开销
+//	h.ts <= e.ts + e.latency_ms + dupHostTailWindow 宿主记账不晚于执行器完成加队列尾延迟
+//	|h.ts + h.latency - (e.ts + e.latency_ms)| <= dupCompleteWindow 完成时刻对齐
+//	h.total/h.input 与 e 侧计数差 <= dupTokenTolerance（任一侧为 0 时不约束：
+//	结算行缺 token、宿主回调被裁剪都属正常）
+func duplicateProbeTx(ctx context.Context, q Querier, models []string, near time.Time, latencyMS int64, hTokens, hInput int64, executorRow bool) (Request, bool, error) {
 	models = normalizeModels(models)
 	if len(models) == 0 {
 		return Request{}, false, nil
@@ -315,24 +344,46 @@ func duplicateProbeTx(ctx context.Context, q Querier, models []string, near time
 	if executorRow {
 		keyCond = `key_id <> ''`
 	}
-	args := make([]any, 0, len(margs)+5)
+	hTS := near.UnixMilli()
+	var hLatency int64
+	if latencyMS > 0 {
+		hLatency = latencyMS
+	}
+	hDone := hTS + hLatency
+	args := make([]any, 0, len(margs)+13)
 	args = append(args, margs...)
-	args = append(args, latencyMS-dupLatencyWindow, latencyMS+dupLatencyWindow,
-		near.Add(-dupTSWindow).UnixMilli(), near.Add(dupTSWindow).UnixMilli(),
-		near.UnixMilli())
-	r, err := scanRequest(q.QueryRowContext(ctx,
+	args = append(args,
+		hTS+dupTSWindow.Milliseconds(),            // e.ts <= h.ts + W  ⇔ h.ts >= e.ts - W
+		hTS-dupHostTailWindow,                     // e.ts + e.latency >= h.ts - T
+		hDone-dupCompleteWindow,                   // e.ts + e.latency >= h.done - C
+		hDone+dupCompleteWindow+dupHostTailWindow, // e.ts + e.latency <= h.done + C + T
+		hTokens, hTokens, dupTokenTolerance, // total_tokens = 0 OR h = 0 OR |e-h| <= tol
+		hInput, hInput, dupTokenTolerance, // input_tokens = 0 OR h = 0 OR |e-h| <= tol
+		hTS)
+	rows, err := q.QueryContext(ctx,
 		`SELECT `+requestColumns+` FROM requests
 		 WHERE `+keyCond+` AND `+frag+`
-		   AND latency_ms BETWEEN ? AND ?
-		   AND ts BETWEEN ? AND ?
-		 ORDER BY ABS(ts - ?) LIMIT 1`, args...))
-	if errors.Is(err, sql.ErrNoRows) {
-		return Request{}, false, nil
-	}
+		   AND ts <= ?
+		   AND ts + latency_ms >= ?
+		   AND ts + latency_ms BETWEEN ? AND ?
+		   AND (total_tokens = 0 OR ? = 0 OR ABS(total_tokens - ?) <= ?)
+		   AND (input_tokens = 0 OR ? = 0 OR ABS(input_tokens - ?) <= ?)
+		 ORDER BY ABS(ts - ?) LIMIT 8`, args...)
 	if err != nil {
 		return Request{}, false, err
 	}
-	return r, true, nil
+	defer rows.Close()
+	for rows.Next() {
+		r, err := scanRequest(rows)
+		if err != nil {
+			return Request{}, false, err
+		}
+		return r, true, nil
+	}
+	if err := rows.Err(); err != nil {
+		return Request{}, false, err
+	}
+	return Request{}, false, nil
 }
 
 // PassiveDedupeHint 携带被动入库时的事务内双查参数。
@@ -342,6 +393,10 @@ type PassiveDedupeHint struct {
 	// Near 与 LatencyMS 是宿主观测的请求时刻与延迟。
 	Near      time.Time
 	LatencyMS int64
+	// TotalTokens 与 InputTokens 是宿主侧的 token 计数，供相容性过滤
+	// （同请求两侧计数差仅可能来自口径归一；0 表示不约束）。
+	TotalTokens int64
+	InputTokens int64
 }
 
 // RecordPassiveUsage 是被动统计路径（宿主 usage.handle 兜底）的入库入口：
@@ -359,7 +414,8 @@ func (s *Store) RecordPassiveUsage(ctx context.Context, r Request, dup PassiveDe
 		dup.Near = r.TS
 	}
 	return s.Write(ctx, func(tx *sql.Tx) error {
-		twin, found, err := duplicateProbeTx(ctx, tx, dup.Models, dup.Near, dup.LatencyMS, true)
+		twin, found, err := duplicateProbeTx(ctx, tx, dup.Models, dup.Near, dup.LatencyMS,
+			dup.TotalTokens, dup.InputTokens, true)
 		if err != nil {
 			return err
 		}
@@ -463,11 +519,24 @@ func fillKeeperZeroTx(ctx context.Context, tx *sql.Tx, s *Store, d Request, keep
 
 // dedupePairSQL 自连接找出「执行器行 a + 被动行 b」的历史重复对。
 // 模型名按精确相等或「渠道/模型」后缀判定（避免 LIKE 元字符误匹配）。
+// 谓词与 duplicateProbeTx 同口径（结构化区间版，见常量块注释）：
+//
+//	b.ts 落在 a 的请求区间内（a.ts-W .. a.ts+a.latency+T）
+//	两侧完成时刻（ts+latency）对齐（±dupCompleteWindow，宿主侧另加尾延迟）
+//	两侧 token 计数相容（任一侧为零时不约束——结算行缺 token / 被动行被裁剪都正常）
+//	ai_judge 归属行（source='ai_judge'）不参与：它没有判重候选，
+//	进对账只会误吞同模型的正常行。
 const dedupePairSQL = `
 	SELECT a.id, b.id FROM requests a JOIN requests b
 	  ON b.id <> a.id
-	 AND b.ts BETWEEN a.ts - ? AND a.ts + ?
-	 AND b.latency_ms BETWEEN a.latency_ms - ? AND a.latency_ms + ?
+	 AND b.ts BETWEEN a.ts - ? AND a.ts + a.latency_ms + ?
+	 AND b.ts + b.latency_ms BETWEEN a.ts + a.latency_ms - ?
+	                          AND a.ts + a.latency_ms + ? + ?
+	 AND (a.total_tokens = 0 OR b.total_tokens = 0
+	   OR ABS(a.total_tokens - b.total_tokens) <= ?)
+	 AND (a.input_tokens = 0 OR b.input_tokens = 0
+	   OR ABS(a.input_tokens - b.input_tokens) <= ?)
+	 AND b.source <> 'ai_judge'
 	 AND (a.model = b.model
 	   OR substr(a.model, length(a.model) - length(b.model)) = '/' || b.model
 	   OR substr(b.model, length(b.model) - length(a.model)) = '/' || a.model)
@@ -503,8 +572,10 @@ func (s *Store) dedupeBatch(ctx context.Context, sinceMS int64, limit int) (int,
 	merged := 0
 	err := s.Write(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, dedupePairSQL,
-			dupTSWindow.Milliseconds(), dupTSWindow.Milliseconds(),
-			dupLatencyWindow, dupLatencyWindow, sinceMS, limit)
+			dupTSWindow.Milliseconds(), dupHostTailWindow,
+			dupCompleteWindow, dupCompleteWindow, dupHostTailWindow,
+			dupTokenTolerance, dupTokenTolerance,
+			sinceMS, limit)
 		if err != nil {
 			return fmt.Errorf("扫描重复请求失败: %w", err)
 		}

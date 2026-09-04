@@ -312,3 +312,133 @@ func TestRecordPassiveUsageMergesIntoExecutor(t *testing.T) {
 		t.Fatalf("无重复时应正常插入: %v", err)
 	}
 }
+
+// TestProbeMatchesHostFullChainLatency 钉住根因场景一：宿主 Latency 含全链路
+// 开销（鉴权/翻译/重试，对照宿主源码核实的 reporter 语义），同一请求两侧
+// 延迟差可达数秒。旧谓词按「延迟±150ms」配对在此漏判，重复行残留到事后
+// 对账才被删掉——面板表现为请求数先涨后缩的波动。
+func TestProbeMatchesHostFullChainLatency(t *testing.T) {
+	s := openTestStore(t, filepath.Join(t.TempDir(), "cpa.db"), "owner-a")
+	ctx := context.Background()
+	base := time.UnixMilli(1_700_000_000_000).UTC()
+
+	// 执行器行：startedAt=base，纯上游延迟 2.8s（host.model.execute 调用耗时）。
+	exec := Request{
+		ID: "exec-slow", TS: base, KeyID: "kid1", CallerID: "default",
+		Model: "stepfun/step-3.7-flash", Result: ResultOK,
+		LatencyMS: 2805, CostMicroUSD: 42, Priced: true,
+	}
+	if err := s.RecordUsage(ctx, exec); err != nil {
+		t.Fatalf("写入执行器行失败: %v", err)
+	}
+
+	// 宿主回调：RequestedAt 晚 1.2s（宿主入口开销），Latency 9.9s（全链路），
+	// 记账又晚了 4s（单 worker 队列积压）。旧谓词：延迟差 7.1s >> 150ms → 漏判。
+	host := Request{
+		ID: "host-late", TS: base.Add(1200 * time.Millisecond), Model: "step-3.7-flash",
+		Provider: "openai", Result: ResultOK,
+		InputTokens: 700, OutputTokens: 300, TotalTokens: 1000,
+		LatencyMS: 9900,
+	}
+	hint := PassiveDedupeHint{Models: []string{"step-3.7-flash"}, Near: host.TS, LatencyMS: host.LatencyMS}
+	if err := s.RecordPassiveUsage(ctx, host, hint); err != nil {
+		t.Fatalf("被动入库失败: %v", err)
+	}
+	if _, err := s.GetRequest(ctx, host.ID); err == nil {
+		t.Fatal("宿主全链路延迟的迟到回调应被并入执行器行，不得插入重复行")
+	}
+	got, err := s.GetRequest(ctx, exec.ID)
+	if err != nil {
+		t.Fatalf("执行器行应保留: %v", err)
+	}
+	if got.InputTokens != 700 || got.TotalTokens != 1000 {
+		t.Fatalf("token 明细应合并: %+v", got)
+	}
+}
+
+// TestProbeRejectsDifferentConcurrentRequests 钉住收紧后的误配防线：
+// 同模型、时间相近、但属于不同请求的两行不得被判为重复。
+func TestProbeRejectsDifferentConcurrentRequests(t *testing.T) {
+	s := openTestStore(t, filepath.Join(t.TempDir(), "cpa.db"), "owner-a")
+	ctx := context.Background()
+	base := time.UnixMilli(1_700_000_000_000).UTC()
+
+	// 两笔独立请求：请求 A（执行器），请求 B（另一用户经原生 Key 的被动行）。
+	// B 的 ts 落在 A 的区间边缘、token 计数差异巨大——都是不同请求的特征。
+	a := Request{
+		ID: "exec-a", TS: base, KeyID: "kidA", CallerID: "default",
+		Model: "gpt-5", Result: ResultOK,
+		LatencyMS: 5000, InputTokens: 18000, TotalTokens: 19000, CostMicroUSD: 9, Priced: true,
+	}
+	if err := s.RecordUsage(ctx, a); err != nil {
+		t.Fatalf("写入 A 失败: %v", err)
+	}
+	// B：ts 落在 A 完成时刻附近（区间包含成立、完成时刻也在容差内——宿主
+	// 队列尾延迟下这是合法形态），但 token 计数与 A 差异巨大 → 靠 token
+	// 相容性拒绝。同模型并发下时间维度本就不可分辨，token 计数才是
+	// 区分不同请求的可靠信号。
+	b := Request{
+		ID: "host-b", TS: base.Add(9 * time.Second), Model: "gpt-5",
+		Provider: "openai", Result: ResultOK,
+		InputTokens: 120, TotalTokens: 150, LatencyMS: 4000,
+	}
+	hint := PassiveDedupeHint{Models: []string{"gpt-5"}, Near: b.TS, LatencyMS: b.LatencyMS,
+		TotalTokens: b.TotalTokens, InputTokens: b.InputTokens}
+	if err := s.RecordPassiveUsage(ctx, b, hint); err != nil {
+		t.Fatalf("被动入库失败: %v", err)
+	}
+	if _, err := s.GetRequest(ctx, b.ID); err != nil {
+		t.Fatalf("不同请求的被动行不得被误并: %v", err)
+	}
+	if _, err := s.GetRequest(ctx, a.ID); err != nil {
+		t.Fatalf("执行器行应保留: %v", err)
+	}
+}
+
+// TestDedupeRequestsFullChainLatencyPair 事后对账同口径：宿主全链路延迟的
+// 历史重复对应被合并；token 计数不相容（差异超容差）的行不得合并。
+func TestDedupeRequestsFullChainLatencyPair(t *testing.T) {
+	s := openTestStore(t, filepath.Join(t.TempDir(), "cpa.db"), "owner-a")
+	ctx := context.Background()
+	base := time.UnixMilli(1_700_000_000_000).UTC()
+
+	// 真重复：宿主延迟远大于执行器延迟（全链路开销），token 相同。
+	exec := Request{
+		ID: "exec-h1", TS: base, KeyID: "kid1", CallerID: "default",
+		Model: "gpt-5", Result: ResultOK, LatencyMS: 2805, CostMicroUSD: 12, Priced: true,
+	}
+	host := Request{
+		ID: "host-h1", TS: base.Add(900 * time.Millisecond), Model: "gpt-5",
+		Provider: "openai", Result: ResultOK,
+		InputTokens: 500, OutputTokens: 200, TotalTokens: 700, LatencyMS: 8800,
+	}
+	// 不合并：token 差异巨大（不同请求）。
+	exec2 := Request{
+		ID: "exec-h2", TS: base.Add(time.Minute), KeyID: "kid1", CallerID: "default",
+		Model: "claude-5", Result: ResultOK, LatencyMS: 3000, InputTokens: 900, TotalTokens: 950, CostMicroUSD: 3, Priced: true,
+	}
+	host2 := Request{
+		ID: "host-h2", TS: base.Add(time.Minute + 500*time.Millisecond), Model: "claude-5",
+		Provider: "anthropic", Result: ResultOK,
+		InputTokens: 12000, TotalTokens: 13000, LatencyMS: 9500,
+	}
+	for _, r := range []Request{exec, host, exec2, host2} {
+		if err := s.RecordUsage(ctx, r); err != nil {
+			t.Fatalf("写入 %s 失败: %v", r.ID, err)
+		}
+	}
+
+	merged, err := s.DedupeRequests(ctx, base.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("DedupeRequests 失败: %v", err)
+	}
+	if merged != 1 {
+		t.Fatalf("应只合并全链路延迟的真重复对（token 不相容的不得合并），得到 %d", merged)
+	}
+	if _, err := s.GetRequest(ctx, host.ID); err == nil {
+		t.Fatal("真重复的被动行应被删除")
+	}
+	if _, err := s.GetRequest(ctx, host2.ID); err != nil {
+		t.Fatalf("token 不相容的被动行应保留: %v", err)
+	}
+}

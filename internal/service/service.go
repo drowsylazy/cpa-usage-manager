@@ -580,9 +580,10 @@ func (s *Service) BackfillRequestUsage(ctx context.Context, kid string, models [
 	return s.st.BackfillRequestUsage(ctx, kid, models, near, b)
 }
 
-// FindDuplicateExecutor 按 时间+延迟+模型 关联执行器已入库的记录，用于判重。
-func (s *Service) FindDuplicateExecutor(ctx context.Context, models []string, near time.Time, latencyMS int64) (string, bool, error) {
-	return s.st.FindDuplicateExecutor(ctx, models, near, latencyMS)
+// FindDuplicateExecutor 按结构化区间谓词关联执行器已入库的记录，用于判重。
+// totalTokens/inputTokens 是宿主侧计数，供 token 相容性过滤（0 = 不约束）。
+func (s *Service) FindDuplicateExecutor(ctx context.Context, models []string, near time.Time, latencyMS, totalTokens, inputTokens int64) (string, bool, error) {
+	return s.st.FindDuplicateExecutor(ctx, models, near, latencyMS, totalTokens, inputTokens)
 }
 
 // BackfillRequestUsageByID 按 ID 回填宿主上报的用量明细。

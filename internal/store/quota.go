@@ -347,8 +347,10 @@ func (s *Store) SettleReservation(ctx context.Context, id string, cost money.Mic
 			// 在同一事务内探测，命中则插入本行后立即合并掉被动行——
 			// 单写者串行化保证探测结果在提交前不会被并发改写，
 			// 外部看不到任何中间态，事后对账因此不再需要。
+			// 结算侧传执行器侧 token 计数做相容性过滤（0 = 不约束）。
 			twin, twinFound, perr := duplicateProbeTx(ctx, tx,
-				modelCandidatesOf(request.Model), request.TS, request.LatencyMS, false)
+				modelCandidatesOf(request.Model), request.TS, request.LatencyMS,
+				request.TotalTokens, request.InputTokens, false)
 			if perr != nil {
 				return perr
 			}
