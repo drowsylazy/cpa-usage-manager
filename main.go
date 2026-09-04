@@ -67,6 +67,8 @@ var runtimeState struct {
 	notifyStop chan struct{}
 	// backupStop 关停定时备份 goroutine，同上。
 	backupStop chan struct{}
+	// fxStop 关停汇率刷新 goroutine，同上。
+	fxStop chan struct{}
 }
 
 type imageHold struct {
@@ -399,17 +401,22 @@ func cliproxyPluginShutdown() {
 	st := runtimeState.st
 	notifyStop := runtimeState.notifyStop
 	backupStop := runtimeState.backupStop
+	fxStop := runtimeState.fxStop
 	runtimeState.st = nil
 	runtimeState.svc = nil
 	runtimeState.api = nil
 	runtimeState.notifyStop = nil
 	runtimeState.backupStop = nil
+	runtimeState.fxStop = nil
 	runtimeState.Unlock()
 	if notifyStop != nil {
 		close(notifyStop)
 	}
 	if backupStop != nil {
 		close(backupStop)
+	}
+	if fxStop != nil {
+		close(fxStop)
 	}
 	if st != nil {
 		_ = st.Close()
@@ -621,6 +628,10 @@ func configure(inline string) error {
 		close(runtimeState.backupStop)
 		runtimeState.backupStop = nil
 	}
+	if runtimeState.fxStop != nil {
+		close(runtimeState.fxStop)
+		runtimeState.fxStop = nil
+	}
 	// 旧库已关、新库未开：失败路径必须把运行态整体置空，让后续请求拿到
 	// 干净的 service_unavailable，而不是对已关闭的库报错——后者会让
 	// usage.handle 的被动记录在 warn 日志之外静默丢失。
@@ -658,6 +669,9 @@ func configure(inline string) error {
 	notifyStop := make(chan struct{})
 	runtimeState.notifyStop = notifyStop
 	go notifySweepLoop(svc, notifyStop)
+	fxStop := make(chan struct{})
+	runtimeState.fxStop = fxStop
+	go fxRefreshLoop(svc, fxStop)
 	if cfg.Backup.Enabled {
 		backupStop := make(chan struct{})
 		runtimeState.backupStop = backupStop
@@ -1498,6 +1512,37 @@ func autoBackupLoop(svc *service.Service, cfg config.BackupConfig, stop <-chan s
 			} else {
 				lastDay = "" // 只读实例不占当天名额，接管租约后照常补备份
 			}
+		}
+	}
+}
+
+// fxRefreshLoop 周期性刷新 USD→CNY 汇率。此前汇率是纯懒加载：只有面板有人
+// 调 /exchange-rate 才可能触发上游拉取，面板无人打开时缓存会一直陈旧到
+// 下一次访问；CNY 计价规则保存时锁定的汇率兜底也因此长期停在旧值。
+// 刷新间隔远小于 fx.DefaultTTL（6h），保证任何时刻被使用的汇率都是新鲜的。
+// 失败静默重试（兜底值仍在，不影响任何功能）；仅租约持有者执行——
+// 汇率缓存写在共享的 meta 表，非持有者刷新是白白打上游。
+func fxRefreshLoop(svc *service.Service, stop <-chan struct{}) {
+	fire := func() {
+		if !svc.Store().Writable() {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		// RefreshExchangeRate 内部已有双源与兜底逻辑，这里的错误仅记录。
+		if _, err := svc.RefreshExchangeRate(ctx); err != nil {
+			log.Printf("cpa-usage-manager: 汇率自动刷新失败（下次重试）: %v", err)
+		}
+	}
+	fire() // 启动即刷一次：不依赖面板被打开
+	ticker := time.NewTicker(30 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			fire()
 		}
 	}
 }
