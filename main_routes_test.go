@@ -227,19 +227,19 @@ func TestExecuteRoutedLoopFailover(t *testing.T) {
 		t.Fatalf("mode=target 应按目标计价: %d", row.CostMicroUSD)
 	}
 
-	// 审计事件存在。
+	// v0.8 起 route.failover 审计退役：转移轨迹随结算行写入 error_note。
+	// 本场景 target-a 500 后转移成功，成功行也带轨迹（"a→b(status_500)"）。
+	if row.ErrorNote == "" || !strings.Contains(row.ErrorNote, "→") {
+		t.Fatalf("结算行 error_note 应带目标转移轨迹: %q", row.ErrorNote)
+	}
 	events, err := st.ListAudit(ctx, 20, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := false
 	for _, e := range events {
 		if e.Action == "route.failover" {
-			found = true
+			t.Fatalf("route.failover 审计应已退役: %+v", e)
 		}
-	}
-	if !found {
-		t.Fatal("缺少 route.failover 审计")
 	}
 
 	// 失败目标已进冷却。
@@ -501,18 +501,19 @@ func TestResolveRoutingAIFallback(t *testing.T) {
 	if len(re.chain) != 1 || re.chain[0] != "fb" {
 		t.Fatalf("链应回落为 [fb]: %v", re.chain)
 	}
+	// v0.8 起 ai_fallback 审计退役：判定错误经 RouteMatch.AIFallbackErr
+	// 随结算行落 error_note，此处校验带出文本非空。
+	if re.match.AIFallbackErr == "" {
+		t.Fatal("AIFallbackErr 应带出判定错误文本")
+	}
 	events, err := st.ListAudit(ctx, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := false
 	for _, e := range events {
 		if e.Action == "route.ai_fallback" {
-			found = true
+			t.Fatalf("route.ai_fallback 审计应已退役: %+v", e)
 		}
-	}
-	if !found {
-		t.Fatal("缺少 route.ai_fallback 审计")
 	}
 }
 
