@@ -336,6 +336,9 @@ h1,h2,h3,p{margin:0}
 .donut-legend-item{
   display:flex;align-items:center;gap:8px;padding:4px 8px;border:0;border-radius:7px;
   background:none;color:var(--fg);font:inherit;font-size:12px;cursor:default;text-align:left;
+  /* grid 子项默认 min-width:auto 不可收缩：长名字会把本行撑出轨道、
+     把占比列推出图例区（.dl-name 的 min-width:0 只管自身，先得让本层可收） */
+  min-width:0;
 }
 .donut-legend-item:hover{background:var(--sunken)}
 .donut-legend-item .swatch{width:9px;height:9px;border-radius:3px;flex:none}
