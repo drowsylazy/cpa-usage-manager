@@ -39,7 +39,7 @@ func TestSettlePricingModeTarget(t *testing.T) {
 	u := usageparse.Usage{InputTokens: 1000, OutputTokens: 0, TotalTokens: 1000}
 	u.InputTokens = 1000
 	reqRow := &store.Request{ID: "req-1", UpstreamModel: "opus-real"}
-	if _, err := s.Settle(ctx, reservation.ID, u, reqRow); err != nil {
+	if _, err := s.Settle(ctx, reservation.ID, u, reqRow, false); err != nil {
 		t.Fatal(err)
 	}
 	page, err := s.ListRequests(ctx, UsageFilter{}, 10, 0, "ts", "desc")
@@ -78,7 +78,7 @@ func TestSettlePricingModeAlias(t *testing.T) {
 	u := usageparse.Usage{}
 	u.InputTokens = 1000
 	reqRow := &store.Request{ID: "req-2", UpstreamModel: "opus-real"}
-	if _, err := s.Settle(ctx, reservation.ID, u, reqRow); err != nil {
+	if _, err := s.Settle(ctx, reservation.ID, u, reqRow, false); err != nil {
 		t.Fatal(err)
 	}
 	page, err := s.ListRequests(ctx, UsageFilter{}, 10, 0, "ts", "desc")

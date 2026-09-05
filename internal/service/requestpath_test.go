@@ -140,7 +140,7 @@ func TestEstimateTokens(t *testing.T) {
 	if out != 512 {
 		t.Fatalf("max_completion_tokens 未生效: %d", out)
 	}
-	if in != int64(len(`{"max_completion_tokens":512}`))/2+1 {
+	if in != int64(len(`{"max_completion_tokens":512}`))/3+1 {
 		t.Fatalf("input 估算异常: %d", in)
 	}
 	in, out = ParseRequestMeta([]byte(`{}`)).tokenEstimates(4096, 1_000_000)

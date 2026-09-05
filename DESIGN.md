@@ -15,7 +15,7 @@
 ### 1.1 额度管理（核心）
 
 - 签发/管理 `cum-<kid>-<secret>` 插件 Key：总/日/周/月额度（micro-USD）、最大并发、可用模型、标签、归属（caller）、禁用/启用/撤销/轮换/删除
-- 请求前**严格预占**（保守 Token 上限 × 计价 → 原子扣占），余额不足 fail-closed 拒绝
+- 请求前**严格预占**（保守 Token 上限，金额分档计：输入估算 × 输入侧档 + 输出估算 × 输出价 → 原子扣占），余额不足 fail-closed 拒绝
 - 按实际 usage **结算**（流式/非流式、多协议：OpenAI/Claude/Gemini/Responses 等），缺失 usage 有兜底策略
 - 周期额度按自然周期滚动（日/周一起点周一/月），默认 UTC；`quota.cycle_offset_minutes` 可整体偏移到本地日历（480=UTC+8，日限额本地零点归零）；并发按在途未结请求计数
 - 明文仅签发时返回一次；数据库只存 HMAC 哈希 + 可恢复的 AES-GCM 密文 + pepper ID + 指纹
@@ -252,7 +252,7 @@ dedupe                  POST  库内判重对账
 
 - 两者均为 `NULL` 表示该档不限；可只配一种
 - **Token 口径 = 计费四类合计**（Input＋Output＋Cache Read＋Cache Creation，即 `Billable().Sum()`），与费用同一口径：inclusive/exclusive 已归一、`cached` 不重复计、推理已并入 Output
-- **判定时机与金额对称**：预占期按估算 token 判定（`reservations.reserved_tokens`，在途预占计入用量），结算时按真实 token 回写累计器；上游未回用量时退回预占估算值
+- **判定时机与金额对称**：预占期按估算 token 判定（`reservations.reserved_tokens`，在途预占计入用量），结算时按真实 token 回写累计器；上游未回用量时退回预占估算值，但**未产生任何响应数据**（HTTP 4xx/5xx、空响应体、流零块）除外——该场景真实成本为零，按零成本结算并照常落请求行，不再把预占估算扣到账上
 - Token 累计器**复用金额那套 `*_cycle_key`** 归零机制，并在同一条 `UPDATE` 内推进，保证两种口径的跨期点严格一致（不会出现金额已跨期而 token 未跨期）
 - 存在的理由：混合模型下单价差可达数十倍（haiku vs opus），同一笔预算对应的 token 量相差极大，只用金额无法精确约束用量
 
@@ -420,7 +420,7 @@ ResolveChain = Eval（ai_judge 失败自动回落兜底分支并记审计）→ 
 ### 12.5 已知限制
 
 - 冷却进程内保存：reconfigure/重启丢失、多实例各自独立——failover 链本身兜底。
-- `input_tokens` 为 len(body)/2+1 封顶粗估（CJK 偏低 1.5~2x），阈值条件需留余量。
+- `input_tokens` 为 len(body)/3+1 封顶粗估（英文/代码高估 ~33%，CJK 最密场景恰好覆盖），阈值条件需留余量。
 - ai_judge 同步阻塞热路径 ≤ timeout_ms；摘要文本发往 judge 目标模型（隐私边界见 README）。
 - 别名流量仅面向插件 Key（cum-/caller_scope）；原生 Key 打别名走宿主原生路径报未知模型，预期共存行为。
 - 引用模型禁命中任何启用别名（含自引用）：路由不嵌套，编译期校验拒绝。

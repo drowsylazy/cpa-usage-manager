@@ -164,7 +164,7 @@ func (s *Service) ResolveIdentity(ctx context.Context, headers http.Header, meta
 // （估算 token、提模型、提 tier、提 reasoning_effort）；长上下文/带图请求
 // 可达数 MB，这里改为入口一次类型化解析后全程复用。
 type RequestMeta struct {
-	// BodyLen 是原始请求体长度（输入 token 按 len/2+1 估算）。
+	// BodyLen 是原始请求体长度（输入 token 按 len/3+1 估算）。
 	BodyLen int
 
 	Model           string          `json:"model"`
@@ -229,11 +229,15 @@ func rawNonEmpty(raw json.RawMessage) bool {
 	return string(raw) != "null"
 }
 
-// tokenEstimates 按锁定决策估算输入/输出上限：输入 body 字符数/2+1，
+// tokenEstimates 按锁定决策估算输入/输出上限：输入 body 字节数/3+1，
 // 输出取 max_tokens / max_completion_tokens / max_output_tokens /
 // generationConfig.maxOutputTokens 中首个存在者（否则 defaultOutput），封顶 max。
+// 输入按字节/3：英文与代码实测约 4 字节/token（高估 ~33%），CJK 密集文本
+// 最密约 3 字节/token，base64 图片数据约 3 字节/token——/3 恰好覆盖最密
+// 场景，又比旧的 /2 少高估一档（旧口径曾把 220k token 的 agent 上下文
+// 预占到 46 万 token，配合「全按最贵档计价」把兜底金额放大 50 倍）。
 func (m RequestMeta) tokenEstimates(defaultOutput, max int64) (in, out int64) {
-	in = int64(m.BodyLen)/2 + 1
+	in = int64(m.BodyLen)/3 + 1
 	if in > max {
 		in = max
 	}
@@ -267,8 +271,10 @@ func (m RequestMeta) imageCount() int64 {
 
 // BuildReservePlan 按模型计价规则与请求体估算预占额度。
 //
-// 锁定决策：预占使用保守上限（输入按 body 字符数/2+1，输出取 max_tokens 或
-// default_output_reserve，均封顶 max_token_estimate），由 Reserve 按规则算出金额。
+// 锁定决策：预占使用保守上限（输入按 body 字节数/3+1，输出取 max_tokens 或
+// default_output_reserve，均封顶 max_token_estimate），金额按分档价计——
+// 输入估算按输入侧最贵档（输入/缓存读/缓存写），输出估算按输出价；
+// 不再把整段估算按四档最高价计（那是长上下文请求预占虚高的主因）。
 func (s *Service) BuildReservePlan(ctx context.Context, model string, body []byte) (ReservePlan, error) {
 	return s.buildPlanFromMeta(ctx, model, ParseRequestMeta(body), model)
 }

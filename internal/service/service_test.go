@@ -191,7 +191,7 @@ func TestSettleAbsorbsPreexistingPassiveRow(t *testing.T) {
 		Source: "openai", Result: store.ResultOK, LatencyMS: 8844,
 	}
 	usage := usageparse.Usage{InputTokens: 14, OutputTokens: 214, TotalTokens: 228}
-	if _, err := s.Settle(ctx, res.ID, usage, execReq); err != nil {
+	if _, err := s.Settle(ctx, res.ID, usage, execReq, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -243,7 +243,7 @@ func TestReserveSettleAndQuotaBoundary(t *testing.T) {
 	}
 	usage := usageparse.Usage{InputTokens: 1, OutputTokens: 1, InputIncludesCache: true, ReasoningInOutput: true}
 	req := &store.Request{ID: "request-1", KeyID: k, CallerID: store.DefaultCallerID, Model: "gpt-test", Result: store.ResultOK}
-	if _, err := s.Settle(ctx, res.ID, usage, req); err != nil {
+	if _, err := s.Settle(ctx, res.ID, usage, req, false); err != nil {
 		t.Fatal(err)
 	}
 	got, err := st.GetRequest(ctx, req.ID)
@@ -270,7 +270,7 @@ func TestMissingUsageReleaseAndModelLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 默认策略为 settle_reserved：缺失 usage 仍结算预占。
-	settled, err := s.Settle(ctx, res.ID, usageparse.Usage{}, nil)
+	settled, err := s.Settle(ctx, res.ID, usageparse.Usage{}, nil, false)
 	if err != nil || settled.Status != store.ReservationSettled {
 		t.Fatalf("缺失 usage 结算异常: %+v %v", settled, err)
 	}
@@ -296,7 +296,7 @@ func TestMissingUsageReleaseAndModelLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	released, err := s2.Settle(ctx, r2.ID, usageparse.Usage{}, nil)
+	released, err := s2.Settle(ctx, r2.ID, usageparse.Usage{}, nil, false)
 	if err != nil || released.Status != store.ReservationReleased {
 		t.Fatalf("缺失 usage release 异常: %+v %v", released, err)
 	}

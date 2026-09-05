@@ -138,7 +138,7 @@ quota:                               # 额度子系统
     default_output_reserve: 4096      # 请求未带 max_tokens 时的输出预占
     require_estimate: false
   settlement:
-    missing_usage: settle_reserved    # 上游未回用量：settle_reserved 按预占扣费 | release 释放
+    missing_usage: settle_reserved    # 上游未回用量（仍有响应数据）：settle_reserved 按预占扣费 | release 释放；上游未产生任何响应数据（HTTP 错误/空响应）时一律零成本结算
     host_usage_wait: 1500ms           # 流式兜底等待宿主用量回调的窗口（非流式不等待）
   stream:
     stale_reservation_timeout: 2h     # 无心跳在途预占自动释放

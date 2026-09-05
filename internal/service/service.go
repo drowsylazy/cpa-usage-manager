@@ -404,9 +404,15 @@ func (s *Service) RevealKey(ctx context.Context, kid, actor string) (string, err
 type ReservationRequest struct {
 	KeyID, CallerID, Model, IdempotencyKey string
 	EstimatedTokens                        int64
-	EstimatedImages                        int64
-	Actor                                  string
-	ExpiresAt                              time.Time
+	// EstimatedInput / EstimatedOutput 是输入/输出估算的拆分（两者之和应等于
+	// EstimatedTokens）。任一非零时预占金额按分档价计（输入侧档 × 输入估算 +
+	// 输出价 × 输出估算）；均为零时退回旧行为（总额 × 四档最高价），兼容
+	// 未携带拆分的调用方。
+	EstimatedInput  int64
+	EstimatedOutput int64
+	EstimatedImages int64
+	Actor           string
+	ExpiresAt       time.Time
 	// PricingOverride 非空时跳过按 Model 的规则匹配，直接采用该计价规则
 	// （别名路由 mode=target：执行器已按首选目标匹配）。
 	PricingOverride *store.PricingRule
@@ -447,21 +453,47 @@ func (s *Service) Reserve(ctx context.Context, r ReservationRequest) (store.Rese
 	if r.EstimatedTokens == 0 && rule.BillingMode == store.BillingModeToken {
 		r.EstimatedTokens = s.cfg.Quota.Limits.DefaultOutputReserve
 	}
-	maxPrice := rule.PriceInput
-	for _, p := range []money.Price{rule.PriceOutput, rule.PriceCacheRead, rule.PriceCacheCreation} {
-		if p > maxPrice {
-			maxPrice = p
-		}
-	}
-	cost, err := money.CostForTokens(r.EstimatedTokens, maxPrice)
-	if err != nil {
-		return store.Reservation{}, err
-	}
-	if rule.BillingMode == store.BillingModeFree {
-		cost = 0
-	}
-	if rule.BillingMode == store.BillingModePerImage {
+	var cost money.Micro
+	switch {
+	case rule.BillingMode == store.BillingModeFree:
+		// cost 保持 0
+	case rule.BillingMode == store.BillingModePerImage:
 		cost, err = multiplyMicro(rule.PerImageMicroUSD, r.EstimatedImages)
+		if err != nil {
+			return store.Reservation{}, err
+		}
+	case r.EstimatedInput > 0 || r.EstimatedOutput > 0:
+		// 分档预占：输入估算按输入侧最贵档（缓存读/写只会发生在输入侧，
+		// 取三者最高保覆盖），输出估算按输出价。此前整段估算按四档最高价
+		// 计，长上下文请求（输出价常为输入价数倍）的预占与兜底金额被
+		// 系统性放大数倍（实测 agent 流量 7.05 → 2.46 USD）。
+		inPrice := rule.PriceInput
+		for _, p := range []money.Price{rule.PriceCacheRead, rule.PriceCacheCreation} {
+			if p > inPrice {
+				inPrice = p
+			}
+		}
+		cin, err := money.CostForTokens(r.EstimatedInput, inPrice)
+		if err != nil {
+			return store.Reservation{}, err
+		}
+		cout, err := money.CostForTokens(r.EstimatedOutput, rule.PriceOutput)
+		if err != nil {
+			return store.Reservation{}, err
+		}
+		if cin > 0 && cout > 0 && cin > math.MaxInt64-cout {
+			return store.Reservation{}, money.ErrOverflow
+		}
+		cost = cin + cout
+	default:
+		maxPrice := rule.PriceInput
+		for _, p := range []money.Price{rule.PriceOutput, rule.PriceCacheRead, rule.PriceCacheCreation} {
+			if p > maxPrice {
+				maxPrice = p
+			}
+		}
+		var err error
+		cost, err = money.CostForTokens(r.EstimatedTokens, maxPrice)
 		if err != nil {
 			return store.Reservation{}, err
 		}
@@ -489,7 +521,7 @@ func (s *Service) Reserve(ctx context.Context, r ReservationRequest) (store.Rese
 	})
 	return res, err
 }
-func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req *store.Request) (store.Reservation, error) {
+func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req *store.Request, noResponse bool) (store.Reservation, error) {
 	r, err := s.st.GetReservation(ctx, id)
 	if err != nil {
 		return store.Reservation{}, err
@@ -514,11 +546,20 @@ func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req
 	var cost, costNative money.Micro
 	var costCurrency string
 	if u.IsZero() {
-		if s.cfg.Quota.Settlement.MissingUsage == config.MissingUsageRelease {
+		switch {
+		case noResponse:
+			// 上游未产生任何响应数据（HTTP 4xx/5xx、空响应体、一条流块都没
+			// 收到）：真实成本为零，不再按预占估算入账——此前该场景把
+			// (body/2+max_tokens)×最贵档的全额预占扣到账上，实测一次上游空
+			// 响应被多扣 5 万倍（0.0001 → 7.05 USD）。预占随结算退回，请求行
+			// 照常落库（cost 0）保留可观测性。
+			cost, costNative, costCurrency = 0, 0, store.PricingCurrencyUSD
+		case s.cfg.Quota.Settlement.MissingUsage == config.MissingUsageRelease:
 			return s.st.ReleaseReservation(ctx, id, time.Now())
+		default:
+			// 上游未回用量：按预占估算（美元口径）入账。
+			cost, costNative, costCurrency = r.HeldMicroUSD, r.HeldMicroUSD, store.PricingCurrencyUSD
 		}
-		// 上游未回用量：按预占估算（美元口径）入账。
-		cost, costNative, costCurrency = r.HeldMicroUSD, r.HeldMicroUSD, store.PricingCurrencyUSD
 	} else {
 		cost, costNative, e = s.costForRule(rule, u, u.ImageCount)
 		if e != nil {
@@ -551,10 +592,15 @@ func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req
 	}
 	// 结算 token 与费用同一口径：Billable() 已把 inclusive/exclusive 归一、
 	// cached 并入缓存读不重复计、推理并入输出。u 为零值（上游未回用量）时
-	// 退回预占的估算值，与 cost 走 HeldMicroUSD 的兜底逻辑保持对称。
+	// 退回预占的估算值，与 cost 走 HeldMicroUSD 的兜底逻辑保持对称；
+	// noResponse（无响应数据）时真实 token 为零，不回填估算。
 	billableTokens := billableForRule(rule, u).Sum()
 	if u.IsZero() {
-		billableTokens = r.ReservedTokens
+		if noResponse {
+			billableTokens = 0
+		} else {
+			billableTokens = r.ReservedTokens
+		}
 	}
 	out, err := s.st.SettleReservation(ctx, id, cost, billableTokens, time.Now(), req,
 		store.AuditEvent{Action: "quota.settle", EntityType: "reservation", EntityID: id, Detail: map[string]any{"cost_micro_usd": cost}})

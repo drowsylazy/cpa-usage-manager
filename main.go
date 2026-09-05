@@ -981,7 +981,7 @@ func execute(body []byte) ([]byte, error) {
 		}
 		return errorEnvelope("reserve_rejected", err.Error()), nil
 	}
-	reservation, err := svc.Reserve(ctx, service.ReservationRequest{KeyID: key.KID, CallerID: key.CallerID, Model: plan.Model, EstimatedTokens: plan.TokenEstimate, EstimatedImages: plan.ImageCount, Actor: "quota"})
+	reservation, err := svc.Reserve(ctx, service.ReservationRequest{KeyID: key.KID, CallerID: key.CallerID, Model: plan.Model, EstimatedTokens: plan.TokenEstimate, EstimatedInput: plan.InputEstimate, EstimatedOutput: plan.OutputEstimate, EstimatedImages: plan.ImageCount, Actor: "quota"})
 	if err != nil {
 		if errors.Is(err, service.ErrModelNotAllowed) {
 			return errorEnvelope("model_not_allowed", err.Error()), nil
@@ -1005,7 +1005,8 @@ func execute(body []byte) ([]byte, error) {
 	// 非流式响应体几乎总带 usage，这里只做非阻塞探测：宿主记账发生在
 	// 本次调用返回之后，同步等待只会白等一个超时。缺失的明细由认领在
 	// 宽限期内按请求 ID 回填。
-	settleReservation(svc, plan, reservation, req, startedAt, time.Time{}, completedAt, status, parsed, usageparse.SniffModel(hostBody), hostErrorNote(status, hostBody), claim)
+	// HTTP 错误或空响应体 = 上游未产生响应数据，零用量时按零成本结算。
+	settleReservation(svc, plan, reservation, req, startedAt, time.Time{}, completedAt, status, parsed, usageparse.SniffModel(hostBody), hostErrorNote(status, hostBody), claim, status >= http.StatusBadRequest || len(hostBody) == 0)
 	return okEnvelope(rpcExecutorResponse{Payload: hostBody, Headers: headers})
 }
 
@@ -1072,7 +1073,7 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 			case dialFailed:
 				if statusErr, ok := dialErr.(errHostStatus); ok {
 					// HTTP 错误：落行结算（与直连语义一致），错误文本关流。
-					settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), int(statusErr), usageparse.Usage{}, targetWithSuffix(re.chain[i], re.match.Suffix), re.failoverNote(), re.claim)
+					settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), int(statusErr), usageparse.Usage{}, targetWithSuffix(re.chain[i], re.match.Suffix), re.failoverNote(), re.claim, true)
 					return dialErr
 				}
 				re.claim.release(0)
@@ -1090,7 +1091,7 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 	if err != nil {
 		return err
 	}
-	reservation, err := svc.Reserve(ctx, service.ReservationRequest{KeyID: key.KID, CallerID: key.CallerID, Model: plan.Model, EstimatedTokens: plan.TokenEstimate, EstimatedImages: plan.ImageCount, Actor: "quota"})
+	reservation, err := svc.Reserve(ctx, service.ReservationRequest{KeyID: key.KID, CallerID: key.CallerID, Model: plan.Model, EstimatedTokens: plan.TokenEstimate, EstimatedInput: plan.InputEstimate, EstimatedOutput: plan.OutputEstimate, EstimatedImages: plan.ImageCount, Actor: "quota"})
 	if err != nil {
 		return err
 	}
@@ -1124,7 +1125,7 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 	}
 	if stream.StatusCode >= 400 {
 		_ = closeHostModelStream(stream.StreamID)
-		settleReservation(svc, plan, reservation, req, startedAt, time.Time{}, time.Now(), stream.StatusCode, usageparse.Usage{}, "", http.StatusText(stream.StatusCode), claim)
+		settleReservation(svc, plan, reservation, req, startedAt, time.Time{}, time.Now(), stream.StatusCode, usageparse.Usage{}, "", http.StatusText(stream.StatusCode), claim, true)
 		return fmt.Errorf("host model status %d", stream.StatusCode)
 	}
 	if strings.TrimSpace(stream.StreamID) == "" {
@@ -1145,20 +1146,20 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 		if errRead != nil {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), errRead.Error(), claim)
+			settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), errRead.Error(), claim, firstChunkAt.IsZero())
 			return errRead
 		}
 		var chunk rpcHostModelStreamReadResponse
 		if err := json.Unmarshal(chunkRaw, &chunk); err != nil {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), err.Error(), claim)
+			settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), err.Error(), claim, firstChunkAt.IsZero())
 			return err
 		}
 		if chunk.Error != "" {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), chunk.Error, claim)
+			settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, acc.Model(), chunk.Error, claim, firstChunkAt.IsZero())
 			return fmt.Errorf("%s", chunk.Error)
 		}
 		if len(chunk.Payload) > 0 {
@@ -1172,7 +1173,7 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 			if err := emitPluginStreamChunk(pluginStreamID, chunk.Payload); err != nil {
 				completedAt = time.Now()
 				parsed, _ := acc.Result()
-				settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 499, parsed, acc.Model(), err.Error(), claim)
+				settleReservation(svc, plan, reservation, req, startedAt, firstChunkAt, completedAt, 499, parsed, acc.Model(), err.Error(), claim, firstChunkAt.IsZero())
 				return err
 			}
 		}
@@ -1192,19 +1193,21 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 			r := buildRequest(svc, reservation, req, plan.Meta, startedAt, firstChunkAt, completedAt, 200)
 			r.UpstreamModel = acc.Model()
 			applyHostUsageToRequest(r, rec)
-			return finishSettle(svc, reservation, r, parsed, claim)
+			return finishSettle(svc, reservation, r, parsed, claim, firstChunkAt.IsZero())
 		}
 	}
 	r := buildRequest(svc, reservation, req, plan.Meta, startedAt, firstChunkAt, completedAt, 200)
 	r.UpstreamModel = acc.Model()
-	return finishSettle(svc, reservation, r, parsed, claim)
+	return finishSettle(svc, reservation, r, parsed, claim, firstChunkAt.IsZero())
 }
 
 // settleReservation 解析 usage 结算预占并写请求记录；结算失败时释放预占兜底。
 // upstreamModel 是执行器从上游响应里嗅探到的真实模型名（可为空）。
+// noResponse 表示上游未产生任何响应数据（HTTP 4xx/5xx、空响应体、流一条块
+// 都没收到）——零用量时不再按预占估算入账（真实成本为零）。
 // errNote 是失败原因摘要（路由流量的目标转移轨迹也在此），
 // 写入前经 store.SanitizeErrorNote 清洗截断。
-func settleReservation(svc *service.Service, plan service.ReservePlan, reservation store.Reservation, req rpcExecutorRequest, startedAt, firstChunkAt, completedAt time.Time, status int, usage usageparse.Usage, upstreamModel, errNote string, claim *usageClaim) {
+func settleReservation(svc *service.Service, plan service.ReservePlan, reservation store.Reservation, req rpcExecutorRequest, startedAt, firstChunkAt, completedAt time.Time, status int, usage usageparse.Usage, upstreamModel, errNote string, claim *usageClaim, noResponse bool) {
 	r := buildRequest(svc, reservation, req, plan.Meta, startedAt, firstChunkAt, completedAt, status)
 	r.UpstreamModel = upstreamModel
 	r.ErrorNote = errNote
@@ -1216,14 +1219,14 @@ func settleReservation(svc *service.Service, plan service.ReservePlan, reservati
 			usage = usageFromRecord(rec)
 		}
 	}
-	_ = finishSettle(svc, reservation, r, usage, claim)
+	_ = finishSettle(svc, reservation, r, usage, claim, noResponse)
 }
 
 // finishSettle 落库结算结果，并把请求行 ID 交给认领：
 // 宽限期内晚到的宿主用量据此回填，无需再靠库内启发式判重。
-func finishSettle(svc *service.Service, reservation store.Reservation, r *store.Request, usage usageparse.Usage, claim *usageClaim) error {
+func finishSettle(svc *service.Service, reservation store.Reservation, r *store.Request, usage usageparse.Usage, claim *usageClaim, noResponse bool) error {
 	ctx := context.Background()
-	_, err := svc.Settle(ctx, reservation.ID, usage, r)
+	_, err := svc.Settle(ctx, reservation.ID, usage, r, noResponse)
 	if err != nil {
 		// 未落库请求行：放弃认领，宿主回调回落到被动统计，避免用量凭空丢失。
 		// 若认领已先一步收到宿主口径，此刻已无法消费——置 released 后该记录
@@ -1721,7 +1724,7 @@ func completeIntercepted(body []byte) ([]byte, error) {
 	if rec, ok := hold.claim.wait(0); ok {
 		applyHostUsageToRequest(r, rec)
 	}
-	_ = finishSettle(svc, hold.reservation, r, usageparse.Usage{ImageCount: hold.plan.ImageCount}, hold.claim)
+	_ = finishSettle(svc, hold.reservation, r, usageparse.Usage{ImageCount: hold.plan.ImageCount}, hold.claim, false)
 	return okEnvelope(map[string]any{})
 }
 

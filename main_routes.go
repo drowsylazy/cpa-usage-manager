@@ -90,7 +90,7 @@ func resolveRouting(ctx context.Context, svc *service.Service, key *store.Plugin
 	re.plan = plan
 	resReq := service.ReservationRequest{
 		KeyID: key.KID, CallerID: key.CallerID, Model: plan.Model,
-		EstimatedTokens: plan.TokenEstimate, EstimatedImages: plan.ImageCount, Actor: "quota",
+		EstimatedTokens: plan.TokenEstimate, EstimatedInput: plan.InputEstimate, EstimatedOutput: plan.OutputEstimate, EstimatedImages: plan.ImageCount, Actor: "quota",
 	}
 	if plan.Priced && match.Route.PricingMode == "target" {
 		override := plan.Rule
@@ -356,7 +356,7 @@ func executeRoutedLoop(ctx context.Context, re *routedExecution, req rpcExecutor
 		if errHost == nil && status < 400 {
 			svc.MarkRouteSuccess(route.ID, tgt)
 			parsed, _ := usageparse.Parse(hostBody)
-			settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), status, parsed, upstream, re.failoverNote(), re.claim)
+			settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), status, parsed, upstream, re.failoverNote(), re.claim, len(hostBody) == 0)
 			return okEnvelope(rpcExecutorResponse{Payload: hostBody, Headers: headers})
 		}
 		if i < len(re.chain)-1 && routeFailureEligible(status, routeFailureCause(status, errHost), errHost) {
@@ -371,7 +371,7 @@ func executeRoutedLoop(ctx context.Context, re *routedExecution, req rpcExecutor
 			return errorEnvelope("upstream_error", errHost.Error()), nil
 		}
 		parsed, _ := usageparse.Parse(hostBody)
-		settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), status, parsed, upstream, re.failoverNote(), re.claim)
+		settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), status, parsed, upstream, re.failoverNote(), re.claim, true)
 		return okEnvelope(rpcExecutorResponse{Payload: hostBody, Headers: headers})
 	}
 	// 不可达：ResolveChain 保证链非空，末次迭代必为终局分支。
@@ -456,20 +456,20 @@ func pumpRoutedStream(re *routedExecution, req rpcExecutorRequest, startedAt tim
 		if errRead != nil {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), errRead.Error(), re.claim)
+			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), errRead.Error(), re.claim, firstChunkAt.IsZero())
 			return errRead
 		}
 		var chunk rpcHostModelStreamReadResponse
 		if err := json.Unmarshal(chunkRaw, &chunk); err != nil {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), err.Error(), re.claim)
+			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), err.Error(), re.claim, firstChunkAt.IsZero())
 			return err
 		}
 		if chunk.Error != "" {
 			completedAt = time.Now()
 			parsed, _ := acc.Result()
-			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), chunk.Error, re.claim)
+			settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 502, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), chunk.Error, re.claim, firstChunkAt.IsZero())
 			return errors.New(chunk.Error)
 		}
 		if len(chunk.Payload) > 0 {
@@ -481,7 +481,7 @@ func pumpRoutedStream(re *routedExecution, req rpcExecutorRequest, startedAt tim
 			if err := emitPluginStreamChunk(pluginStreamID, chunk.Payload); err != nil {
 				completedAt = time.Now()
 				parsed, _ := acc.Result()
-				settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 499, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), err.Error(), re.claim)
+				settleReservation(svc, re.plan, re.reservation, req, startedAt, firstChunkAt, completedAt, 499, parsed, service.FirstNonEmpty(acc.Model(), upstreamFallback), err.Error(), re.claim, firstChunkAt.IsZero())
 				return err
 			}
 		}
@@ -498,10 +498,10 @@ func pumpRoutedStream(re *routedExecution, req rpcExecutorRequest, startedAt tim
 			r := buildRequest(svc, re.reservation, req, re.plan.Meta, startedAt, firstChunkAt, completedAt, 200)
 			r.UpstreamModel = service.FirstNonEmpty(acc.Model(), upstreamFallback)
 			applyHostUsageToRequest(r, rec)
-			return finishSettle(svc, re.reservation, r, parsed, re.claim)
+			return finishSettle(svc, re.reservation, r, parsed, re.claim, firstChunkAt.IsZero())
 		}
 	}
 	r := buildRequest(svc, re.reservation, req, re.plan.Meta, startedAt, firstChunkAt, completedAt, 200)
 	r.UpstreamModel = service.FirstNonEmpty(acc.Model(), upstreamFallback)
-	return finishSettle(svc, re.reservation, r, parsed, re.claim)
+	return finishSettle(svc, re.reservation, r, parsed, re.claim, firstChunkAt.IsZero())
 }

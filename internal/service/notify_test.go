@@ -371,7 +371,7 @@ func TestNotifySingleUsageAlert(t *testing.T) {
 	}
 	usage := usageparse.Usage{InputTokens: 6_000, OutputTokens: 6_000, TotalTokens: 12_000}
 	// gpt-x 无计价规则 → 费用 0，靠 Token 阈值触发。
-	if _, err := s.Settle(ctx, res.ID, usage, nil); err != nil {
+	if _, err := s.Settle(ctx, res.ID, usage, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	waitFor := func(cond func(n int) bool) ntCall {

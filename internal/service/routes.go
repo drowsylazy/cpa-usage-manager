@@ -267,12 +267,13 @@ func (s *Service) ResolveChain(ctx context.Context, m *RouteMatch, env *routelan
 }
 
 // BuildRouteEnv 构造规则语言的运行时变量集。input_tokens 与预占估算同口径：
-// body 字节数/2+1 封顶 MaxTokenEstimate；model 为请求原名剥思考后缀。
+// body 字节数/3+1 封顶 MaxTokenEstimate（英文/代码约 4 字节/token，CJK 最密
+// 约 3 字节/token）；model 为请求原名剥思考后缀。
 // key 可为 nil（规则干跑测试）：此时 kid/key_label/caller_id 为空串。
 // hour/weekday（1=周一..7=周日）按 quota.cycle_offset_minutes 偏移后的
 // 本地日历取值，与额度周期口径一致。
 func (s *Service) BuildRouteEnv(meta RequestMeta, rawModel string, stream bool, source string, key *store.PluginKey) *routelang.Env {
-	in := int64(meta.BodyLen)/2 + 1
+	in := int64(meta.BodyLen)/3 + 1
 	if in > s.cfg.Quota.Limits.MaxTokenEstimate {
 		in = s.cfg.Quota.Limits.MaxTokenEstimate
 	}

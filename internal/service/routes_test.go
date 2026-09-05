@@ -364,7 +364,7 @@ func TestValidateRouteRuleBranches(t *testing.T) {
 	}
 	u := usageparse.Usage{}
 	u.InputTokens = 1
-	if _, err := s.Settle(ctx, res.ID, u, &store.Request{ID: "req-hist", Model: "hist-real-model", UpstreamModel: "hist-upstream-model"}); err != nil {
+	if _, err := s.Settle(ctx, res.ID, u, &store.Request{ID: "req-hist", Model: "hist-real-model", UpstreamModel: "hist-upstream-model"}, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"hist-real-model", "Hist-Upstream-Model"} {
@@ -378,7 +378,7 @@ func TestValidateRouteRuleBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Settle(ctx, res2.ID, u, &store.Request{ID: "req-routed", UpstreamModel: "rt-target"}); err != nil {
+	if _, err := s.Settle(ctx, res2.ID, u, &store.Request{ID: "req-routed", UpstreamModel: "rt-target"}, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, _, err = s.ValidateRouteRule(ctx, routed.ID, "routed-alias", `-> "rt-target"`, "target"); err != nil {
@@ -564,7 +564,7 @@ func TestTestRouteDryRun(t *testing.T) {
 	if len(res.Chain) != 2 || res.Chain[0] != "a" || res.Chain[1] != "b" || res.FellBack || res.AISkipped {
 		t.Fatalf("应命中第一分支整链: %+v", res)
 	}
-	wantIn := int64(len(synth))/2 + 1
+	wantIn := int64(len(synth))/3 + 1
 	if res.Vars["input_tokens"] != wantIn || res.Vars["body_len"] != int64(len(synth)) {
 		t.Fatalf("input_tokens/body_len 口径错误: want %d/%d got %v/%v",
 			wantIn, len(synth), res.Vars["input_tokens"], res.Vars["body_len"])
