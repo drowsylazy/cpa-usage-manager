@@ -79,6 +79,7 @@ func (a *API) register() {
 	a.route("/keys", a.keys)
 	a.route("/keys/candidates", a.keyCandidates)
 	a.route("/reservations/held", a.heldReservations)
+	a.route("/reservations/recent", a.recentReservations)
 	a.route("/model-routes/health", a.modelRoutesHealth)
 	a.route("/keys/issue", a.issue)
 	a.route("/keys/update", a.updateKey)
@@ -378,6 +379,21 @@ func (a *API) heldReservations(w http.ResponseWriter, r *http.Request) {
 	}
 	staleBefore := time.Now().Add(-a.svc.Config().Quota.Stream.StaleReservationTimeout.Std())
 	items, e := a.st.ListHeldReservations(r.Context(), staleBefore, time.Now(), 100)
+	if e != nil {
+		jsonOut(w, map[string]string{"error": e.Error()}, 500)
+		return
+	}
+	jsonOut(w, map[string]any{"items": items, "count": len(items)}, 200)
+}
+
+// recentReservations 返回最近已完结的预占（估算 vs 实结对照），供实时页
+// 「最近预占」回顾面板。released = 未走到结算即释放（上游错误/无响应/清扫）。
+func (a *API) recentReservations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.WriteHeader(405)
+		return
+	}
+	items, e := a.st.ListRecentReservations(r.Context(), 25)
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 500)
 		return

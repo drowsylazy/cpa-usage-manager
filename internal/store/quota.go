@@ -524,6 +524,62 @@ type HeldReservation struct {
 	StaleMark bool `json:"stale"`
 }
 
+// RecentReservation 是最近已完结预占的回顾行（GET /reservations/recent）：
+// 预占估算 vs 实际结算的对照，用于实时页「最近预占」面板。
+type RecentReservation struct {
+	ID               string      `json:"id"`
+	KeyID            string      `json:"key_id"`
+	Model            string      `json:"model"`
+	Status           string      `json:"status"` // settled | released
+	HeldMicroUSD     money.Micro `json:"held_micro_usd"`
+	SettledMicroUSD  money.Micro `json:"settled_micro_usd"`
+	ReservedTokens   int64       `json:"reserved_tokens"`
+	CreatedAt        time.Time   `json:"created_at"`
+	FinishedAt       time.Time   `json:"finished_at"`
+	AgeMS            int64       `json:"age_ms"` // 预占创建到完结的全程耗时
+}
+
+// ListRecentReservations 返回最近 limit 条已完结（settled/released）预占，
+// 按完结时刻倒序。released 涵盖三种收尾：执行器放弃/上游无响应释放、
+// 心跳或过期清扫——都表示没有走到结算，settled_micro_usd 即为 0。
+// 走 idx_reservations_settled 无法覆盖 released，故全表扫描 status 前缀
+// 走 idx_reservations_key_status 的 status 列；已完结行随保留期被
+// ApplyRetention 回收，量级有限。
+func (s *Store) ListRecentReservations(ctx context.Context, limit int) ([]RecentReservation, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 25
+	}
+	out := make([]RecentReservation, 0)
+	err := s.Read(ctx, func(q Querier) error {
+		rows, err := q.QueryContext(ctx,
+			`SELECT id, key_id, model, status, held_micro_usd, settled_micro_usd, reserved_tokens,
+			        created_at, COALESCE(settled_at, released_at)
+			 FROM reservations
+			 WHERE status IN ('settled','released')
+			 ORDER BY COALESCE(settled_at, released_at) DESC LIMIT ?`, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r RecentReservation
+			var held, settled, created, finished int64 // 时间列存 UnixMilli 整数，与 scanReservation 同口径
+			if err := rows.Scan(&r.ID, &r.KeyID, &r.Model, &r.Status, &held, &settled,
+				&r.ReservedTokens, &created, &finished); err != nil {
+				return err
+			}
+			r.HeldMicroUSD = money.Micro(held)
+			r.SettledMicroUSD = money.Micro(settled)
+			r.CreatedAt = time.UnixMilli(created).UTC()
+			r.FinishedAt = time.UnixMilli(finished).UTC()
+			r.AgeMS = finished - created
+			out = append(out, r)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
 // ListHeldReservations 返回全部在途（status='held'）预占，按创建时间倒序，
 // 供系统页「进行中请求」面板。走 idx_reservations_key_status 的 status 前缀。
 func (s *Store) ListHeldReservations(ctx context.Context, staleBefore time.Time, now time.Time, limit int) ([]HeldReservation, error) {
