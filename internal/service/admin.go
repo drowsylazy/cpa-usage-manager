@@ -413,7 +413,7 @@ func requestCSVRow(r store.Request) []string {
 		itoa(r.InputTokens), itoa(r.OutputTokens), itoa(r.ReasoningTokens), itoa(r.CachedTokens),
 		itoa(r.CacheReadTokens), itoa(r.CacheCreationTokens), itoa(r.TotalTokens),
 		itoa(r.LatencyMS), itoa(r.TTFTMS), milliString(r.TPSMilli), r.ThinkingIntensity,
-		// cost = 原生币种金额（currency 指明币种），cost_usd = 美元等值（按规则锁定汇率折算）。
+		// cost = 原生币种金额（currency 指明币种），cost_usd = 美元等值（按当前实时汇率折算）。
 		money.Micro(r.CostNativeMicro).USDString(), currency, r.CostMicroUSD.USDString(), strconv.FormatBool(r.Priced)}
 }
 

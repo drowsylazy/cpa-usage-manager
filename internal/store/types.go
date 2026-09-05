@@ -200,11 +200,13 @@ type PricingRule struct {
 	PerImageMicroUSD money.Micro `json:"per_image_micro_usd"`
 
 	// Currency 是价格四档与 PerImageMicroUSD 的计价币种：USD（默认）或 CNY。
-	// 价格列以该币种的 micro 单位存储（每百万 token）；结算时按保存时锁定
-	// 的 RateMilli 折算成 micro-USD 入账——账本恒为 USD，不随汇率行情漂移，
-	// 改价需重新保存规则。
+	// 价格列以该币种的 micro 单位存储（每百万 token）；结算时原生金额按原值
+	// 入账（CNY 规则恒 micro-CNY），美元等值按**当前实时汇率**折算成
+	// micro-USD（供额度扣减与跨币种聚合），随行情浮动。
 	Currency string `json:"currency"`
-	// RateMilli 是保存时锁定的 USD→CNY 汇率 ×1000（如 7160 = 7.16）；USD 规则恒为 1000。
+	// RateMilli 是 v0.7.2「保存时锁定汇率」的遗留列，2026-09 起不再参与
+	// 任何计算（折算改走 svc.ExchangeRate 实时汇率）；仅在读写时保留以
+	// 兼容旧库，新存规则恒为 1000。
 	RateMilli int64 `json:"fx_rate_milli"`
 
 	Source      string `json:"source"`
@@ -334,7 +336,7 @@ type Request struct {
 	CostMicroUSD      money.Micro `json:"cost_micro_usd"`
 	// Currency / CostNativeMicro 是该请求费用的**原生币种入账**：
 	// 命中 CNY 计价规则时 CostNativeMicro 存 micro-CNY、Currency=CNY，
-	// CostMicroUSD 则是按规则锁定汇率折算的美元等值（供额度扣减与跨币种
+	// CostMicroUSD 则是按当前实时汇率折算的美元等值（供额度扣减与跨币种
 	// 聚合使用）。空币种视为 USD（CostNativeMicro == CostMicroUSD）。
 	Currency        string      `json:"currency"`
 	CostNativeMicro money.Micro `json:"cost_native_micro"`

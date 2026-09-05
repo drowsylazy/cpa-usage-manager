@@ -706,11 +706,6 @@ func (a *API) pricing(w http.ResponseWriter, r *http.Request) {
 		jsonOut(w, map[string]string{"error": e.Error()}, 400)
 		return
 	}
-	// CNY 规则未显式给汇率时取当前 USD→CNY 汇率锁定（保存后不随行情漂移；
-	// ExchangeRate 永不失败，最坏退化到兜底汇率）。
-	if in.Currency == "CNY" && in.RateMilli <= 0 {
-		in.RateMilli = int64(a.svc.ExchangeRate(r.Context()).USDToCNY) / 1000
-	}
 	v, e := a.st.UpsertPricingRule(r.Context(), in)
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 400)

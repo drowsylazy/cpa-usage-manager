@@ -520,7 +520,7 @@ func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req
 		// 上游未回用量：按预占估算（美元口径）入账。
 		cost, costNative, costCurrency = r.HeldMicroUSD, r.HeldMicroUSD, store.PricingCurrencyUSD
 	} else {
-		cost, costNative, e = costForRule(rule, u, u.ImageCount)
+		cost, costNative, e = s.costForRule(rule, u, u.ImageCount)
 		if e != nil {
 			return store.Reservation{}, e
 		}
@@ -699,7 +699,7 @@ func (s *Service) PriceNative(model string, u usageparse.Usage) (money.Micro, mo
 	if !p && s.cfg.Pricing.UnknownPolicy == config.UnknownPolicyDeny {
 		return 0, 0, store.PricingCurrencyUSD, false, ErrUnknownPricing
 	}
-	usd, native, e := costForRule(r, u, u.ImageCount)
+	usd, native, e := s.costForRule(r, u, u.ImageCount)
 	cur := r.Currency
 	if cur == "" {
 		cur = store.PricingCurrencyUSD
@@ -717,20 +717,25 @@ func billableForRule(r store.PricingRule, u usageparse.Usage) usageparse.Billabl
 	return u.Billable()
 }
 
-// usdCost 把按规则币种计的成本折算成 micro-USD 账本口径。CNY 规则的
-// 价格四档以 micro-CNY 存储，按保存时锁定的 fx_rate_milli 折算（ceil），
-// 不随行情漂移；USD 规则原样返回。
-func usdCost(native money.Micro, r store.PricingRule) (money.Micro, error) {
-	if r.Currency != store.PricingCurrencyCNY || r.RateMilli <= 0 || r.RateMilli == 1000 {
+// usdCost 把按规则币种计的成本折算成 micro-USD 账本口径。CNY 规则的价格
+// 四档以 micro-CNY 存储，按**当前实时汇率**折算（ceil）——美元与人民币
+// 分开入账（原生金额恒人民币），美元等值仅是跨币种聚合与额度扣减的
+// 换算口径，随行情浮动；USD 规则原样返回。
+func (s *Service) usdCost(native money.Micro, r store.PricingRule) (money.Micro, error) {
+	if r.Currency != store.PricingCurrencyCNY {
 		return native, nil
 	}
 	if native <= 0 {
 		return 0, nil
 	}
-	if uint64(native) > uint64(math.MaxInt64)/1000 {
+	rate := s.ExchangeRate(context.Background()).USDToCNY
+	if rate <= 0 {
+		rate = fx.FallbackRate
+	}
+	if uint64(native) > uint64(math.MaxInt64)/uint64(fx.MicroScale) {
 		return 0, money.ErrOverflow
 	}
-	q := (uint64(native)*1000 + uint64(r.RateMilli) - 1) / uint64(r.RateMilli)
+	q := (uint64(native)*uint64(fx.MicroScale) + uint64(rate) - 1) / uint64(rate)
 	if q > uint64(math.MaxInt64) {
 		return 0, money.ErrOverflow
 	}
@@ -738,9 +743,9 @@ func usdCost(native money.Micro, r store.PricingRule) (money.Micro, error) {
 }
 
 // costForRule 返回 (美元等值, 原生币种金额, error)。CNY 规则的价格四档以
-// micro-CNY 计算，原生金额即 micro-CNY 合计；美元等值按保存时锁定的
-// fx_rate_milli 整笔折算（ceil），供额度扣减与跨币种聚合使用。
-func costForRule(r store.PricingRule, u usageparse.Usage, images int64) (money.Micro, money.Micro, error) {
+// micro-CNY 计算，原生金额即 micro-CNY 合计；美元等值按当前实时汇率
+// 整笔折算（ceil），供额度扣减与跨币种聚合使用（随行情浮动）。
+func (s *Service) costForRule(r store.PricingRule, u usageparse.Usage, images int64) (money.Micro, money.Micro, error) {
 	switch r.BillingMode {
 	case store.BillingModeFree:
 		return 0, 0, nil
@@ -749,7 +754,7 @@ func costForRule(r store.PricingRule, u usageparse.Usage, images int64) (money.M
 		if err != nil {
 			return 0, 0, err
 		}
-		usd, err := usdCost(v, r)
+		usd, err := s.usdCost(v, r)
 		return usd, v, err
 	}
 	b := billableForRule(r, u)
@@ -768,8 +773,8 @@ func costForRule(r store.PricingRule, u usageparse.Usage, images int64) (money.M
 	if err != nil {
 		return 0, 0, err
 	}
-	// CNY 规则：各档先按 micro-CNY 向上取整相加，再按锁定汇率整笔折算成 USD。
-	usd, err := usdCost(total, r)
+	// CNY 规则：各档先按 micro-CNY 向上取整相加，再按当前实时汇率整笔折算成 USD。
+	usd, err := s.usdCost(total, r)
 	return usd, total, err
 }
 

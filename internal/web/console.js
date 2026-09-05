@@ -2185,7 +2185,7 @@ const REQ_COLS = [
     cell: x => '<td class="num">' + reqTokenCell(x) + '</td>',
   },
   { id: 'cost', label: '费用', sort: 'cost', num: true, cell: x => x.currency === 'CNY'
-      ? '<td class="num" title="人民币计价规则，按保存时锁定汇率折算 $' + fmtUSD(x.cost_micro_usd).slice(1) + '">' + fmtMoney(x.cost_native_micro, '¥') + '</td>'
+      ? '<td class="num" title="人民币计价规则，按当前实时汇率折算 $' + fmtUSD(x.cost_micro_usd).slice(1) + '">' + fmtMoney(x.cost_native_micro, '¥') + '</td>'
       : '<td class="num">' + fmtCur(x.cost_micro_usd) + '</td>' },
   {
     // 排序键指向 latency（总延迟）。旧版把「首字」表头标成 data-sort="latency"，
@@ -2618,9 +2618,9 @@ function renderPricing() {
     + '<th>来源</th><th class="w-act"></th>';
   const pages = Math.max(1, Math.ceil(items.length / PRICING_PAGE_SIZE));
   const rows = items.slice(pricingPage * PRICING_PAGE_SIZE, (pricingPage + 1) * PRICING_PAGE_SIZE);
-  // 价格列带币种单位：CNY 行 ¥、USD 行 $；CNY 悬浮给出锁定的美元等值折算率。
+  // 价格列带币种单位：CNY 行 ¥、USD 行 $；CNY 悬浮给出当前实时汇率（美元等值按它折算）。
   const priceCell = (p, v) => p.currency === 'CNY'
-    ? '<td class="num" title="按 1 USD = ' + ((p.fx_rate_milli || 0) / 1000) + ' CNY 折算美元等值">' + fmtMoney(v, '¥') + '</td>'
+    ? '<td class="num" title="按 1 USD = ' + curFxText() + ' CNY 折算美元等值（实时汇率）">' + fmtMoney(v, '¥') + '</td>'
     : '<td class="num">' + fmtPrice(v) + '</td>';
   $('pricing-rows').innerHTML = rows.map(p => '<tr>'
     + '<td class="num cell-mono">' + p.priority + '</td>'
@@ -2631,7 +2631,7 @@ function renderPricing() {
     + priceCell(p, p.price_output)
     + priceCell(p, p.price_cache_read)
     + priceCell(p, p.price_cache_creation)
-    + '<td class="cell-dim">' + (p.currency === 'CNY' ? '<span class="pill trace" title="按 1 USD = ' + ((p.fx_rate_milli || 0) / 1000) + ' CNY 折算美元等值">CNY</span> ' : '')
+    + '<td class="cell-dim">' + (p.currency === 'CNY' ? '<span class="pill trace" title="按 1 USD = ' + curFxText() + ' CNY 折算美元等值（实时汇率）">CNY</span> ' : '')
     + esc(p.source === 'models_dev' ? 'models.dev' : '手动') + '</td>'
     + '<td class="w-act"><button type="button" class="btn small" data-edit="' + p.id + '">编辑</button>'
     + '<button type="button" class="btn small danger" data-id="' + p.id + '">删除</button></td></tr>').join('')
@@ -2659,14 +2659,14 @@ $('pricing-rows').addEventListener('click', e => {
 });
 // micro-USD/百万 token → 弹窗里的 $/M 数值文本。
 const priceInputVal = v => String((Number(v) || 0) / 1e6);
+// curFxText 当前实时汇率文本（S.fx 未就绪时显示 —）。
+function curFxText() { return S.fx && S.fx.usd_to_cny_micro ? (S.fx.usd_to_cny_micro / 1e6).toFixed(4) : '—'; }
 function pricingFormBody(p) {
   const sel = (kind, cur) => '<option value="' + kind + '"' + (kind === cur ? ' selected' : '') + '>' + kind + '</option>';
   const kindSel = p
     ? ['exact', 'glob', 'regexp'].map(k => sel(k, p.match_kind)).join('')
     : '<option value="exact">exact 完全匹配</option><option value="glob" selected>glob 通配</option><option value="regexp">regexp 正则</option>';
   const cur = p ? (p.currency || 'USD') : 'USD';
-  const rate = p && p.currency === 'CNY' ? String((p.fx_rate_milli || 0) / 1000)
-    : (S.fx && S.fx.usd_to_cny_micro ? String(S.fx.usd_to_cny_micro / 1e6) : '');
   // 只保留真正参与计算的四档：推理并入输出、cached 并入缓存读，独立档位无处可用。
   return '<div class="form-grid">'
     + fieldRow(labelWithTip('匹配方式', TIPS.matchKind), '<select id="p-kind">' + kindSel + '</select>')
@@ -2674,10 +2674,8 @@ function pricingFormBody(p) {
     + fieldRow('模式', '<input id="p-pattern" value="' + (p ? esc(p.pattern) : '') + '" placeholder="如 gpt-* 或 claude-sonnet-4" spellcheck="false">')
     + fieldRow('状态', '<select id="p-enabled"><option value="true"' + (!p || p.enabled ? ' selected' : '') + '>启用</option>'
       + '<option value="false"' + (p && !p.enabled ? ' selected' : '') + '>停用</option></select>')
-    + fieldRow('计价币种', '<select id="p-cur"><option value="USD"' + (cur === 'USD' ? ' selected' : '') + '>USD 美元</option>'
+    + fieldRow(labelWithTip('计价币种', '人民币规则价格与原生入账恒为 CNY，按原值记账；美元等值仅是额度扣减与跨币种聚合的换算口径，按当前实时汇率折算（后台每 30 分钟自动刷新，不随规则保存锁定）。'), '<select id="p-cur"><option value="USD"' + (cur === 'USD' ? ' selected' : '') + '>USD 美元</option>'
       + '<option value="CNY"' + (cur === 'CNY' ? ' selected' : '') + '>CNY 人民币</option></select>')
-    + fieldRow(labelWithTip('锁定汇率', '人民币规则按原值入账；此汇率只用于把价格折算成美元等值，供额度扣减与跨币种聚合（额度上限恒为美元口径）。保存后锁定不随行情变化，改价或换汇率需重存本规则；留空用当前汇率。'),
-      '<input id="p-rate" inputmode="decimal" value="' + esc(rate) + '" placeholder="留空用当前汇率">')
     + '<div class="form-sep wide">单价（每百万 token）</div>'
     + fieldRow(labelWithTip('输入', TIPS.input), '<input id="p-in" inputmode="decimal" value="' + (p ? priceInputVal(p.price_input) : '') + '" placeholder="0">')
     + fieldRow(labelWithTip('输出', TIPS.output), '<input id="p-out" inputmode="decimal" value="' + (p ? priceInputVal(p.price_output) : '') + '" placeholder="0">')
@@ -2688,14 +2686,12 @@ function pricingFormBody(p) {
 function pricingSubmit() {
   const num = id => Math.round((parseFloat($(id).value) || 0) * 1e6);
   const cur = $('p-cur').value;
-  const rate = parseFloat($('p-rate').value);
   return {
     match_kind: $('p-kind').value,
     pattern: $('p-pattern').value.trim() || '*',
     priority: parseInt($('p-priority').value, 10) || 0,
     enabled: $('p-enabled').value === 'true',
     currency: cur,
-    fx_rate_milli: cur === 'CNY' && isFinite(rate) && rate > 0 ? Math.round(rate * 1000) : 0,
     price_input: num('p-in'), price_output: num('p-out'),
     price_cache_read: num('p-cache-read'), price_cache_creation: num('p-cache-create'),
     accounting_mode: 'default', billing_mode: 'token', per_image_micro_usd: 0,
@@ -2706,7 +2702,7 @@ $('pricing-add').addEventListener('click', () => {
   openSheet({
     title: '新增计价规则', okText: '保存',
     body: pricingFormBody(null),
-    note: '单价为每百万 Token 金额，币种可选美元或人民币；人民币按原值入账，美元等值按锁定汇率折算（额度扣减恒按美元）。同匹配方式同模式重复添加将覆盖原规则。',
+    note: '单价为每百万 Token 金额，币种可选美元或人民币；人民币按原值入账，美元等值按当前实时汇率折算（额度扣减恒按美元）。同匹配方式同模式重复添加将覆盖原规则。',
     onOk: async () => {
       await post('/pricing', pricingSubmit());
       toast('规则已保存', 'ok');
@@ -3754,7 +3750,7 @@ $('pricing-calc').addEventListener('click', () => {
         Number($('pc-cr').value) || 0, Number($('pc-cw').value) || 0);
       const num = Number(micro);
       let text = p.currency === 'CNY'
-        ? '费用：' + fmtMoney(num, '¥') + '（人民币规则；美元等值按保存时锁定汇率折算）'
+        ? '费用：' + fmtMoney(num, '¥') + '（人民币规则；美元等值按当前实时汇率折算）'
         : '费用：$' + (num / 1e6).toFixed(4);
       $('pc-result').textContent = text;
       return false; // 保持弹窗打开，便于反复调参对比

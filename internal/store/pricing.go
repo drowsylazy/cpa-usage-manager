@@ -11,7 +11,7 @@ import (
 	"github.com/drowsylazy/cpa-usage-manager/internal/money"
 )
 
-// 计价币种取值。CNY 规则的价格以 micro-CNY 存储并按锁定汇率折算入账。
+// 计价币种取值。CNY 规则的价格以 micro-CNY 存储，原生按原值入账。
 const (
 	PricingCurrencyUSD = "USD"
 	PricingCurrencyCNY = "CNY"
@@ -25,27 +25,22 @@ const pricingColumns = `id, match_kind, pattern, priority, enabled,
 	currency, fx_rate_milli,
 	source, models_dev_id, created_at, updated_at`
 
-// normalizeCurrency 归一币种与锁定汇率：空值回 USD；CNY 必须带合理汇率。
+// normalizeCurrency 归一币种：空值回 USD。fx_rate_milli 是 v0.7.2「保存时
+// 锁定汇率」的遗留列——2026-09 起美元等值改按当前实时汇率折算（svc 层
+// ExchangeRate），该列不再参与任何计算，仅在读写时保留以兼容旧库；新存
+// 规则恒写 1000（中性值）。
 func normalizeCurrency(r *PricingRule) error {
 	if r.Currency == "" {
 		r.Currency = PricingCurrencyUSD
 	}
 	r.Currency = strings.ToUpper(strings.TrimSpace(r.Currency))
-	if r.RateMilli <= 0 {
-		r.RateMilli = 1000
-	}
+	r.RateMilli = 1000
 	switch r.Currency {
-	case PricingCurrencyUSD:
-		r.RateMilli = 1000
-	case PricingCurrencyCNY:
-		// 合理区间 0.5..50 CNY/USD，防手滑录入把折算放大成天文数字。
-		if r.RateMilli < 500 || r.RateMilli > 50_000 {
-			return fmt.Errorf("fx_rate_milli 须为汇率×1000（500..50000，如 7160 = 7.16），得到 %d", r.RateMilli)
-		}
+	case PricingCurrencyUSD, PricingCurrencyCNY:
+		return nil
 	default:
 		return fmt.Errorf("currency 须为 USD 或 CNY，得到 %q", r.Currency)
 	}
-	return nil
 }
 
 // scanPricingRule 从一行结果扫描 PricingRule。

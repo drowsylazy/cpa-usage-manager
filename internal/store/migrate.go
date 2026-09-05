@@ -410,7 +410,8 @@ var migrations = []migration{
 		stmts: []string{
 			// ---- 计价规则币种 ----
 			// 部分国内 API 以人民币计价：价格四档以规则币种的 micro 单位存储，
-			// 结算时按保存时锁定的汇率折算成 micro-USD 入账（账本恒为 USD）。
+			// 结算时原生按原值入账；美元等值按当前实时汇率折算（v0.7.2 曾按
+			// 保存时锁定的 fx_rate_milli 折算，2026-09 起该列废弃为兼容列）。
 			`ALTER TABLE pricing_rules ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'`,
 			`ALTER TABLE pricing_rules ADD COLUMN fx_rate_milli INTEGER NOT NULL DEFAULT 1000`,
 		},
@@ -421,7 +422,7 @@ var migrations = []migration{
 		stmts: []string{
 			// ---- 逐请求费用原生币种入账 ----
 			// requests 行保留计价规则币种的原生金额（CNY 规则即 micro-CNY）；
-			// cost_micro_usd 仍是按锁定汇率折算的美元等值，供额度扣减与
+			// cost_micro_usd 仍是按当前汇率折算的美元等值，供额度扣减与
 			// 跨币种聚合使用。历史行均为 USD 口径，缺省列即可。
 			`ALTER TABLE requests ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'`,
 			`ALTER TABLE requests ADD COLUMN cost_native_micro INTEGER NOT NULL DEFAULT 0`,
