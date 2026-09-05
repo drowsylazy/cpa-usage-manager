@@ -313,10 +313,14 @@ func (s *Service) BuildReservePlanFromMeta(ctx context.Context, model string, me
 
 // ---------- 输出预占的历史校准 ----------
 
-// outputCalTTL / outputCalSamples 是输出 P95 校准的缓存窗口与样本量。
+// outputCalTTL / outputCalSamples 是输出 P95 校准的缓存窗口与样本量；
+// densityCalTTL / densityCalSamples 是输入密度学习的同款参数。
 const (
 	outputCalTTL     = 60 * time.Second
 	outputCalSamples = 500
+
+	densityCalTTL     = 60 * time.Second
+	densityCalSamples = 200
 )
 
 // outputCalEntry 是 outCal 缓存桶：p95 为加权分位值，ok=false 表示
@@ -325,6 +329,15 @@ type outputCalEntry struct {
 	p95 int64
 	ok  bool
 	at  time.Time
+}
+
+// densityCalEntry 是 denCal 缓存桶：milliDensity 是该模型近期
+// body_len÷input_tokens 中位数 ×1000（7.3 字节/token 存 7300）；
+// ok=false 表示无有效样本，输入估算回退固定混合密度。
+type densityCalEntry struct {
+	milliDensity int64
+	ok           bool
+	at           time.Time
 }
 
 // calibratedOutput 输出预占的历史校准（service 级 60s 缓存，按模型分桶）。
@@ -443,10 +456,84 @@ func (s *Service) buildPlanFromMeta(ctx context.Context, model string, meta Requ
 	// min(max_tokens, p95) 的保守口径：P95 未知时取 max_tokens 的 1/8
 	// 与 defaultOutput 的较大者，既不再全额虚占，也覆盖首次请求。
 	out = s.calibratedOutput(model, out, s.cfg.Quota.Limits.DefaultOutputReserve)
+	// 输入预占密度学习：固定混合密度（ASCII/4+多字节/3）对 agent 长对话
+	// 上下文仍高估近一倍（实测 glm-5.3 密度 7.3 字节/token——token 表
+	// 内部频率加权后英文语料高于 4 字节/token 的直觉值）。该模型已有
+	// body_len÷input 样本时按中位数密度折算；无样本回退混合密度。
+	if in2 := s.calibratedInput(model, int64(meta.BodyLen), in, s.cfg.Quota.Limits.MaxTokenEstimate); in2 > 0 {
+		in = in2
+	}
 	plan.InputEstimate = in
 	plan.OutputEstimate = out
 	plan.TokenEstimate = in + out
 	return plan, nil
+}
+
+// calibratedInput 输入预占的密度学习：按该模型近期 body_len÷input_tokens
+// 的中位数把当前请求体折算成 token。fallback 是固定混合密度的估算值，
+// 无样本（新模型/历史行无 body_len）时原样返回；学习密度折算结果以
+// fallback ×1.5 封顶——防御异常样本（如上游谎报输入 token）把预占压得
+// 过低，宁可略高估也不让预占失去兜底意义。
+func (s *Service) calibratedInput(model string, bodyLen, fallback, maxEstimate int64) int64 {
+	if bodyLen <= 0 {
+		return fallback
+	}
+	milli, ok := s.densityMedianCached(model)
+	if !ok {
+		return fallback
+	}
+	// 毫密度折算：tokens = bodyLen ÷ (milli/1000) = bodyLen×1000/milli。
+	in := bodyLen * 1000 / milli
+	if in <= 0 {
+		in = 1
+	}
+	// 折算值须落在混合密度估算的 [0.5×, 1.5×] 带内：超出说明历史样本与
+	// 当前请求体的构成严重不符（如上游谎报输入 token、请求体突然换成
+	// base64 图片密集型），此时学习值不可信，回退固定估算兜底。
+	if lo, hi := fallback/2, fallback*3/2; hi >= fallback && (in < lo || in > hi) {
+		return fallback
+	}
+	if in > maxEstimate {
+		in = maxEstimate
+	}
+	return in
+}
+
+// densityMedianCached 返回模型近期输入密度中位数（×1000 整数）与是否可用，
+// 60s 分桶缓存与输出校准同款。样本 <3 条视为不可用。
+func (s *Service) densityMedianCached(model string) (int64, bool) {
+	now := time.Now()
+	s.denCalMu.Lock()
+	if s.denCal != nil {
+		if e, ok := s.denCal[model]; ok && now.Sub(e.at) < densityCalTTL {
+			s.denCalMu.Unlock()
+			return e.milliDensity, e.ok
+		}
+	}
+	s.denCalMu.Unlock()
+	// 查询失败（库瞬时忙）时样本为空，按「样本不足」回退混合密度。
+	samples, _ := s.st.RecentDensities(context.Background(), model, densityCalSamples)
+	n := len(samples)
+	if n < 3 {
+		s.denCalMu.Lock()
+		if s.denCal == nil {
+			s.denCal = make(map[string]densityCalEntry)
+		}
+		s.denCal[model] = densityCalEntry{ok: false, at: now}
+		s.denCalMu.Unlock()
+		return 0, false
+	}
+	med := samples[n/2]
+	if n%2 == 0 {
+		med = (samples[n/2-1] + samples[n/2]) / 2
+	}
+	s.denCalMu.Lock()
+	if s.denCal == nil {
+		s.denCal = make(map[string]densityCalEntry)
+	}
+	s.denCal[model] = densityCalEntry{milliDensity: med, ok: true, at: now}
+	s.denCalMu.Unlock()
+	return med, true
 }
 
 func bearerToken(headers http.Header) string {

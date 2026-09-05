@@ -55,3 +55,44 @@ func TestRecentOutputTokens(t *testing.T) {
 		t.Fatalf("limit=2 应取最近两条升序: %v", limited)
 	}
 }
+
+// TestRecentDensities 锁输入密度学习的样本查询：只取该模型成功、
+// body_len>0 且 input_tokens>0 的行，body_len<1024 的短体噪声剔除，
+// 返回毫密度（body_len÷input×1000）升序。
+func TestRecentDensities(t *testing.T) {
+	s := openTestStore(t, filepath.Join(t.TempDir(), "cpa.db"), "recent-density")
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Hour)
+
+	mk := func(id, model, result string, bodyLen, inTok int64, at time.Time) Request {
+		return Request{ID: id, TS: at, Model: model, Result: result,
+			BodyLen: bodyLen, InputTokens: inTok, TotalTokens: inTok}
+	}
+	rows := []Request{
+		mk("d-1", "m", ResultOK, 730_000, 100_000, base.Add(1*time.Minute)),      // 7300
+		mk("d-2", "m", ResultOK, 400_000, 50_000, base.Add(2*time.Minute)),       // 8000
+		mk("d-err", "m", ResultError, 700_000, 100_000, base.Add(3*time.Minute)), // 失败行剔除
+		mk("d-nolen", "m", ResultOK, 0, 90_000, base.Add(4*time.Minute)),         // 无 body_len 剔除
+		mk("d-noin", "m", ResultOK, 500_000, 0, base.Add(5*time.Minute)),         // 无输入 token 剔除
+		mk("d-short", "m", ResultOK, 512, 80, base.Add(6*time.Minute)),           // 短体噪声剔除
+		mk("d-3", "m", ResultOK, 210_000, 30_000, base.Add(7*time.Minute)),       // 7000
+	}
+	for _, r := range rows {
+		if err := s.RecordPassiveUsage(ctx, r, PassiveDedupeHint{Models: []string{r.Model}, Near: r.TS}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.RecentDensities(ctx, "m", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("应只返回 3 条有效密度样本，得到 %d: %v", len(got), got)
+	}
+	for i, want := range []int64{7000, 7300, 8000} {
+		if got[i] != want {
+			t.Fatalf("密度样本[%d] = %d want %d（应升序）", i, got[i], want)
+		}
+	}
+}

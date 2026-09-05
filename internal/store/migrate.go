@@ -8,7 +8,7 @@ import (
 
 // SchemaVersion 是本代码期望的数据库 schema 版本。
 // 打开库时若发现库版本更高，说明是被更新版插件写过的库，拒绝降级使用。
-const SchemaVersion = 16
+const SchemaVersion = 17
 
 // migration 是一次版本化迁移。
 type migration struct {
@@ -477,6 +477,19 @@ var migrations = []migration{
 			// 500 行、进程内计算分位数，不落库不加表，这个索引让 WHERE
 			// model=? AND result='ok' 不必回表过滤失败行。
 			`CREATE INDEX idx_requests_model_result_ts ON requests(model, result, ts DESC)`,
+		},
+	},
+	{
+		version: 17,
+		name:    "request_body_len",
+		stmts: []string{
+			// ---- 输入预占的密度学习数据源 ----
+			// 固定密度假设（ASCII/4 + 多字节/3）对 agent 长对话上下文仍高估
+			// 近一倍（实测 glm-5.3 密度 7.3 字节/token：token 内部出现频率
+			// 加权后英文语料高于 4 字节）。记录每个请求的 body_len，预占时
+			// 用该模型近期 body_len ÷ 实际输入 token 的中位数学习真实密度。
+			// 0 = 未知（历史行与未携带的路径）。
+			`ALTER TABLE requests ADD COLUMN body_len INTEGER NOT NULL DEFAULT 0`,
 		},
 	},
 }

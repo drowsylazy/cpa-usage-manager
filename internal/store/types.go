@@ -278,7 +278,7 @@ type Reservation struct {
 	ReservedTokens  int64       `json:"reserved_tokens"`
 	// SettledTokens 是结算时的真实计费 token（schema v15 起落库；
 	// 历史已结算行与 released 行为 0）。
-	SettledTokens   int64       `json:"settled_tokens"`
+	SettledTokens int64 `json:"settled_tokens"`
 
 	CreatedAt   time.Time  `json:"created_at"`
 	ExpiresAt   time.Time  `json:"expires_at"`
@@ -352,6 +352,10 @@ type Request struct {
 	// ErrorNote 是失败原因摘要（截断至 errorNoteMaxLen，写入前经凭据清洗；
 	// 路由中间尝试以 "目标→目标" 轨迹形式追加）。空串表示无异常。
 	ErrorNote string `json:"error_note,omitempty"`
+	// BodyLen 是原始请求体字节数（schema v17；0=未记录，历史行与部分
+	// 被动路径）。与 input_tokens 一起构成输入密度学习的样本对：
+	// body_len ÷ input_tokens = 该请求的真实字节/token 密度。
+	BodyLen int64 `json:"body_len,omitempty"`
 }
 
 // AuditEvent 是一条审计事件。

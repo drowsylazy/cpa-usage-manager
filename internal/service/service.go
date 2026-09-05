@@ -192,6 +192,11 @@ type Service struct {
 	// 调用方回退保守口径。
 	outCalMu sync.Mutex
 	outCal   map[string]outputCalEntry
+	// denCal* 是输入密度学习（body_len÷input_tokens 中位数 ×1000）的
+	// 60s 分桶缓存，与 outCal 同款；ok=false 表示无有效样本，输入估算
+	// 回退固定混合密度。
+	denCalMu sync.Mutex
+	denCal   map[string]densityCalEntry
 	// notifyCfg* 是告警设置的 60s TTL 缓存：结算热路径每次都要比对单请求
 	// 异常阈值，不能逐请求读 preferences；SaveNotifySettings 时失效。
 	notifyCfgMu  sync.Mutex

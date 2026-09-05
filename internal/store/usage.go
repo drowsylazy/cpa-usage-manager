@@ -56,8 +56,8 @@ func insertRequestTx(ctx context.Context, s *Store, tx *sql.Tx, r Request) error
 			cache_read_tokens, cache_creation_tokens, total_tokens,
 			latency_ms, ttft_ms, generation_ms, tps_milli,
 			thinking_intensity, cost_micro_usd, currency, cost_native_micro, priced, reservation_id,
-			status_code, error_note
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			status_code, error_note, body_len
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING`,
 		r.ID, r.TS.UTC().UnixMilli(), r.KeyID, r.CallerID, r.Model, r.Provider, r.Source, r.UpstreamModel,
 		r.AuthID, r.AuthLabel, r.AuthType, r.Tier, r.Result,
@@ -65,7 +65,7 @@ func insertRequestTx(ctx context.Context, s *Store, tx *sql.Tx, r Request) error
 		r.CacheReadTokens, r.CacheCreationTokens, r.TotalTokens,
 		r.LatencyMS, r.TTFTMS, r.GenerationMS, r.TPSMilli,
 		r.ThinkingIntensity, int64(r.CostMicroUSD), nativeCurrency(r), int64(r.CostNativeMicro), boolInt(r.Priced), r.ReservationID,
-		r.StatusCode, r.ErrorNote)
+		r.StatusCode, r.ErrorNote, r.BodyLen)
 	if err != nil {
 		return fmt.Errorf("写入请求记录 %s 失败: %w", r.ID, err)
 	}
@@ -748,7 +748,7 @@ const requestColumns = `id, ts, key_id, caller_id, model, provider, source, upst
 	cache_read_tokens, cache_creation_tokens, total_tokens,
 	latency_ms, ttft_ms, generation_ms, tps_milli,
 	thinking_intensity, cost_micro_usd, currency, cost_native_micro, priced, reservation_id,
-	status_code, error_note`
+	status_code, error_note, body_len`
 
 // RequestColumns 是 requests 表完整列清单的包外只读副本：服务层的请求
 // 明细查询必须引用它而不是手抄列清单——v12 曾因副本漏列导致明细接口
@@ -842,7 +842,7 @@ func scanRequest(sc interface{ Scan(...any) error }) (Request, error) {
 		&r.CacheReadTokens, &r.CacheCreationTokens, &r.TotalTokens,
 		&r.LatencyMS, &r.TTFTMS, &r.GenerationMS, &r.TPSMilli,
 		&r.ThinkingIntensity, &cost, &r.Currency, &costNative, &priced, &r.ReservationID,
-		&r.StatusCode, &r.ErrorNote,
+		&r.StatusCode, &r.ErrorNote, &r.BodyLen,
 	)
 	if err != nil {
 		return Request{}, err

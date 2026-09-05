@@ -565,6 +565,43 @@ func (s *Store) RecentOutputTokens(ctx context.Context, model string, limit int)
 	return out, nil
 }
 
+// RecentDensities 返回某模型近期请求的输入密度样本（body_len ÷ 输入 token，
+// 放大为 ×1000 的整数避免浮点），供输入预占学习真实字节/token 密度。
+// 只取执行器路径且宿主/上游报告了输入 token 的成功行（body_len>0 且
+// input_tokens>0）；被动路径不带 body_len，零输入行密度无意义，都被排除。
+func (s *Store) RecentDensities(ctx context.Context, model string, limit int) ([]int64, error) {
+	if limit <= 0 || limit > 2000 {
+		limit = 200
+	}
+	out := make([]int64, 0, 64)
+	err := s.Read(ctx, func(q Querier) error {
+		rows, err := q.QueryContext(ctx,
+			`SELECT body_len, input_tokens FROM requests
+			 WHERE model = ? AND result = ? AND body_len > 0 AND input_tokens > 0
+			 ORDER BY ts DESC LIMIT ?`, model, ResultOK, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var bodyLen, inTok int64
+			if err := rows.Scan(&bodyLen, &inTok); err != nil {
+				return err
+			}
+			if bodyLen < 1024 {
+				continue // 极短请求体的密度噪声大（包装 JSON 占比过高），不进样本
+			}
+			out = append(out, bodyLen*1000/inTok)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
 // RecentReservation 是最近已完结预占的回顾行（GET /reservations/recent）：
 // 预占估算 vs 实际结算的对照，用于实时页「最近预占」面板。
 type RecentReservation struct {

@@ -12,12 +12,36 @@ import (
 // outputs[i%len]，时间递增（越靠后越新）。
 func seedOutputHistory(t *testing.T, st *store.Store, model string, outputs []int64) {
 	t.Helper()
+	seedRows(t, st, model, outputs, nil)
+}
+
+// seedDensityHistory 为模型插入带 body_len 的成功行：inputs[i] 是
+// body_len 与 input_tokens 构成的样本对。
+func seedDensityHistory(t *testing.T, st *store.Store, model string, pairs [][2]int64) {
+	t.Helper()
+	seedRows(t, st, model, nil, pairs)
+}
+
+// seedRows 落一批成功请求行：outputs 非空时按输出样本写入（body_len=0），
+// pairs 非空时按 (body_len, input_tokens) 样本写入（输出 0）。
+func seedRows(t *testing.T, st *store.Store, model string, outputs []int64, pairs [][2]int64) {
+	t.Helper()
 	ctx := context.Background()
-	base := time.Now().UTC().Add(-time.Duration(len(outputs)+1) * time.Minute)
+	n := len(outputs) + len(pairs)
+	base := time.Now().UTC().Add(-time.Duration(n+1) * time.Minute)
 	for i, o := range outputs {
 		r := store.Request{
-			ID: model + "-hist-" + time.Duration(i).String(), TS: base.Add(time.Duration(i) * time.Minute),
+			ID: model + "-out-" + time.Duration(i).String(), TS: base.Add(time.Duration(i) * time.Minute),
 			Model: model, Result: store.ResultOK, OutputTokens: o, TotalTokens: o,
+		}
+		if err := st.RecordPassiveUsage(ctx, r, store.PassiveDedupeHint{Models: []string{model}, Near: r.TS}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, p := range pairs {
+		r := store.Request{
+			ID: model + "-den-" + time.Duration(i).String(), TS: base.Add(time.Duration(i) * time.Minute),
+			Model: model, Result: store.ResultOK, InputTokens: p[1], BodyLen: p[0], TotalTokens: p[1],
 		}
 		if err := st.RecordPassiveUsage(ctx, r, store.PassiveDedupeHint{Models: []string{model}, Near: r.TS}); err != nil {
 			t.Fatal(err)
@@ -123,5 +147,73 @@ func TestOutputP95(t *testing.T) {
 	tailed[99] = 50000
 	if p, _ := outputP95(tailed); p > 2000 {
 		t.Fatalf("P95 不应被单点长尾拉飞: %d", p)
+	}
+}
+
+// TestCalibratedInput 锁输入密度学习三路径：
+//  1. 有 (body_len, input) 样本 → 按中位数密度折算，显著低于混合密度估算；
+//  2. 无样本（新模型）→ 回退混合密度估算值；
+//  3. 学习密度折算异常偏低（上游谎报 token）→ 以混合密度 ×1.5 封底。
+func TestCalibratedInput(t *testing.T) {
+	s, st := testService(t)
+
+	// 路径 2：无历史，回退混合密度估算（100KB ASCII → 25000）。
+	fallback := estimateInputTokens(make([]byte, 100_000)) // 全 ASCII
+	if got := s.calibratedInput("fresh-model", 100_000, fallback, 1_000_000); got != fallback {
+		t.Fatalf("无样本应回退混合密度: got %d want %d", got, fallback)
+	}
+
+	// 路径 1：10 条样本，密度 7000–7600 毫密度（7–7.6 字节/token），
+	// 中位数约 7300 → 100KB 体折算约 13698 token，远低于 /4 的 25000。
+	pairs := make([][2]int64, 10)
+	for i := range pairs {
+		density := int64(7000 + i*67) // 7000..7603 毫密度
+		pairs[i] = [2]int64{400_000, 400_000 * 1000 / density}
+	}
+	seedDensityHistory(t, st, "dense-model", pairs)
+	got := s.calibratedInput("dense-model", 100_000, fallback, 1_000_000)
+	if got < 13_000 || got > 14_500 {
+		t.Fatalf("密度学习折算异常: got %d want 13000..14500", got)
+	}
+
+	// 路径 3：上游只报 1/10 输入 token（密度样本 40000 毫密度），
+	// 折算 2500 会被 ×1.5 封底拉回 fallback 附近（不低于 fallback）。
+	liar := make([][2]int64, 5)
+	for i := range liar {
+		liar[i] = [2]int64{40_000, 1_000}
+	}
+	seedDensityHistory(t, st, "liar-model", liar)
+	liarFallback := estimateInputTokens(make([]byte, 100_000))
+	if got := s.calibratedInput("liar-model", 100_000, liarFallback, 1_000_000); got < liarFallback {
+		t.Fatalf("异常低密度应被 ×1.5 封底（不低于混合密度估算）: got %d fallback %d", got, liarFallback)
+	}
+}
+
+// TestBuildReservePlanDensityCalibration 端到端：密度样本存在时
+// BuildReservePlan 的输入估算按学习密度走，而不是混合密度。
+func TestBuildReservePlanDensityCalibration(t *testing.T) {
+	s, st := testService(t)
+	ctx := context.Background()
+	tieredPricingRule(t, s, "dense-test")
+
+	// 密度 7300 毫密度（glm-5.3 实测口径）。
+	pairs := make([][2]int64, 8)
+	for i := range pairs {
+		pairs[i] = [2]int64{730_000, 100_000}
+	}
+	seedDensityHistory(t, st, "dense-test", pairs)
+
+	body := make([]byte, 730_000) // 全 ASCII：混合密度会估 182500
+	for i := range body {
+		body[i] = 'a'
+	}
+	body[0] = '{'
+	body[len(body)-1] = '}'
+	plan, err := s.BuildReservePlan(ctx, "dense-test", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.InputEstimate < 95_000 || plan.InputEstimate > 115_000 {
+		t.Fatalf("输入估算应按学习密度（约 100K）而非混合密度（182K）: %d", plan.InputEstimate)
 	}
 }

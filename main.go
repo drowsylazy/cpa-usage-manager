@@ -1281,11 +1281,13 @@ func buildRequest(svc *service.Service, reservation store.Reservation, req rpcEx
 		AuthType:          req.AuthType,
 		Tier:              meta.ResolvedTier,
 		ThinkingIntensity: meta.ResolvedThinking,
-		LatencyMS:         millisBetween(startedAt, completedAt),
-		TTFTMS:            millisBetween(startedAt, firstChunkAt),
-		GenerationMS:      millisBetween(firstChunkAt, completedAt),
-		CostMicroUSD:      0,
-		Priced:            true,
+		// body_len 落库供输入密度学习（body_len ÷ input_tokens 的样本对）。
+		BodyLen:     int64(meta.BodyLen),
+		LatencyMS:   millisBetween(startedAt, completedAt),
+		TTFTMS:      millisBetween(startedAt, firstChunkAt),
+		GenerationMS: millisBetween(firstChunkAt, completedAt),
+		CostMicroUSD: 0,
+		Priced:       true,
 	}
 	if status >= http.StatusBadRequest {
 		r.Result = store.ResultError
@@ -2290,6 +2292,8 @@ func usageRecordToRequest(st *store.Store, u rpcUsageRecord) store.Request {
 		TotalTokens:         u.Detail.TotalTokens,
 		LatencyMS:           u.Latency.Milliseconds(),
 		TTFTMS:              u.TTFT.Milliseconds(),
+		// 被动路径拿不到请求体，body_len 保持 0（密度学习的样本只来自
+		// 执行器路径，被动行不进样本查询）。
 	}
 	if req.TS.IsZero() {
 		req.TS = time.Now().UTC()
