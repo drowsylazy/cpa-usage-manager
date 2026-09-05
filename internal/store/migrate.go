@@ -8,7 +8,7 @@ import (
 
 // SchemaVersion 是本代码期望的数据库 schema 版本。
 // 打开库时若发现库版本更高，说明是被更新版插件写过的库，拒绝降级使用。
-const SchemaVersion = 14
+const SchemaVersion = 15
 
 // migration 是一次版本化迁移。
 type migration struct {
@@ -452,6 +452,18 @@ var migrations = []migration{
 			`ALTER TABLE requests ADD COLUMN status_code INTEGER NOT NULL DEFAULT 0`,
 			`ALTER TABLE requests ADD COLUMN error_note TEXT NOT NULL DEFAULT ''`,
 			`CREATE INDEX idx_requests_status_ts ON requests(status_code, ts DESC)`,
+		},
+	},
+	{
+		version: 15,
+		name:    "reservation_settled_tokens",
+		stmts: []string{
+			// ---- 预占行的真实 token 落库 ----
+			// 结算时的 billableTokens 此前只进 plugin_keys 累计器，预占行上
+			// 只剩估算值 reserved_tokens，「最近预占」面板因此只能对照金额。
+			// 补存结算 token，估算 vs 实际的 token 对照不再依赖金额折算。
+			// 历史已结算行为 0（无从回填），面板按 "-" 展示。
+			`ALTER TABLE reservations ADD COLUMN settled_tokens INTEGER NOT NULL DEFAULT 0`,
 		},
 	},
 }

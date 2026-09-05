@@ -397,6 +397,7 @@ table.data th{
   text-align:left;white-space:nowrap;
 }
 table.data th.num{text-align:right}
+table.data th.ctr,table.data td.ctr{text-align:center}
 table.data th.sort{cursor:pointer;user-select:none}
 table.data th.sort:hover{color:var(--fg)}
 table.data th.sort[data-dir]::after{content:"↓";margin-left:4px;color:var(--signal)}

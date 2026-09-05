@@ -3232,9 +3232,9 @@ $('held-auto').addEventListener('change', () => {
 });
 $('held-refresh').addEventListener('click', () => { loadHeld().catch(() => {}); });
 
-// loadRecent 拉取并渲染「最近预占」：最近 25 条已完结请求的估算 vs 实结对照。
-// released = 未走到结算即释放（上游错误/无响应/超时清扫），实结为 0 属预期；
-// 偏差列按 实结/预占 的百分比展示，>100% 说明预占低估（结算超扣了预占）。
+// loadRecent 拉取并渲染「最近预占」：最近 25 条已完结请求的 预估 vs 实际 token 对照。
+// released = 未走到结算即释放（上游错误/无响应/超时清扫），实际消耗无从谈起；
+// 实际占比 = 实际消耗 ÷ 预估 token，70%–130% 视为估算健康区间（双向往返）。
 async function loadRecent() {
   const rows = $('recent-rows'), note = $('recent-note'), sub = $('recent-sub');
   let items;
@@ -3250,38 +3250,40 @@ async function loadRecent() {
   const released = items.length - settled.length;
   sub.textContent = items.length
     ? '最近 ' + items.length + ' 条已完结：' + settled.length + ' 条已结算 · ' + released + ' 条未结算即释放'
-    : '最近 25 条已完结请求的预占估算与实际结算对照：预占覆盖实际消耗即健康，偏差过大说明估算口径需要调整';
+    : '最近 25 条已完结请求的预估与实际消耗 token 对照：实际占比落在 70%–130% 之间即估算健康';
   rows.innerHTML = items.map(x => {
     const label = keyLabelOf(x.key_id);
-    let state, dev;
+    let state, ratio;
     if (x.status === 'settled') {
       state = '<span class="pill">已结算</span>';
-      if (x.held_micro_usd > 0) {
-        const pct = Math.round(x.settled_micro_usd / x.held_micro_usd * 100);
-        // 预占是保守上限：实结占比越低越健康；超 100% 说明估算低于真实消耗。
-        const cls = pct > 100 ? 'pill alarm' : pct > 80 ? 'pill warn' : 'pill live';
-        dev = '<span class="' + cls + '" title="实结 ' + fmtCur(x.settled_micro_usd) + ' / 预占 ' + fmtCur(x.held_micro_usd) + '">' + pct + '%</span>';
+      if (x.reserved_tokens > 0 && x.settled_tokens > 0) {
+        const pct = Math.round(x.settled_tokens / x.reserved_tokens * 100);
+        // 健康区间 70%–130%：双向都算正常（预估略高或略低都无碍）；
+        // 偏离区间才示警——偏低黄（预估虚高，长期占用额度）、偏高红
+        // （预估不足，真实消耗超出预估、结算超扣）。
+        const cls = pct >= 70 && pct <= 130 ? 'pill live' : pct > 130 ? 'pill alarm' : 'pill warn';
+        ratio = '<span class="' + cls + '" title="实际 ' + fmtTok(x.settled_tokens) + ' / 预估 ' + fmtTok(x.reserved_tokens) + '">' + pct + '%</span>';
       } else {
-        dev = '<span class="pill">—</span>';
+        ratio = '<span class="pill" title="预估或实际 token 为 0（含 v15 之前的历史行）">—</span>';
       }
     } else {
       state = '<span class="pill warn" title="未走到结算即释放：上游错误、无响应或超时清扫，未产生扣费">已释放</span>';
-      dev = '<span class="pill" title="预占已全额退回，未扣费">退回</span>';
+      ratio = '<span class="pill" title="预占已全额退回，未扣费">退回</span>';
     }
     return '<tr>'
       + '<td class="cell-mono" title="' + esc(x.finished_at || '') + '">' + (x.finished_at ? rel(x.finished_at) : '-') + '</td>'
-      + '<td class="cell-mono cell-clip" title="' + esc(label ? label + ' · ' + x.key_id : x.key_id || '') + '">'
+      + '<td class="cell-mono cell-clip" style="max-width:180px" title="' + esc(label ? label + ' · ' + x.key_id : x.key_id || '') + '">'
       + esc(label || x.key_id || '-') + '</td>'
-      + '<td class="cell-mono cell-clip" title="' + esc(x.model || '') + '">' + esc(x.model || '-') + '</td>'
+      + '<td class="cell-mono cell-clip" style="max-width:220px" title="' + esc(x.model || '') + '">' + esc(x.model || '-') + '</td>'
       + '<td>' + state + '</td>'
-      + '<td class="num">' + fmtCur(x.held_micro_usd || 0) + '</td>'
-      + '<td class="num">' + (x.status === 'settled' ? fmtCur(x.settled_micro_usd || 0) : '—') + '</td>'
-      + '<td>' + dev + '</td>'
+      + '<td class="num">' + fmtTok(x.reserved_tokens || 0) + '</td>'
+      + '<td class="num">' + (x.status === 'settled' && x.settled_tokens > 0 ? fmtTok(x.settled_tokens) : '—') + '</td>'
+      + '<td class="ctr">' + ratio + '</td>'
       + '<td class="num" title="' + esc(x.created_at || '') + ' 创建">' + (x.age_ms > 0 ? fmtDur(Math.round(x.age_ms / 1000)) : '-') + '</td>'
       + '</tr>';
   }).join('');
   note.textContent = items.length
-    ? '偏差 = 实际结算 ÷ 预占估算。预占是保守上限，占比越低越健康；超过 100% 说明估算低于真实消耗。'
+    ? '实际占比 = 实际消耗 ÷ 预估 Token。70%–130% 为健康区间（双向）；低于区间说明预估虚高，高于区间说明预估不足。'
     : '暂无已完结的预占记录（随保留期清理）。';
 }
 $('held-refresh').addEventListener('click', () => { loadRecent().catch(() => {}); });

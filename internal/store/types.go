@@ -276,6 +276,9 @@ type Reservation struct {
 	HeldMicroUSD    money.Micro `json:"held_micro_usd"`
 	SettledMicroUSD money.Micro `json:"settled_micro_usd"`
 	ReservedTokens  int64       `json:"reserved_tokens"`
+	// SettledTokens 是结算时的真实计费 token（schema v15 起落库；
+	// 历史已结算行与 released 行为 0）。
+	SettledTokens   int64       `json:"settled_tokens"`
 
 	CreatedAt   time.Time  `json:"created_at"`
 	ExpiresAt   time.Time  `json:"expires_at"`

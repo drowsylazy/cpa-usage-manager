@@ -54,7 +54,7 @@ func (s *Store) HoldReservation(ctx context.Context, p HoldReservationParams) (R
 			}
 		}
 		if p.IdempotencyKey != "" {
-			row := tx.QueryRowContext(ctx, `SELECT id,key_id,caller_id,model,idempotency_key,status,held_micro_usd,settled_micro_usd,reserved_tokens,created_at,expires_at,heartbeat_at,settled_at,released_at FROM reservations WHERE idempotency_key = ?`, p.IdempotencyKey)
+			row := tx.QueryRowContext(ctx, `SELECT id,key_id,caller_id,model,idempotency_key,status,held_micro_usd,settled_micro_usd,reserved_tokens,settled_tokens,created_at,expires_at,heartbeat_at,settled_at,released_at FROM reservations WHERE idempotency_key = ?`, p.IdempotencyKey)
 			r, err := scanReservation(row)
 			if err == nil {
 				if r.KeyID != p.KeyID {
@@ -256,12 +256,14 @@ func nullIfEmpty(s string) any {
 func scanReservation(sc interface{ Scan(...any) error }) (Reservation, error) {
 	var r Reservation
 	var created, expires, heartbeat int64
+	var settledTokens int64
 	var settled, released *int64
 	var idem sql.NullString
-	if err := sc.Scan(&r.ID, &r.KeyID, &r.CallerID, &r.Model, &idem, &r.Status, &r.HeldMicroUSD, &r.SettledMicroUSD, &r.ReservedTokens, &created, &expires, &heartbeat, &settled, &released); err != nil {
+	if err := sc.Scan(&r.ID, &r.KeyID, &r.CallerID, &r.Model, &idem, &r.Status, &r.HeldMicroUSD, &r.SettledMicroUSD, &r.ReservedTokens, &settledTokens, &created, &expires, &heartbeat, &settled, &released); err != nil {
 		return Reservation{}, err
 	}
 	r.IdempotencyKey = idem.String
+	r.SettledTokens = settledTokens
 	r.CreatedAt = time.UnixMilli(created).UTC()
 	r.ExpiresAt = time.UnixMilli(expires).UTC()
 	r.HeartbeatAt = time.UnixMilli(heartbeat).UTC()
@@ -274,7 +276,7 @@ func (s *Store) GetReservation(ctx context.Context, id string) (Reservation, err
 	var r Reservation
 	err := s.Read(ctx, func(q Querier) error {
 		var e error
-		r, e = scanReservation(q.QueryRowContext(ctx, `SELECT id,key_id,caller_id,model,idempotency_key,status,held_micro_usd,settled_micro_usd,reserved_tokens,created_at,expires_at,heartbeat_at,settled_at,released_at FROM reservations WHERE id = ?`, id))
+		r, e = scanReservation(q.QueryRowContext(ctx, `SELECT id,key_id,caller_id,model,idempotency_key,status,held_micro_usd,settled_micro_usd,reserved_tokens,settled_tokens,created_at,expires_at,heartbeat_at,settled_at,released_at FROM reservations WHERE id = ?`, id))
 		return e
 	})
 	if errors.Is(err, sql.ErrNoRows) {
@@ -301,7 +303,7 @@ func (s *Store) SettleReservation(ctx context.Context, id string, cost money.Mic
 	}
 	var out Reservation
 	err := s.Write(ctx, func(tx *sql.Tx) error {
-		row := tx.QueryRowContext(ctx, `SELECT id,key_id,caller_id,model,idempotency_key,status,held_micro_usd,settled_micro_usd,reserved_tokens,created_at,expires_at,heartbeat_at,settled_at,released_at FROM reservations WHERE id = ?`, id)
+		row := tx.QueryRowContext(ctx, `SELECT id,key_id,caller_id,model,idempotency_key,status,held_micro_usd,settled_micro_usd,reserved_tokens,settled_tokens,created_at,expires_at,heartbeat_at,settled_at,released_at FROM reservations WHERE id = ?`, id)
 		r, err := scanReservation(row)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: reservation %q", ErrNotFound, id)
@@ -313,7 +315,7 @@ func (s *Store) SettleReservation(ctx context.Context, id string, cost money.Mic
 			out = r
 			return nil
 		}
-		if _, err = s.execHotTx(ctx, tx, `UPDATE reservations SET status='settled',settled_micro_usd=?,settled_at=?,heartbeat_at=? WHERE id=? AND status='held'`, int64(cost), now.UTC().UnixMilli(), now.UTC().UnixMilli(), id); err != nil {
+		if _, err = s.execHotTx(ctx, tx, `UPDATE reservations SET status='settled',settled_micro_usd=?,settled_tokens=?,settled_at=?,heartbeat_at=? WHERE id=? AND status='held'`, int64(cost), billableTokens, now.UTC().UnixMilli(), now.UTC().UnixMilli(), id); err != nil {
 			return err
 		}
 		cy := CyclesFor(now)
@@ -394,7 +396,7 @@ func (s *Store) ReleaseReservation(ctx context.Context, id string, now time.Time
 	}
 	var out Reservation
 	err := s.Write(ctx, func(tx *sql.Tx) error {
-		row := tx.QueryRowContext(ctx, `SELECT id,key_id,caller_id,model,idempotency_key,status,held_micro_usd,settled_micro_usd,reserved_tokens,created_at,expires_at,heartbeat_at,settled_at,released_at FROM reservations WHERE id=?`, id)
+		row := tx.QueryRowContext(ctx, `SELECT id,key_id,caller_id,model,idempotency_key,status,held_micro_usd,settled_micro_usd,reserved_tokens,settled_tokens,created_at,expires_at,heartbeat_at,settled_at,released_at FROM reservations WHERE id=?`, id)
 		r, err := scanReservation(row)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: reservation %q", ErrNotFound, id)
@@ -527,16 +529,18 @@ type HeldReservation struct {
 // RecentReservation 是最近已完结预占的回顾行（GET /reservations/recent）：
 // 预占估算 vs 实际结算的对照，用于实时页「最近预占」面板。
 type RecentReservation struct {
-	ID               string      `json:"id"`
-	KeyID            string      `json:"key_id"`
-	Model            string      `json:"model"`
-	Status           string      `json:"status"` // settled | released
-	HeldMicroUSD     money.Micro `json:"held_micro_usd"`
-	SettledMicroUSD  money.Micro `json:"settled_micro_usd"`
-	ReservedTokens   int64       `json:"reserved_tokens"`
-	CreatedAt        time.Time   `json:"created_at"`
-	FinishedAt       time.Time   `json:"finished_at"`
-	AgeMS            int64       `json:"age_ms"` // 预占创建到完结的全程耗时
+	ID              string      `json:"id"`
+	KeyID           string      `json:"key_id"`
+	Model           string      `json:"model"`
+	Status          string      `json:"status"` // settled | released
+	HeldMicroUSD    money.Micro `json:"held_micro_usd"`
+	SettledMicroUSD money.Micro `json:"settled_micro_usd"`
+	ReservedTokens  int64       `json:"reserved_tokens"`
+	// SettledTokens 是结算时的真实计费 token；released 与历史行为 0。
+	SettledTokens   int64       `json:"settled_tokens"`
+	CreatedAt       time.Time   `json:"created_at"`
+	FinishedAt      time.Time   `json:"finished_at"`
+	AgeMS           int64       `json:"age_ms"` // 预占创建到完结的全程耗时
 }
 
 // ListRecentReservations 返回最近 limit 条已完结（settled/released）预占，
@@ -552,7 +556,7 @@ func (s *Store) ListRecentReservations(ctx context.Context, limit int) ([]Recent
 	out := make([]RecentReservation, 0)
 	err := s.Read(ctx, func(q Querier) error {
 		rows, err := q.QueryContext(ctx,
-			`SELECT id, key_id, model, status, held_micro_usd, settled_micro_usd, reserved_tokens,
+			`SELECT id, key_id, model, status, held_micro_usd, settled_micro_usd, reserved_tokens, settled_tokens,
 			        created_at, COALESCE(settled_at, released_at)
 			 FROM reservations
 			 WHERE status IN ('settled','released')
@@ -565,7 +569,7 @@ func (s *Store) ListRecentReservations(ctx context.Context, limit int) ([]Recent
 			var r RecentReservation
 			var held, settled, created, finished int64 // 时间列存 UnixMilli 整数，与 scanReservation 同口径
 			if err := rows.Scan(&r.ID, &r.KeyID, &r.Model, &r.Status, &held, &settled,
-				&r.ReservedTokens, &created, &finished); err != nil {
+				&r.ReservedTokens, &r.SettledTokens, &created, &finished); err != nil {
 				return err
 			}
 			r.HeldMicroUSD = money.Micro(held)

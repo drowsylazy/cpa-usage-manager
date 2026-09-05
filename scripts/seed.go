@@ -387,20 +387,21 @@ func main() {
 	}
 
 	// ── 最近预占回顾：给「最近预占」面板供数据 ────────────────────
-	// 6 条已完结（4 settled 含高中低偏差 + 2 released），按完结时刻倒序插入。
+	// 6 条已完结（4 settled 覆盖占比健康/虚高/不足三档 + 2 released），
+	// settled 的 tokens 是实际消耗（估算的 40%–145% 不等），按完结时刻倒序。
 	for i, fin := range []struct {
 		id, model                              string
 		held, paid                             money.Micro
-		tokens                                 int64
+		tokens, actual                         int64
 		ok                                     bool
 		ago                                    time.Duration
 	}{
-		{"seed-rec-1", "agentrouter/glm-5.3", 2_460_000, 138_469, 588_000, true, 90 * time.Second},
-		{"seed-rec-2", "agentrouter/glm-5.3", 2_460_000, 5_947, 587_900, true, 4 * time.Minute},
-		{"seed-rec-3", "deepseek-v4-flash-0731", 4_200, 482, 21_300, true, 9 * time.Minute},
-		{"seed-rec-4", "claude-opus-4.5", 5_800_000, 6_120_000, 720_000, true, 21 * time.Minute},
-		{"seed-rec-5", "agentrouter/glm-5.3", 7_054_968, 0, 588_000, false, 33 * time.Minute},
-		{"seed-rec-6", "gpt-5.2", 1_200, 0, 132_000, false, 47 * time.Minute},
+		{"seed-rec-1", "agentrouter/glm-5.3", 2_460_000, 138_469, 588_000, 225_400, true, 90 * time.Second},
+		{"seed-rec-2", "agentrouter/glm-5.3", 2_460_000, 5_947, 587_900, 512_600, true, 4 * time.Minute},
+		{"seed-rec-3", "deepseek-v4-flash-0731", 4_200, 482, 21_300, 21_050, true, 9 * time.Minute},
+		{"seed-rec-4", "claude-opus-4.5", 5_800_000, 6_120_000, 720_000, 1_044_000, true, 21 * time.Minute},
+		{"seed-rec-5", "agentrouter/glm-5.3", 7_054_968, 0, 588_000, 0, false, 33 * time.Minute},
+		{"seed-rec-6", "gpt-5.2", 1_200, 0, 132_000, 0, false, 47 * time.Minute},
 	} {
 		kid := live[i%len(live)].kid
 		created := heldNow.Add(-fin.ago - time.Duration(4+3*i)*time.Second)
@@ -415,7 +416,7 @@ func main() {
 		}
 		done := heldNow.Add(-fin.ago)
 		if fin.ok {
-			if _, err := st.SettleReservation(ctx, p.ID, fin.paid, fin.tokens/3, done, nil); err != nil {
+			if _, err := st.SettleReservation(ctx, p.ID, fin.paid, fin.actual, done, nil); err != nil {
 				log.Printf("结算 %s 失败（忽略）：%v", p.ID, err)
 			}
 		} else if _, err := st.ReleaseReservation(ctx, p.ID, done); err != nil {

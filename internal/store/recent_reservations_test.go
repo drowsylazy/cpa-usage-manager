@@ -62,10 +62,10 @@ func TestListRecentReservations(t *testing.T) {
 		t.Fatalf("完结时刻倒序错误: %s, %s", got[0].ID, got[1].ID)
 	}
 	rel, set := got[0], got[1]
-	if rel.Status != "released" || rel.SettledMicroUSD != 0 || rel.HeldMicroUSD != 900 {
+	if rel.Status != "released" || rel.SettledMicroUSD != 0 || rel.HeldMicroUSD != 900 || rel.SettledTokens != 0 {
 		t.Fatalf("released 行字段异常: %+v", rel)
 	}
-	if set.Status != "settled" || set.SettledMicroUSD != 120 || set.HeldMicroUSD != 700 || set.ReservedTokens != 300 {
+	if set.Status != "settled" || set.SettledMicroUSD != 120 || set.HeldMicroUSD != 700 || set.ReservedTokens != 300 || set.SettledTokens != 260 {
 		t.Fatalf("settled 行字段异常: %+v", set)
 	}
 	if set.AgeMS != int64(time.Minute/time.Millisecond) {
