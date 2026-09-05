@@ -347,6 +347,45 @@ func main() {
 		}
 	}
 
+	// ── 模型集合：给「目标健康」面板供数据 ────────────────────────
+	for _, rt := range []store.ModelRoute{
+		{Alias: "smart", Rule: "when hour >= 22 || hour < 6 -> priority [\"claude-haiku-4\", \"gpt-5-mini\"]\n-> \"deepseek-v4-flash\"", CooldownSeconds: 60, PricingMode: "target", Enabled: true},
+		{Alias: "cheap", Rule: "-> \"deepseek-v4-flash\"", CooldownSeconds: 30, PricingMode: "target", Enabled: true},
+		{Alias: "draft-off", Rule: "-> \"claude-haiku-4\"", CooldownSeconds: 60, PricingMode: "target", Enabled: false},
+	} {
+		if _, err := st.InsertModelRoute(ctx, rt); err != nil {
+			log.Printf("插入模型集合 %s 失败（忽略）：%v", rt.Alias, err)
+		}
+	}
+
+	// ── 在途预占：给「进行中请求」面板供数据 ──────────────────────
+	// 两条活跃（心跳新鲜）+ 一条心跳超时（stale 清扫候选）。
+	heldNow := time.Now().UTC()
+	for i, hk := range live {
+		if i >= 2 {
+			break
+		}
+		p := store.HoldReservationParams{
+			ID: fmt.Sprintf("seed-held-live-%d", i), KeyID: hk.kid, CallerID: store.DefaultCallerID,
+			Model: models[i%len(models)].name, HeldMicroUSD: money.Micro(1500 + 900*i), ReservedTokens: int64(2400 + 1300*i),
+			ExpiresAt: heldNow.Add(2 * time.Hour), Now: heldNow,
+		}
+		if _, _, err := st.HoldReservation(ctx, p); err != nil {
+			log.Printf("预占 %s 失败（忽略）：%v", p.ID, err)
+		}
+	}
+	if len(live) > 2 {
+		old := heldNow.Add(-3 * time.Hour)
+		p := store.HoldReservationParams{
+			ID: "seed-held-stale", KeyID: live[2].kid, CallerID: store.DefaultCallerID,
+			Model: "claude-sonnet-4", HeldMicroUSD: 3_200, ReservedTokens: 5100,
+			ExpiresAt: old.Add(2 * time.Hour), Now: old,
+		}
+		if _, _, err := st.HoldReservation(ctx, p); err != nil {
+			log.Printf("预占 %s 失败（忽略）：%v", p.ID, err)
+		}
+	}
+
 	fmt.Printf("已注入：%d 枚密钥 · %d 条计价规则 · %d 条请求（含 %d 条失败）· 合计 $%.2f\n",
 		len(live), rules, inserted, failures, float64(costTotal)/1e6)
 	fmt.Printf("模型 %d 个 · 时间跨度 30 天（第 %d 天留空以测零值缺口）\n", len(models), gapDay)

@@ -94,6 +94,7 @@
     <button role="tab" id="tab-usage" class="tab" data-tab="usage">用量</button>
     <button role="tab" id="tab-pricing" class="tab" data-tab="pricing">价格</button>
     <button role="tab" id="tab-routes" class="tab" data-tab="routes">模型集合</button>
+    <button role="tab" id="tab-live" class="tab" data-tab="live">实时</button>
     <button role="tab" id="tab-system" class="tab" data-tab="system">系统<span class="tab-dot alarm" data-badge="system" hidden></span></button>
     <span class="tabs-meta mono" id="stamp"></span>
   </nav>
@@ -286,38 +287,47 @@
     <div class="panel-head"><div><h2 class="panel-title">目标健康</h2><p class="panel-sub">启用集合的全部目标：进程内冷却状态与最近 60 分钟失败统计；回答「路由为什么绕开了某个目标」</p></div>
       <div class="panel-tools"><button type="button" class="btn" id="rh-refresh">刷新</button></div>
     </div>
-    <div class="panel-body">
-      <div class="table-wrap fixed5">
-        <table class="tbl">
-          <thead><tr><th>集合</th><th>目标</th><th>状态</th><th class="num">近 60 分钟</th><th class="num">失败</th></tr></thead>
-          <tbody id="rh-rows"></tbody>
-        </table>
-      </div>
-      <p class="note" id="rh-note">暂无启用中的集合。</p>
+    <div class="table-wrap">
+      <table class="data" id="rh-table">
+        <thead><tr>
+          <th class="w-grow">集合</th><th class="w-grow">目标</th><th>状态</th><th class="num">近 60 分钟</th><th class="num">失败</th>
+        </tr></thead>
+        <tbody id="rh-rows"></tbody>
+      </table>
     </div>
+    <p class="note" id="rh-note" style="padding:10px 16px 0"></p>
+  </article>
+</section>
+
+<!-- ── 实时 ─────────────────────────────────────────────────────── -->
+<section class="view" id="view-live" role="tabpanel" aria-labelledby="tab-live" hidden>
+  <article class="panel">
+    <div class="panel-head">
+      <div><h2 class="panel-title">进行中请求</h2><p class="panel-sub" id="held-count">在途额度预占的实时视图：请求结算或心跳超时后被清扫后离开列表</p></div>
+      <div class="panel-tools">
+        <label class="check-row"><input type="checkbox" id="held-auto"> 5s 自动刷新</label>
+        <button type="button" class="btn" id="held-refresh">
+          <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v4h-4"/></svg>
+          <span>刷新</span>
+        </button>
+      </div>
+    </div>
+    <div class="table-wrap tall">
+      <table class="data" id="held-table">
+        <thead><tr>
+          <th>密钥</th><th>模型</th><th class="num">预占金额</th><th class="num">预占 Token</th>
+          <th class="num">已耗时</th><th class="num">最近心跳</th><th>状态</th>
+        </tr></thead>
+        <tbody id="held-rows"></tbody>
+      </table>
+    </div>
+    <p class="note" id="held-note"></p>
   </article>
 </section>
 
 <!-- ── 系统 ─────────────────────────────────────────────────────── -->
 <section class="view" id="view-system" role="tabpanel" aria-labelledby="tab-system" hidden>
   <div class="readouts" id="sys-readouts"></div>
-
-  <article class="panel">
-    <div class="panel-head"><div><h2 class="panel-title">进行中请求</h2><p class="panel-sub">在途预占的实时视图；心跳超时的行已标记，等待 stale 清扫或维护动作回收</p></div>
-      <div class="panel-tools"><button type="button" class="btn" id="held-refresh">刷新</button></div>
-    </div>
-    <div class="panel-body">
-      <div class="table-wrap fixed5">
-        <table class="tbl">
-          <thead><tr>
-            <th>密钥</th><th>模型</th><th class="num">预占金额</th><th class="num">预占 Token</th><th class="num">已耗时</th><th>状态</th>
-          </tr></thead>
-          <tbody id="held-rows"></tbody>
-        </table>
-      </div>
-      <p class="note" id="held-note">在途为空。</p>
-    </div>
-  </article>
 
   <div class="split even">
     <article class="panel">

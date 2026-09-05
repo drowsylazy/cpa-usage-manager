@@ -148,3 +148,51 @@ func seedKeyForQuota(t *testing.T, s *Store) string {
 	}
 	return kid
 }
+
+// 时间列以 UnixMilli 整数落库；ListHeldReservations 曾直接扫 *time.Time 触发
+// "unsupported Scan, storing driver.Value type int64 into type *time.Time"，
+// 面板「进行中请求」整面板 500。此测试钉住整数扫描口径。
+func TestListHeldReservationsScansMillisTimestamps(t *testing.T) {
+	s := openTestStore(t, filepath.Join(t.TempDir(), "cpa.db"), "held-list")
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	kid := seedKeyForQuota(t, s)
+
+	if _, _, err := s.HoldReservation(ctx, HoldReservationParams{
+		ID: "held-1", KeyID: kid, Model: "m", HeldMicroUSD: 2_500, ReservedTokens: 42,
+		ExpiresAt: now.Add(2 * time.Hour), Now: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 一条已结算行：不应出现在 held 视图里。
+	if _, err := s.SettleReservation(ctx, "held-1", 2_500, 42, now.Add(time.Minute), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.HoldReservation(ctx, HoldReservationParams{
+		ID: "held-2", KeyID: kid, Model: "m2", HeldMicroUSD: 1_000, ReservedTokens: 7,
+		ExpiresAt: now.Add(2 * time.Hour), Now: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := s.ListHeldReservations(ctx, now.Add(-2*time.Hour), now.Add(time.Minute), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("held 行数 = %d, 期望 1（仅未结算行）", len(items))
+	}
+	h := items[0]
+	if h.ID != "held-2" || h.Model != "m2" || h.ReservedTokens != 7 || h.HeldMicroUSD != 1_000 {
+		t.Fatalf("行内容不符: %+v", h)
+	}
+	if !h.CreatedAt.Equal(now) {
+		t.Fatalf("created_at 应为 %v, 得到 %v", now, h.CreatedAt)
+	}
+	if h.AgeSec != 60 {
+		t.Fatalf("age_sec = %d, 期望 60", h.AgeSec)
+	}
+	if h.StaleMark {
+		t.Fatal("心跳新鲜的行不应标记 stale")
+	}
+}

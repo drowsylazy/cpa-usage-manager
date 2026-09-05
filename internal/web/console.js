@@ -1448,9 +1448,13 @@ const keysView = {
   balanceSeq: 0,    // 余额异步响应的竞态守卫：快速切换抽屉对象时丢弃晚到的旧响应
 };
 // keyLabelOf 由 kid 查密钥标签；无标签或缓存未热时返回空串，由调用方决定回落值。
+// keysView.cache 只有当前分页页，先查跨页候选缓存 keyCandidates（/keys/candidates 全量口径）。
+let keyCandidates = [];
 function keyLabelOf(kid) {
-  const k = keysView.cache.find(x => x.kid === kid);
-  return k && k.label ? k.label : '';
+  const inPage = keysView.cache.find(x => x.kid === kid);
+  if (inPage) return inPage.label || '';
+  const c = keyCandidates.find(x => x.kid === kid);
+  return c && c.label ? c.label : '';
 }
 
 loaders.keys = async () => { await refreshKeys(); };
@@ -2846,29 +2850,34 @@ loaders.routes = async () => {
   stamp();
 };
 // loadRoutesHealth 渲染「目标健康」面板：冷却状态 + 近 60 分钟失败统计。
+// 排序：冷却中的目标排最前（最值得关注），其次按失败数降序，最后按请求量降序。
 async function loadRoutesHealth() {
   const rows = $('rh-rows'), note = $('rh-note');
+  let items;
   try {
     const r = await api('/model-routes/health');
-    const items = r.items || [];
-    rows.innerHTML = items.map(h =>
-      '<tr><td class="cell-mono cell-clip" title="' + esc(h.alias) + '">' + esc(h.alias || '-') + '</td>'
-      + '<td class="cell-mono cell-clip" title="' + esc(h.target) + '">' + esc(h.target) + '</td>'
-      + '<td>' + (h.cooling
-        ? '<span class="pill warn" title="冷却剩余 ' + h.cooldown_remaining_sec + ' 秒">冷却 ' + fmtDur(h.cooldown_remaining_sec) + '</span>'
-        : '<span class="pill live">可用</span>')
-      + '</td>'
-      + '<td class="num">' + fmtInt(h.total_60m || 0) + '</td>'
-      + '<td class="num">' + (h.fail_60m > 0
-        ? '<span class="pill alarm">' + fmtInt(h.fail_60m) + '</span>'
-        : '<span class="cell-dim">0</span>')
-      + '</td></tr>').join('');
-    note.textContent = items.length
-      ? '冷却是进程内启发式：重启丢失、多实例各自独立；失败目标恢复成功后立即回到可用池。'
-      : '暂无启用中的集合。';
+    items = (r.items || []).slice().sort((a, b) =>
+      (b.cooling - a.cooling) || ((b.fail_60m || 0) - (a.fail_60m || 0)) || ((b.total_60m || 0) - (a.total_60m || 0)));
   } catch (e) {
+    rows.innerHTML = '';
     note.textContent = '加载失败：' + e.message;
+    return;
   }
+  rows.innerHTML = items.map(h =>
+    '<tr><td class="cell-mono cell-clip" title="' + esc(h.alias) + '">' + esc(h.alias || '-') + '</td>'
+    + '<td class="cell-mono cell-clip" title="' + esc(h.target) + '">' + esc(h.target) + '</td>'
+    + '<td>' + (h.cooling
+      ? '<span class="pill warn" title="冷却剩余 ' + h.cooldown_remaining_sec + ' 秒">冷却 ' + fmtDur(h.cooldown_remaining_sec) + '</span>'
+      : '<span class="pill live">可用</span>')
+    + '</td>'
+    + '<td class="num">' + fmtInt(h.total_60m || 0) + '</td>'
+    + '<td class="num">' + (h.fail_60m > 0
+      ? '<span class="pill alarm">' + fmtInt(h.fail_60m) + '</span>'
+      : '<span class="cell-dim">0</span>')
+    + '</td></tr>').join('');
+  note.textContent = items.length
+    ? '冷却是进程内启发式：重启丢失、多实例各自独立；失败目标恢复成功后立即回到可用池。'
+    : '暂无启用中的集合，或启用集合的规则未引用任何目标。';
 }
 $('rh-refresh').addEventListener('click', () => { loadRoutesHealth().catch(() => {}); });
 function renderRouteJudgeState() {
@@ -3157,36 +3166,74 @@ loaders.system = async () => {
   $('db-note').textContent = s.writable
     ? '备份为单文件 SQLite 快照；恢复前服务端会做一致性检查。'
     : '当前实例处于只读模式（可能存在跨进程写者），备份可用，恢复不可用。';
-  await loadHeld();
   await loadNotify();
   await loadReports();
   updateBadges();
   stamp();
 };
-// loadHeld 拉取并渲染在途预占（进行中请求）面板。
+// ---------- 实时（进行中请求） ----------
+// loadHeld 拉取并渲染「进行中请求」：在途额度预占的实时视图。
+// 刷新按钮旁的 5s 自动刷新为该页专属（不走顶栏的全局自动刷新，那个间隔可到 86400s，
+// 对实时视图太迟钝），页面隐藏或切走页签时暂停。
 async function loadHeld() {
   const rows = $('held-rows'), note = $('held-note');
+  let items;
   try {
     const r = await api('/reservations/held');
-    const items = r.items || [];
-    rows.innerHTML = items.map(h =>
-      '<tr><td class="cell-mono" title="' + esc(h.key_id || '') + '">' + esc(keyLabelOf(h.key_id) || h.key_id || '-') + '</td>'
+    items = r.items || [];
+  } catch (e) {
+    rows.innerHTML = '';
+    $('held-count').textContent = '在途额度预占的实时视图：请求结算或心跳超时后被清扫后离开列表';
+    note.textContent = '加载失败：' + e.message;
+    return;
+  }
+  const staleN = items.filter(h => h.stale).length;
+  $('held-count').textContent = items.length
+    ? '共 ' + items.length + ' 条在途' + (staleN ? ' · ' + staleN + ' 条心跳超时' : '')
+    : '在途额度预占的实时视图：请求结算或心跳超时后被清扫后离开列表';
+  rows.innerHTML = items.map(h => {
+    const label = keyLabelOf(h.key_id);
+    let state;
+    if (h.stale) state = '<span class="pill alarm">心跳超时</span>';
+    else if (h.age_sec > 300) state = '<span class="pill warn">超过 5 分钟</span>';
+    else state = '<span class="pill live">活跃</span>';
+    return '<tr>'
+      + '<td class="cell-mono cell-clip" title="' + esc(label ? label + ' · ' + h.key_id : h.key_id || '') + '">'
+      + esc(label || h.key_id || '-') + '</td>'
       + '<td class="cell-mono cell-clip" title="' + esc(h.model || '') + '">' + esc(h.model || '-') + '</td>'
       + '<td class="num">' + fmtCur(h.held_micro_usd || 0) + '</td>'
       + '<td class="num">' + fmtTok(h.reserved_tokens || 0) + '</td>'
       + '<td class="num">' + fmtDur(h.age_sec) + '</td>'
-      + '<td>' + (h.stale
-        ? '<span class="pill alarm">心跳超时</span>'
-        : (h.age_sec > 300 ? '<span class="pill warn">超过 5 分钟</span>' : '<span class="pill live">活跃</span>'))
-      + '</td></tr>').join('');
-    note.textContent = items.length
-      ? '共 ' + items.length + ' 条在途。心跳超时的行会在下一次维护动作或预占清扫时回收。'
-      : '在途为空。';
-  } catch (e) {
-    note.textContent = '加载失败：' + e.message;
-  }
+      + '<td class="num" title="' + esc(h.heartbeat_at || '') + '">' + (h.heartbeat_at ? rel(h.heartbeat_at) : '-') + '</td>'
+      + '<td>' + state + '</td></tr>';
+  }).join('');
+  note.textContent = items.length
+    ? '心跳超时的行会在下一次维护动作或预占清扫时回收。'
+    : '当前没有进行中的请求。';
 }
+// heldTimer 是本页 5s 轮询的定时器句柄；只有本页签可见且勾选自动刷新时才走。
+let heldTimer = null;
+function setupHeldAuto() {
+  if (heldTimer) { clearInterval(heldTimer); heldTimer = null; }
+  if (!$('held-auto').checked) return;
+  heldTimer = setInterval(() => {
+    if (document.hidden || $('app').hidden || activeTab !== 'live') return;
+    loadHeld().catch(() => {});
+  }, 5000);
+}
+$('held-auto').addEventListener('change', () => {
+  localStorage.setItem('held-auto', $('held-auto').checked ? '1' : '0');
+  setupHeldAuto();
+});
 $('held-refresh').addEventListener('click', () => { loadHeld().catch(() => {}); });
+loaders.live = async () => {
+  // 密钥标签走全量候选（keysView.cache 只有当前分页页）。
+  api('/keys/candidates')
+    .then(r => { keyCandidates = r.items || []; })
+    .catch(() => {});
+  await loadHeld();
+  stamp();
+};
 
 // fmtDur 把秒数渲染为可读时长。
 function fmtDur(sec) {
@@ -3717,6 +3764,8 @@ $('pricing-calc').addEventListener('click', () => {
 
 // ---------- 启动 ----------
 applyTheme();
+$('held-auto').checked = localStorage.getItem('held-auto') === '1';
+setupHeldAuto();
 if (key) showApp();
 else { $('gate').hidden = false; $('gate-key').focus(); }
 })();

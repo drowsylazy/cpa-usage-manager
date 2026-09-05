@@ -542,11 +542,13 @@ func (s *Store) ListHeldReservations(ctx context.Context, staleBefore time.Time,
 		defer rows.Close()
 		for rows.Next() {
 			var h HeldReservation
-			var held int64
-			if err := rows.Scan(&h.ID, &h.KeyID, &h.Model, &held, &h.ReservedTokens, &h.CreatedAt, &h.HeartbeatAt); err != nil {
+			var held, created, heartbeat int64 // 时间列存 UnixMilli 整数，与 scanReservation 同口径
+			if err := rows.Scan(&h.ID, &h.KeyID, &h.Model, &held, &h.ReservedTokens, &created, &heartbeat); err != nil {
 				return err
 			}
 			h.HeldMicroUSD = money.Micro(held)
+			h.CreatedAt = time.UnixMilli(created).UTC()
+			h.HeartbeatAt = time.UnixMilli(heartbeat).UTC()
 			h.AgeSec = int64(now.Sub(h.CreatedAt).Seconds())
 			h.StaleMark = !h.HeartbeatAt.After(staleBefore)
 			out = append(out, h)
