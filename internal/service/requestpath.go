@@ -164,7 +164,7 @@ func (s *Service) ResolveIdentity(ctx context.Context, headers http.Header, meta
 // （估算 token、提模型、提 tier、提 reasoning_effort）；长上下文/带图请求
 // 可达数 MB，这里改为入口一次类型化解析后全程复用。
 type RequestMeta struct {
-	// BodyLen 是原始请求体长度（输入 token 按 len/3+1 估算）。
+	// BodyLen 是原始请求体长度（输入 token 按混合密度估算，见 estimateInputTokens）。
 	BodyLen int
 
 	Model           string          `json:"model"`
@@ -180,6 +180,11 @@ type RequestMeta struct {
 	Tools             json.RawMessage `json:"tools"`
 	System            json.RawMessage `json:"system"`
 	SystemInstruction json.RawMessage `json:"systemInstruction"`
+
+	// InputEstimate 是 ParseRequestMeta 时按混合密度算好的输入 token 估算
+	// （ASCII/4 + 多字节/3）：tokenEstimates 与路由 env 的 input_tokens 都
+	// 用它，Meta 离开请求体作用域后不再重扫 body。
+	InputEstimate int64
 
 	HasTools  bool
 	HasSystem bool
@@ -206,18 +211,19 @@ type effortMeta struct {
 	Effort string `json:"effort"`
 }
 
-// ParseRequestMeta 对请求体做一次类型化解析。body 非 JSON 对象时返回零值
-// （与旧实现的 map 解析失败分支等价），BodyLen 始终保留。
+// ParseRequestMeta 对请求体做一次类型化解析。body 非 JSON 对象时除
+// BodyLen/InputEstimate 外返回零值（与旧实现的 map 解析失败分支等价）。
 func ParseRequestMeta(body []byte) RequestMeta {
-	m := RequestMeta{BodyLen: len(body)}
+	m := RequestMeta{BodyLen: len(body), InputEstimate: estimateInputTokens(body)}
 	if len(body) == 0 || json.Unmarshal(body, &m) != nil {
-		return RequestMeta{BodyLen: len(body)}
+		return RequestMeta{BodyLen: len(body), InputEstimate: estimateInputTokens(body)}
 	}
 	m.Model = strings.TrimSpace(m.Model)
 	m.ResolvedTier = FirstNonEmpty(m.ServiceTier, m.Tier)
 	m.ResolvedThinking = FirstNonEmpty(m.Reasoning.Effort, m.Thinking.Effort, m.ReasoningEffort)
 	m.HasTools = rawNonEmpty(m.Tools)
 	m.HasSystem = rawNonEmpty(m.System) || rawNonEmpty(m.SystemInstruction)
+	m.InputEstimate = estimateInputTokens(body)
 	return m
 }
 
@@ -229,15 +235,28 @@ func rawNonEmpty(raw json.RawMessage) bool {
 	return string(raw) != "null"
 }
 
-// tokenEstimates 按锁定决策估算输入/输出上限：输入 body 字节数/3+1，
-// 输出取 max_tokens / max_completion_tokens / max_output_tokens /
-// generationConfig.maxOutputTokens 中首个存在者（否则 defaultOutput），封顶 max。
-// 输入按字节/3：英文与代码实测约 4 字节/token（高估 ~33%），CJK 密集文本
-// 最密约 3 字节/token，base64 图片数据约 3 字节/token——/3 恰好覆盖最密
-// 场景，又比旧的 /2 少高估一档（旧口径曾把 220k token 的 agent 上下文
-// 预占到 46 万 token，配合「全按最贵档计价」把兜底金额放大 50 倍）。
+// estimateInputTokens 按混合密度估算输入 token：ASCII 字节 /4、多字节
+// 序列 /3（UTF-8 中文 3 字节、emoji 4 字节，多字节文本实测 2.5–3 字节/token）。
+// 此前的整包 /3 对英文/代码为主的 JSON 请求体高估约 60%（实测 626KB 体
+// /3 得 209K，真实输入 token 约 130K）。逐字节扫描成本 O(body)，与原先
+// 的整除同级。
+func estimateInputTokens(body []byte) int64 {
+	var ascii, multi int64
+	for _, b := range body {
+		if b < 0x80 {
+			ascii++
+		} else {
+			multi++
+		}
+	}
+	return ascii/4 + multi/3 + 1
+}
+
+// tokenEstimates 按锁定决策估算输入/输出上限：输入走 estimateInputTokens
+// （混合密度），输出取 max_tokens / max_completion_tokens / max_output_tokens /
+// generationConfig.maxOutputTokens 中首个存在者（否则 defaultOutput），均封顶 max。
 func (m RequestMeta) tokenEstimates(defaultOutput, max int64) (in, out int64) {
-	in = int64(m.BodyLen)/3 + 1
+	in = m.InputEstimate
 	if in > max {
 		in = max
 	}
@@ -271,10 +290,11 @@ func (m RequestMeta) imageCount() int64 {
 
 // BuildReservePlan 按模型计价规则与请求体估算预占额度。
 //
-// 锁定决策：预占使用保守上限（输入按 body 字节数/3+1，输出取 max_tokens 或
-// default_output_reserve，均封顶 max_token_estimate），金额按分档价计——
-// 输入估算按输入侧最贵档（输入/缓存读/缓存写），输出估算按输出价；
-// 不再把整段估算按四档最高价计（那是长上下文请求预占虚高的主因）。
+// 锁定决策：预占使用保守上限——输入按混合密度估算（ASCII/4 + 多字节/3），
+// 输出按该模型最近成功请求的输出 P95 校准（无历史时回退保守口径），
+// 均封顶 max_token_estimate；金额按分档价计：输入估算按输入侧最贵档
+// （输入/缓存读/缓存写），输出估算按输出价；不再把整段估算按四档最高价
+// 计（那是长上下文请求预占虚高的主因）。
 func (s *Service) BuildReservePlan(ctx context.Context, model string, body []byte) (ReservePlan, error) {
 	return s.buildPlanFromMeta(ctx, model, ParseRequestMeta(body), model)
 }
@@ -289,6 +309,112 @@ func (s *Service) BuildReservePlanWithPricing(ctx context.Context, model string,
 // 只解析一次请求体，这里不再重复 O(body) 扫描。
 func (s *Service) BuildReservePlanFromMeta(ctx context.Context, model string, meta RequestMeta, pricingModel string) (ReservePlan, error) {
 	return s.buildPlanFromMeta(ctx, model, meta, pricingModel)
+}
+
+// ---------- 输出预占的历史校准 ----------
+
+// outputCalTTL / outputCalSamples 是输出 P95 校准的缓存窗口与样本量。
+const (
+	outputCalTTL     = 60 * time.Second
+	outputCalSamples = 500
+)
+
+// outputCalEntry 是 outCal 缓存桶：p95 为加权分位值，ok=false 表示
+// 样本不足（<3 条成功请求），调用方应回退保守口径而非使用 p95=0。
+type outputCalEntry struct {
+	p95 int64
+	ok  bool
+	at  time.Time
+}
+
+// calibratedOutput 输出预占的历史校准（service 级 60s 缓存，按模型分桶）。
+// maxOut 是 tokenEstimates 的原口径（max_tokens 或 defaultOutputReserve）。
+// 有该模型的成功历史时取输出 P95（近端加权：新样本 1.5×，适应 agent 输出
+// 水平的变化），min(max_tokens, P95×1.25) 保底不越过客户端显式允许的上限；
+// 无历史（新模型/空库）回退 min(maxOut, max(defaultOutput, maxOut/8))——
+// agent 客户端的 max_tokens 普遍是拍脑袋的大数（ZCode 128000，实际输出
+// 几 K），1/8 已数倍于常见实际输出；defaultOutput 抬底保证无 max_tokens
+// 的普通请求不受影响。
+func (s *Service) calibratedOutput(model string, maxOut, defaultOutput int64) int64 {
+	p95, ok := s.outputP95Cached(model)
+	if !ok {
+		if maxOut <= defaultOutput {
+			return maxOut
+		}
+		fallback := maxOut / 8
+		if fallback < defaultOutput {
+			fallback = defaultOutput
+		}
+		if fallback > maxOut {
+			fallback = maxOut
+		}
+		return fallback
+	}
+	reserve := p95 + p95/4 // ×1.25 余量吸收输出长尾
+	if reserve < defaultOutput {
+		reserve = defaultOutput
+	}
+	if maxOut > 0 && reserve > maxOut {
+		reserve = maxOut
+	}
+	return reserve
+}
+
+// outputP95Cached 返回模型最近成功输出的 P95（近端加权）与是否可用。
+// 缓存 60s：校准查询走 (model,result,ts) 索引取 500 行，每次预占都查会把
+// 热路径的读放大一截；60s 内同一模型共享一份样本，结算路径写入新样本后
+// 自然在下个窗口生效。
+func (s *Service) outputP95Cached(model string) (int64, bool) {
+	now := time.Now()
+	s.outCalMu.Lock()
+	if s.outCal != nil {
+		if e, ok := s.outCal[model]; ok && now.Sub(e.at) < outputCalTTL {
+			s.outCalMu.Unlock()
+			return e.p95, e.ok
+		}
+	}
+	s.outCalMu.Unlock()
+	// 查询失败（库瞬时忙等）时样本为空，按「样本不足」回退保守口径，不阻断预占。
+	samples, _ := s.st.RecentOutputTokens(context.Background(), model, outputCalSamples)
+	p95, ok := outputP95(samples)
+	s.outCalMu.Lock()
+	if s.outCal == nil {
+		s.outCal = make(map[string]outputCalEntry)
+	}
+	s.outCal[model] = outputCalEntry{p95: p95, ok: ok, at: now}
+	s.outCalMu.Unlock()
+	return p95, ok
+}
+
+// outputP95 对升序样本取近端加权 P95：最新一半样本权重 1.5×（时间倒序
+// 取出后升序排列，数组后半段是较新样本）。样本 <3 条视为不可用——
+// 一两次请求说明不了输出水平，回退保守口径。
+func outputP95(samples []int64) (int64, bool) {
+	n := len(samples)
+	if n < 3 {
+		return 0, false
+	}
+	var total float64
+	for range samples {
+		total += 1.0
+	}
+	// 近端加权：后半段（较新）样本 1.5×。
+	for i := n / 2; i < n; i++ {
+		total += 0.5
+	}
+	target := total * 0.95
+	var acc float64
+	for i, v := range samples {
+		w := 1.0
+		if i >= n/2 {
+			w = 1.5
+		}
+		acc += w
+		if acc >= target {
+			return v, true
+		}
+	}
+	return samples[n-1], true
 }
 
 func (s *Service) buildPlanFromMeta(ctx context.Context, model string, meta RequestMeta, pricingModel string) (ReservePlan, error) {
@@ -310,6 +436,13 @@ func (s *Service) buildPlanFromMeta(ctx context.Context, model string, meta Requ
 		return plan, nil
 	}
 	in, out := meta.tokenEstimates(s.cfg.Quota.Limits.DefaultOutputReserve, s.cfg.Quota.Limits.MaxTokenEstimate)
+	// 输出预占历史校准：max_tokens 是客户端允许的上限，不是预期输出——
+	// agent 客户端普遍拍脑袋给 128000，实际输出几 K，全额预占让
+	// 「最近预占」实际占比长期 27% 上下（实测 ZCode 流量）。改按该模型
+	// 最近成功请求的输出 P95 预占，max_tokens 只做封顶；无历史时回退
+	// min(max_tokens, p95) 的保守口径：P95 未知时取 max_tokens 的 1/8
+	// 与 defaultOutput 的较大者，既不再全额虚占，也覆盖首次请求。
+	out = s.calibratedOutput(model, out, s.cfg.Quota.Limits.DefaultOutputReserve)
 	plan.InputEstimate = in
 	plan.OutputEstimate = out
 	plan.TokenEstimate = in + out

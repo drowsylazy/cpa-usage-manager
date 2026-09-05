@@ -186,6 +186,12 @@ type Service struct {
 	judgeCfgMu  sync.Mutex
 	judgeConf   judgeSettings
 	judgeConfAt time.Time
+	// outCal* 是输出预占校准的 60s 分桶缓存（模型 → 输出 P95）：
+	// 预占热路径不能每次都查 500 行样本，60s 内同模型共享一份，
+	// 结算落库的新样本在下个窗口生效。ok=false 表示样本不足，
+	// 调用方回退保守口径。
+	outCalMu sync.Mutex
+	outCal   map[string]outputCalEntry
 	// notifyCfg* 是告警设置的 60s TTL 缓存：结算热路径每次都要比对单请求
 	// 异常阈值，不能逐请求读 preferences；SaveNotifySettings 时失效。
 	notifyCfgMu  sync.Mutex

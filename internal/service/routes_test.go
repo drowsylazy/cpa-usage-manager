@@ -564,7 +564,7 @@ func TestTestRouteDryRun(t *testing.T) {
 	if len(res.Chain) != 2 || res.Chain[0] != "a" || res.Chain[1] != "b" || res.FellBack || res.AISkipped {
 		t.Fatalf("应命中第一分支整链: %+v", res)
 	}
-	wantIn := int64(len(synth))/3 + 1
+	wantIn := ParseRequestMeta(synth).InputEstimate
 	if res.Vars["input_tokens"] != wantIn || res.Vars["body_len"] != int64(len(synth)) {
 		t.Fatalf("input_tokens/body_len 口径错误: want %d/%d got %v/%v",
 			wantIn, len(synth), res.Vars["input_tokens"], res.Vars["body_len"])

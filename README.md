@@ -135,8 +135,8 @@ quota:                               # 额度子系统
     active_pepper_id: active                    # 签发新密钥的 pepper 代际（支持轮换）
   limits:
     max_token_estimate: 1000000       # 单请求预占 Token 严格上限
-    default_output_reserve: 4096      # 请求未带 max_tokens 时的输出预占
-    require_estimate: false
+    default_output_reserve: 4096      # 请求未带 max_tokens 时的输出预占下限
+    require_estimate: false           # 输出预占按该模型近期实际输出的 P95 自动校准（max_tokens 只封顶），此处无需配置
   settlement:
     missing_usage: settle_reserved    # 上游未回用量（仍有响应数据）：settle_reserved 按预占扣费 | release 释放；上游未产生任何响应数据（HTTP 错误/空响应）时一律零成本结算
     host_usage_wait: 1500ms           # 流式兜底等待宿主用量回调的窗口（非流式不等待）

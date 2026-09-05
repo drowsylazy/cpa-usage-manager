@@ -8,7 +8,7 @@ import (
 
 // SchemaVersion 是本代码期望的数据库 schema 版本。
 // 打开库时若发现库版本更高，说明是被更新版插件写过的库，拒绝降级使用。
-const SchemaVersion = 15
+const SchemaVersion = 16
 
 // migration 是一次版本化迁移。
 type migration struct {
@@ -464,6 +464,19 @@ var migrations = []migration{
 			// 补存结算 token，估算 vs 实际的 token 对照不再依赖金额折算。
 			// 历史已结算行为 0（无从回填），面板按 "-" 展示。
 			`ALTER TABLE reservations ADD COLUMN settled_tokens INTEGER NOT NULL DEFAULT 0`,
+		},
+	},
+	{
+		version: 16,
+		name:    "request_output_history",
+		stmts: []string{
+			// ---- 输出预占的历史校准数据源 ----
+			// 输出预占此前取 max_tokens 全额（ZCode 场景 128000），agent 的
+			// 实际输出只有几 K，「最近预占」实际占比长期 27% 上下。校准取
+			// 该模型最近成功请求的输出 P95，走 (model, ts DESC) 索引取近
+			// 500 行、进程内计算分位数，不落库不加表，这个索引让 WHERE
+			// model=? AND result='ok' 不必回表过滤失败行。
+			`CREATE INDEX idx_requests_model_result_ts ON requests(model, result, ts DESC)`,
 		},
 	},
 }

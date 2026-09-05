@@ -136,12 +136,19 @@ func TestBuildReservePlanDisabledRuleFallsBack(t *testing.T) {
 }
 
 func TestEstimateTokens(t *testing.T) {
-	in, out := ParseRequestMeta([]byte(`{"max_completion_tokens":512}`)).tokenEstimates(4096, 1_000_000)
+	meta := ParseRequestMeta([]byte(`{"max_completion_tokens":512}`))
+	in, out := meta.tokenEstimates(4096, 1_000_000)
 	if out != 512 {
 		t.Fatalf("max_completion_tokens 未生效: %d", out)
 	}
-	if in != int64(len(`{"max_completion_tokens":512}`))/3+1 {
+	// 纯 ASCII 请求体按 /4 估：33 字节 → 9。
+	if in != int64(len(`{"max_completion_tokens":512}`))/4+1 {
 		t.Fatalf("input 估算异常: %d", in)
+	}
+	// 中文密集体：UTF-8 中文 3 字节/字按 /3 估，混合密度不吃亏。
+	mix := ParseRequestMeta([]byte(`{"messages":[{"content":"你好世界"}]}`))
+	if mix.InputEstimate <= int64(len(`{"messages":[{"content":"你好世界"}]}`))/4 {
+		t.Fatalf("中文体的估算应高于同长 ASCII 的 /4: %d", mix.InputEstimate)
 	}
 	in, out = ParseRequestMeta([]byte(`{}`)).tokenEstimates(4096, 1_000_000)
 	if out != 4096 {

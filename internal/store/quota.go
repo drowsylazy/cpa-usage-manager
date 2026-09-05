@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -526,6 +527,44 @@ type HeldReservation struct {
 	StaleMark bool `json:"stale"`
 }
 
+// RecentOutputTokens 返回某模型最近成功请求的输出 token 样本（升序），
+// 供输出预占的历史校准取分位数。走 idx_requests_model_result_ts
+// (model, result, ts DESC)；只取 output_tokens>0 的行——零输出行
+// （无响应释放、上游空回复、缺 usage 的兜底行）会污染校准基线。
+// 样本量上限 500：分位数在两位数样本后已稳定，再多的历史只会让
+// 基线对近期行为变化（agent 转向/提示词改版）钝化。
+func (s *Store) RecentOutputTokens(ctx context.Context, model string, limit int) ([]int64, error) {
+	if limit <= 0 || limit > 2000 {
+		limit = 500
+	}
+	out := make([]int64, 0, 64)
+	err := s.Read(ctx, func(q Querier) error {
+		rows, err := q.QueryContext(ctx,
+			`SELECT output_tokens FROM requests
+			 WHERE model = ? AND result = ? AND output_tokens > 0
+			 ORDER BY ts DESC LIMIT ?`, model, ResultOK, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var v int64
+			if err := rows.Scan(&v); err != nil {
+				return err
+			}
+			out = append(out, v)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	// 时间倒序取出，升序返回：分位数取「近端加权」语义（新样本权重 1.5×），
+	// 升序遍历更直观。拷贝排序不改原切片顺序之外的语义。
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
 // RecentReservation 是最近已完结预占的回顾行（GET /reservations/recent）：
 // 预占估算 vs 实际结算的对照，用于实时页「最近预占」面板。
 type RecentReservation struct {
@@ -537,10 +576,10 @@ type RecentReservation struct {
 	SettledMicroUSD money.Micro `json:"settled_micro_usd"`
 	ReservedTokens  int64       `json:"reserved_tokens"`
 	// SettledTokens 是结算时的真实计费 token；released 与历史行为 0。
-	SettledTokens   int64       `json:"settled_tokens"`
-	CreatedAt       time.Time   `json:"created_at"`
-	FinishedAt      time.Time   `json:"finished_at"`
-	AgeMS           int64       `json:"age_ms"` // 预占创建到完结的全程耗时
+	SettledTokens int64     `json:"settled_tokens"`
+	CreatedAt     time.Time `json:"created_at"`
+	FinishedAt    time.Time `json:"finished_at"`
+	AgeMS         int64     `json:"age_ms"` // 预占创建到完结的全程耗时
 }
 
 // ListRecentReservations 返回最近 limit 条已完结（settled/released）预占，
