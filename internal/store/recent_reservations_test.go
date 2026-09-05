@@ -50,7 +50,7 @@ func TestListRecentReservations(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := s.ListRecentReservations(ctx, 25)
+	got, err := s.ListRecentReservations(ctx, 10)
 	if err != nil {
 		t.Fatal(err)
 	}

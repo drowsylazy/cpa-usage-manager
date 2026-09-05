@@ -3232,7 +3232,7 @@ $('held-auto').addEventListener('change', () => {
 });
 $('held-refresh').addEventListener('click', () => { loadHeld().catch(() => {}); });
 
-// loadRecent 拉取并渲染「最近预占」：最近 25 条已完结请求的 预估 vs 实际 token 对照。
+// loadRecent 拉取并渲染「最近预占」：最近 10 条已完结请求的 预估 vs 实际 token 对照。
 // released = 未走到结算即释放（上游错误/无响应/超时清扫），实际消耗无从谈起；
 // 实际占比 = 实际消耗 ÷ 预估 token，70%–130% 视为估算健康区间（双向往返）。
 async function loadRecent() {
@@ -3250,7 +3250,7 @@ async function loadRecent() {
   const released = items.length - settled.length;
   sub.textContent = items.length
     ? '最近 ' + items.length + ' 条已完结：' + settled.length + ' 条已结算 · ' + released + ' 条未结算即释放'
-    : '最近 25 条已完结请求的预估与实际消耗 token 对照：实际占比落在 70%–130% 之间即估算健康';
+    : '最近 10 条已完结请求的预估与实际消耗 token 对照：实际占比落在 70%–130% 之间即估算健康';
   rows.innerHTML = items.map(x => {
     const label = keyLabelOf(x.key_id);
     let state, ratio;

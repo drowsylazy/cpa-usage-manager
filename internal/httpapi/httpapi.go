@@ -393,7 +393,7 @@ func (a *API) recentReservations(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(405)
 		return
 	}
-	items, e := a.st.ListRecentReservations(r.Context(), 25)
+	items, e := a.st.ListRecentReservations(r.Context(), 10)
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 500)
 		return
