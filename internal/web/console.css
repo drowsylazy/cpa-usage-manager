@@ -542,12 +542,11 @@ table.data td.cell-clip{max-width:340px;overflow:hidden;text-overflow:ellipsis}
 .ky-cell[data-kind="tok"][data-state="warn"] .ky-bar>span{background:var(--warn)}
 .ky-cell[data-state="alarm"] .ky-bar>span,
 .ky-cell[data-kind="tok"][data-state="alarm"] .ky-bar>span{background:var(--alarm)}
-.ky-spent{
-  padding-top:2px;color:var(--fg3);font-size:12px;
-}
-
+/* 页脚贴卡片下缘：网格把同行卡片拉伸到最高者高度时，弹性空隙被吸收在
+   余额区与页脚之间（页脚分隔线始终贴底），不再在卡片底部堆出一块空白。 */
 .ky-meta{
   display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+  margin-top:auto;
   padding-top:9px;border-top:1px solid var(--line);
   color:var(--fg4);font-size:11px;
 }

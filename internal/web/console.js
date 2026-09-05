@@ -1653,6 +1653,16 @@ function keyCardHTML(k) {
   const cells =
     (u ? keyQuotaCell(u, 'usd', '金额', fmtCur) : '')
     + (t ? keyQuotaCell(t, 'tok', 'Token', fmtTok) : '');
+  // 无任何限额的 Key 没有进度条可画，但保持与限额卡片同构的余额区
+  // （标签 + 大数字读数）：网格会把同行卡片拉伸到最高者的高度，只给一行
+  // 小字会在卡片下半部留出一大块空白。
+  const quotaArea = cells
+    ? '<div class="ky-split' + (u && t ? '' : ' ky-single') + '">' + cells + '</div>'
+    : '<div class="ky-split ky-single"><div class="ky-cell" data-kind="usd">'
+      + '<span class="ky-cell-label">累计金额</span>'
+      + '<span class="ky-quota-row"><span class="ky-quota-num mono">' + fmtCur(k.spent_micro_usd) + '</span>'
+      + '<span class="ky-used mono">Token 已用 ' + fmtTok(k.tokens_used) + '</span></span>'
+      + '</div></div>';
   return '<article class="ky-card" data-kid="' + esc(k.kid) + '" role="listitem" tabindex="0">'
     + '<div class="ky-card-top">'
     + '<span class="pill ' + meta.pill + '">' + meta.label + '</span>'
@@ -1662,9 +1672,7 @@ function keyCardHTML(k) {
     + '<button type="button" class="ky-kid mono" data-copy="' + esc(k.kid) + '" title="点击复制完整 kid：' + esc(k.kid) + '">'
     + '<span>' + esc(kidShort(k.kid)) + '</span>' + COPY_SVG + '</button>'
     + '</div>'
-    + (cells
-      ? '<div class="ky-split' + (u && t ? '' : ' ky-single') + '">' + cells + '</div>'
-      : '<div class="ky-spent mono">累计已用 ' + fmtCur(k.spent_micro_usd) + '</div>')
+    + quotaArea
     + '<footer class="ky-meta">'
     + '<span class="ky-pair"><b>' + esc(k.caller_id || '-') + '</b>' + (k.caller_scope === 'key' ? '独立计额' : '归属 caller') + '</span>'
     + '<span>并发 ' + (k.max_concurrent_requests > 0 ? '≤ ' + k.max_concurrent_requests : '不限') + '</span>'
