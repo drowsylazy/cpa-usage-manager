@@ -867,64 +867,76 @@ table.data th .info{vertical-align:0}
   .chart{height:260px}
 }
 
-/* ── 系统页·通知（shoutrrr 多端点） ─────────────────────────── */
-/* 设置项分组卡片：组标题 + 开关行（主开关 + 条件参数同一行）。
-   旧版把 6 个开关和 6 个参数输入框平铺在两行 btn-row 里，
-   开关与参数在换行后交错，扫读时分不清哪个参数属于哪个开关。 */
-.nt-group{
-  border:1px solid var(--line);border-radius:10px;background:var(--sunken);
-  overflow:hidden;
+/* ── 系统页·告警设置 / 通知端点 / 定期报告 ─────────────────── */
+/* 设置列表：每条规则一行，开关（加粗，固定左列）+ 条件参数（浅色，同行右列），
+   行间细分割线。不再套内嵌边框卡——面板本身已是一张卡。 */
+.nt-rules{display:grid;gap:0}
+.nt-rule{
+  display:flex;align-items:center;justify-content:space-between;gap:18px;
+  min-height:44px;padding:8px 0;
+  cursor:pointer;
 }
-.nt-group-head{
-  padding:8px 12px;border-bottom:1px solid var(--line);
-  color:var(--fg2);font-size:11.5px;font-weight:700;letter-spacing:.02em;
+.nt-rule + .nt-rule{border-top:1px solid var(--line)}
+.nt-rule-name{
+  flex:none;display:inline-flex;align-items:center;gap:8px;
+  font-size:13px;font-weight:600;color:var(--fg2);user-select:none;
 }
-.nt-group-body{display:grid;gap:0;padding:4px 12px}
-.nt-opt{
-  display:flex;align-items:center;gap:14px;flex-wrap:wrap;
-  padding:8px 0;
-}
-.nt-opt + .nt-opt{border-top:1px solid var(--line)}
-.nt-opt-main{
-  flex:none;display:inline-flex;align-items:center;gap:6px;
-  min-width:130px;
-  font-size:12.5px;font-weight:600;color:var(--fg2);cursor:pointer;user-select:none;
-}
-.nt-opt-main input{accent-color:var(--signal)}
-.nt-opt-inline{
-  display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;
+.nt-rule-name input{accent-color:var(--signal)}
+.nt-rule-name.nt-plain{font-weight:500;color:var(--fg3)}
+.nt-rule-params{
+  display:inline-flex;align-items:center;justify-content:flex-end;gap:6px;flex-wrap:wrap;
   color:var(--fg3);font-size:12px;
 }
-.nt-opt-inline input[type="number"]{
-  width:64px;padding:4px 8px;border:1px solid var(--line);border-radius:7px;
+.nt-rule-params input[type="number"]{
+  width:66px;padding:4px 8px;border:1px solid var(--line);border-radius:7px;
   background:var(--raised);color:var(--fg);font:inherit;font-size:12.5px;
 }
-.nt-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.check-row{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--fg2);cursor:pointer;user-select:none}
-.check-row input{accent-color:var(--signal)}
-.check-row input[type="number"]{width:64px;padding:4px 8px;border:1px solid var(--line);border-radius:7px;background:var(--raised);color:var(--fg);font:inherit;font-size:12.5px}
-.nt-list{display:grid;gap:8px}
-.nt-item{
-  display:flex;align-items:flex-start;gap:10px;
-  padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--sunken);
+.nt-rule-params .or{color:var(--fg4);font-style:normal}
+.nt-foot{
+  display:flex;justify-content:flex-end;padding-top:14px;margin-top:2px;
+  border-top:1px solid var(--line);
 }
-.nt-item.off{opacity:.55}
-.nt-scheme{
-  flex:none;margin-top:2px;padding:3px 7px;border-radius:6px;
-  background:var(--raised);border:1px solid var(--line3);
+/* 端点/报告行列表：主行（徽标+名称+状态）+ 次行（描述左、操作右） */
+.nt-list{display:grid;gap:8px}
+.nt-row{
+  display:flex;align-items:center;gap:11px;
+  padding:9px 12px;border:1px solid var(--line);border-radius:10px;background:var(--raised);
+}
+.nt-row.off{opacity:.6}
+.nt-scheme,.nt-freq{
+  flex:none;padding:3px 8px;border-radius:6px;
+  background:var(--sunken);border:1px solid var(--line3);
   color:var(--fg2);font:600 10.5px/1.4 var(--mono);
   text-transform:uppercase;letter-spacing:.05em;
 }
-.nt-main{flex:1;min-width:0;display:grid;gap:2px}
-.nt-head b{font-size:12.5px}
-.nt-url{font-size:11px;color:var(--fg3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.nt-status{font-size:11.5px;color:var(--fg3);word-break:break-all}
-.nt-ok{color:var(--live)}
-.nt-err{color:var(--alarm)}
-.nt-dim{color:var(--fg3)}
+/* 频率徽标用语义色区分：一目了然三类报告的周期 */
+.nt-freq{text-transform:none;letter-spacing:.02em}
+.nt-freq.daily{color:var(--live);border-color:var(--live);background:transparent}
+.nt-freq.weekly{color:var(--signal);border-color:var(--signal);background:transparent}
+.nt-freq.monthly{color:var(--trace);border-color:var(--trace);background:transparent}
+.nt-main{flex:1;min-width:0;display:grid;gap:4px}
+.nt-line1{display:flex;align-items:center;gap:8px;min-width:0}
+.nt-name{
+  font-size:12.5px;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.nt-status{flex:none;font-size:11px}
+.nt-status.ok{color:var(--live)}
+.nt-status.err{color:var(--alarm)}
+.nt-status.dim{color:var(--fg4)}
+.nt-line2{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0}
+.nt-line2 .mono,.nt-desc{
+  font-size:11px;color:var(--fg4);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.nt-ops{flex:none;display:inline-flex;align-items:center;gap:4px}
+.nt-ops .btn{min-height:26px;padding:0 8px;font-size:11.5px}
+.check-row{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--fg2);cursor:pointer;user-select:none}
+.check-row input{accent-color:var(--signal)}
+.check-row input[type="number"]{width:64px;padding:4px 8px;border:1px solid var(--line);border-radius:7px;background:var(--raised);color:var(--fg);font:inherit;font-size:12.5px}
 @media (max-width:700px){
-  .nt-item{flex-wrap:wrap}
-  .nt-main{min-width:100%}
+  .nt-rule{align-items:flex-start;flex-direction:column;gap:6px}
+  .nt-rule-params{justify-content:flex-start}
+  .nt-row{flex-wrap:wrap}
+  .nt-line2{flex-wrap:wrap}
 }
 
 /* ── 系统页·定期报告 ────────────────────────────────────────── */
@@ -937,9 +949,6 @@ table.data th .info{vertical-align:0}
 .rp-secs,.rp-eps{display:grid;gap:8px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--sunken)}
 @media (max-width:700px){
   .rp-top-row{align-items:flex-start}
-  /* 窄屏：开关行主项与参数放不下同一行时换行，参数行缩进对齐主项文字 */
-  .nt-opt{flex-direction:column;align-items:flex-start;gap:4px}
-  .nt-opt-inline{padding-left:20px}
 }
 
 /* ── 模型集合（路由别名） ──────────────────────────────────── */

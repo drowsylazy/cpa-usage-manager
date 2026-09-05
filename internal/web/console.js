@@ -3356,29 +3356,28 @@ function renderNotify() {
   $('nt-expire-days').value = st.expire_warn_days > 0 ? st.expire_warn_days : '';
   const eps = notifyCache.endpoints;
   if (!eps.length) {
-    $('nt-list').innerHTML = '<p class="note">尚未配置通知端点。</p>';
+    $('nt-list').innerHTML = '<p class="note">尚未配置通知端点，点右上角「新增端点」开始。</p>';
     return;
   }
   $('nt-list').innerHTML = eps.map(e => {
     const scheme = (String(e.url).split('://')[0] || '?').toLowerCase();
-    const status = e.last_error
-      ? '<span class="nt-err">✗ ' + esc(e.last_error) + '</span>'
-      : e.last_ok_at
-        ? '<span class="nt-ok">✓ 上次发送成功 · ' + esc(fmtDT(e.last_ok_at)) + '</span>'
-        : '<span class="nt-dim">从未发送</span>';
-    return '<div class="nt-item' + (e.enabled ? '' : ' off') + '">'
+    let status;
+    if (e.last_error) status = '<span class="nt-status err" title="' + esc(e.last_error) + '">✗ 发送失败</span>';
+    else if (e.last_ok_at) status = '<span class="nt-status ok" title="上次成功 ' + esc(fmtDT(e.last_ok_at)) + '">✓ 正常</span>';
+    else status = '<span class="nt-status dim">从未发送</span>';
+    return '<div class="nt-row' + (e.enabled ? '' : ' off') + '">'
       + '<span class="nt-scheme">' + esc(scheme) + '</span>'
       + '<div class="nt-main">'
-      + '<div class="nt-head"><b>' + esc(e.label || '未命名端点') + '</b>'
-      + (e.enabled ? '' : ' <span class="pill">停用</span>') + '</div>'
-      + '<div class="nt-url mono" title="' + esc(e.url) + '">' + esc(e.url) + '</div>'
-      + '<div class="nt-status">' + status + '</div>'
-      + '</div>'
-      + '<div class="btn-row">'
+      + '<div class="nt-line1"><b class="nt-name">' + esc(e.label || '未命名端点') + '</b>'
+      + (e.enabled ? '' : '<span class="pill">停用</span>')
+      + status + '</div>'
+      + '<div class="nt-line2">'
+      + '<span class="nt-url mono" title="' + esc(e.url) + '">' + esc(e.url) + '</span>'
+      + '<span class="nt-ops">'
       + '<button type="button" class="btn" data-nt-test="' + e.id + '">测试</button>'
       + '<button type="button" class="btn" data-nt-edit="' + e.id + '">编辑</button>'
       + '<button type="button" class="btn danger" data-nt-del="' + e.id + '">删除</button>'
-      + '</div></div>';
+      + '</span></div></div></div>';
   }).join('');
 }
 function openEndpointSheet(ep) {
@@ -3486,23 +3485,24 @@ function renderReports() {
     if (c.frequency === 'monthly') sched = '每月 ' + c.monthday + ' 日 ' + c.time_of_day;
     const tz = c.tz_offset_min ? ' · UTC' + (c.tz_offset_min > 0 ? '+' : '') + Math.round(c.tz_offset_min / 60 * 10) / 10 : ' · UTC';
     const eps = (c.endpoint_ids || []).map(epName).join('、') || '无端点';
-    const status = c.last_error
-      ? '<span class="nt-err">✗ ' + esc(c.last_error) + '</span>'
-      : c.last_sent_at
-        ? '<span class="nt-ok">✓ 上次发送 · ' + esc(fmtDT(c.last_sent_at)) + '</span>'
-        : '<span class="nt-dim">从未发送</span>';
-    return '<div class="nt-item' + (c.enabled ? '' : ' off') + '">'
-      + '<span class="nt-scheme">' + esc(freqName[c.frequency] || c.frequency) + '</span>'
+    let status;
+    if (c.last_error) status = '<span class="nt-status err" title="' + esc(c.last_error) + '">✗ 发送失败</span>';
+    else if (c.last_sent_at) status = '<span class="nt-status ok" title="上次发送 ' + esc(fmtDT(c.last_sent_at)) + '">✓ 正常</span>';
+    else status = '<span class="nt-status dim">从未发送</span>';
+    const freqClass = { daily: 'daily', weekly: 'weekly', monthly: 'monthly' }[c.frequency] || '';
+    return '<div class="nt-row' + (c.enabled ? '' : ' off') + '">'
+      + '<span class="nt-freq ' + freqClass + '">' + esc(freqName[c.frequency] || c.frequency) + '</span>'
       + '<div class="nt-main">'
-      + '<div class="nt-head"><b>' + esc(c.name || '未命名报告') + '</b>' + (c.enabled ? '' : ' <span class="pill">停用</span>') + '</div>'
-      + '<div class="nt-status">' + esc(sched + tz) + ' → ' + esc(eps) + '</div>'
-      + '<div class="nt-status">' + status + '</div>'
-      + '</div>'
-      + '<div class="btn-row">'
+      + '<div class="nt-line1"><b class="nt-name">' + esc(c.name || '未命名报告') + '</b>'
+      + (c.enabled ? '' : '<span class="pill">停用</span>')
+      + status + '</div>'
+      + '<div class="nt-line2">'
+      + '<span class="nt-desc">' + esc(sched + tz + ' · 发往 ' + eps) + '</span>'
+      + '<span class="nt-ops">'
       + '<button type="button" class="btn" data-rp-test="' + c.id + '">测试</button>'
       + '<button type="button" class="btn" data-rp-edit="' + c.id + '">编辑</button>'
       + '<button type="button" class="btn danger" data-rp-del="' + c.id + '">删除</button>'
-      + '</div></div>';
+      + '</span></div></div></div>';
   }).join('');
 }
 const RP_METRICS = [['cost', '费用'], ['tokens', 'Token'], ['requests', '请求数']];

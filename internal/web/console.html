@@ -361,38 +361,54 @@
     </article>
   </div>
 
+  <div class="split even">
+    <article class="panel">
+      <div class="panel-head"><div><h2 class="panel-title">告警与通知设置</h2><p class="panel-sub">额度越线、单请求异常、错误率与密钥临期的推送规则</p></div></div>
+      <div class="panel-body">
+        <div class="nt-rules">
+          <label class="nt-rule" title="每档越线只报一次；余量回升后自动重新武装">
+            <span class="nt-rule-name"><input type="checkbox" id="nt-enabled"> 额度告警</span>
+            <span class="nt-rule-params">余量低于 <input type="number" id="nt-warn" min="1" max="95" step="1" value="20"> % 时触发</span>
+          </label>
+          <label class="nt-rule">
+            <span class="nt-rule-name"><input type="checkbox" id="nt-single"> 单请求异常告警</span>
+            <span class="nt-rule-params">费用 ≥ <input type="number" id="nt-single-usd" min="0" step="0.01" placeholder="不限"> $<i class="or">或</i>Token ≥ <input type="number" id="nt-single-tok" min="0" step="1" placeholder="不限"></span>
+          </label>
+          <label class="nt-rule">
+            <span class="nt-rule-name"><input type="checkbox" id="nt-errrate"> 错误率告警</span>
+            <span class="nt-rule-params">近 <input type="number" id="nt-errrate-win" min="1" max="60" step="1" value="10"> 分钟失败 ≥ <input type="number" id="nt-errrate-pct" min="1" max="100" step="1" value="50"> %</span>
+          </label>
+          <label class="nt-rule">
+            <span class="nt-rule-name nt-plain">密钥临期预警</span>
+            <span class="nt-rule-params">到期前 <input type="number" id="nt-expire-days" min="0" max="90" step="1" placeholder="关" title="0=关闭"> 天推送一次</span>
+          </label>
+          <label class="nt-rule">
+            <span class="nt-rule-name"><input type="checkbox" id="nt-errors"> 错误上报</span>
+            <span class="nt-rule-params">发送失败 / 存储降级，同来源每小时限一条</span>
+          </label>
+        </div>
+        <div class="nt-foot"><button type="button" class="btn primary" id="nt-save-btn">保存设置</button></div>
+      </div>
+    </article>
+
+    <article class="panel">
+      <div class="panel-head">
+        <div><h2 class="panel-title">通知端点</h2><p class="panel-sub">推送渠道（shoutrrr）：Telegram / Discord / 飞书 / ntfy / generic webhook</p></div>
+        <div class="panel-tools"><button type="button" class="btn primary" id="nt-add-btn"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>新增端点</span></button></div>
+      </div>
+      <div class="panel-body">
+        <div class="nt-list" id="nt-list"></div>
+      </div>
+    </article>
+  </div>
+
   <article class="panel">
-    <div class="panel-head"><div><h2 class="panel-title">通知与报告</h2><p class="panel-sub">额度越线、密钥过期、系统错误与定期报告，经 shoutrrr 推送到多个渠道（Telegram / Discord / 飞书 / ntfy / generic webhook 等）</p></div></div>
-    <div class="panel-body stack">
-      <div class="nt-group">
-        <div class="nt-group-head">额度与用量告警</div>
-        <div class="nt-group-body">
-          <label class="nt-opt"><span class="nt-opt-main"><input type="checkbox" id="nt-enabled"> 额度告警</span>
-            <span class="nt-opt-inline">余量低于 <input type="number" id="nt-warn" min="1" max="95" step="1" value="20"> % 时触发</span></label>
-          <label class="nt-opt"><span class="nt-opt-main"><input type="checkbox" id="nt-single"> 单请求异常告警</span>
-            <span class="nt-opt-inline">费用 ≥ <input type="number" id="nt-single-usd" min="0" step="0.01" placeholder="不限"> $ 或 Token ≥ <input type="number" id="nt-single-tok" min="0" step="1" placeholder="不限"></span></label>
-          <label class="nt-opt"><span class="nt-opt-main"><input type="checkbox" id="nt-errrate"> 错误率告警</span>
-            <span class="nt-opt-inline">近 <input type="number" id="nt-errrate-win" min="1" max="60" step="1" value="10"> 分钟失败 ≥ <input type="number" id="nt-errrate-pct" min="1" max="100" step="1" value="50"> %</span></label>
-          <label class="nt-opt"><span class="nt-opt-main">密钥临期预警</span>
-            <span class="nt-opt-inline">到期前 <input type="number" id="nt-expire-days" min="0" max="90" step="1" placeholder="关" title="到期前 N 天推送一次；0=关闭"> 天推送一次</span></label>
-          <label class="nt-opt"><span class="nt-opt-main"><input type="checkbox" id="nt-errors"> 错误上报</span>
-            <span class="nt-opt-inline">发送失败、存储降级等系统错误，同来源每小时最多一条</span></label>
-        </div>
-      </div>
-      <div class="nt-actions">
-        <button type="button" class="btn primary" id="nt-save-btn">保存设置</button>
-        <button type="button" class="btn" id="nt-add-btn">新增通知端点</button>
-      </div>
-      <div class="nt-list" id="nt-list"></div>
-      <p class="note">URL 写法见 shoutrrr 文档，如 <span class="mono">lark://open.larksuite.com/&lt;token&gt;</span>、<span class="mono">telegram://&lt;token&gt;@bot</span>、<span class="mono">generic://host/path</span>。<br>额度告警按状态翻转边沿触发：每档只报一次，余量回升后自动重新武装。</p>
-      <div class="nt-group">
-        <div class="nt-group-head">定期报告</div>
-        <div class="nt-group-body">
-          <button type="button" class="btn" id="rp-add-btn">新增报告</button>
-        </div>
-      </div>
+    <div class="panel-head">
+      <div><h2 class="panel-title">定期报告</h2><p class="panel-sub">覆盖「上一个已完成周期」：日报=昨天、周报=上个自然周、月报=上个自然月</p></div>
+      <div class="panel-tools"><button type="button" class="btn primary" id="rp-add-btn"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>新增报告</span></button></div>
+    </div>
+    <div class="panel-body">
       <div class="nt-list" id="rp-list"></div>
-      <p class="note">报告覆盖「上一个已完成周期」：日报=昨天，周报=上个自然周（周一起），月报=上个自然月；内容板块与 Top N 在表单里自由组合。停机跨过触发点时补发最近一期。</p>
     </div>
   </article>
 
