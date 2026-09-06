@@ -339,6 +339,21 @@
     </div>
     <p class="note tbl-foot" id="recent-note"></p>
   </article>
+
+  <article class="panel">
+    <div class="panel-head">
+      <div><h2 class="panel-title">估算密度</h2><p class="panel-sub" id="densities-sub">各模型输入预占学习到的等效密度（请求体字节 ÷ 输入 token）：折算即按此密度进行，MAD 越小样本越一致</p></div>
+    </div>
+    <div class="table-wrap">
+      <table class="data" id="densities-table">
+        <thead><tr>
+          <th>模型</th><th class="num">等效密度</th><th class="num">离散度 (±MAD)</th><th class="num">样本数</th><th>口径</th>
+        </tr></thead>
+        <tbody id="densities-rows"></tbody>
+      </table>
+    </div>
+    <p class="note tbl-foot" id="densities-note">密度 = 近期成功请求的 请求体字节 ÷ 完整输入上下文 token（含缓存读/写）的中位数；样本来自执行器路径（历史行与被动统计不带请求体长度）。</p>
+  </article>
 </section>
 
 <!-- ── 系统 ─────────────────────────────────────────────────────── -->

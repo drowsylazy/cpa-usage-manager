@@ -80,6 +80,7 @@ func (a *API) register() {
 	a.route("/keys/candidates", a.keyCandidates)
 	a.route("/reservations/held", a.heldReservations)
 	a.route("/reservations/recent", a.recentReservations)
+	a.route("/densities", a.densities)
 	a.route("/model-routes/health", a.modelRoutesHealth)
 	a.route("/keys/issue", a.issue)
 	a.route("/keys/update", a.updateKey)
@@ -394,6 +395,21 @@ func (a *API) recentReservations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	items, e := a.st.ListRecentReservations(r.Context(), 10)
+	if e != nil {
+		jsonOut(w, map[string]string{"error": e.Error()}, 500)
+		return
+	}
+	jsonOut(w, map[string]any{"items": items, "count": len(items)}, 200)
+}
+
+// densities 返回各模型当前学习到的输入密度读数（中位数/MAD/样本数），
+// 供实时页「估算密度」面板：预占输入估算正按什么密度折算，一目了然。
+func (a *API) densities(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.WriteHeader(405)
+		return
+	}
+	items, e := a.st.ModelDensities(r.Context(), 200)
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 500)
 		return

@@ -647,3 +647,16 @@ func TestMalformedUsageContainerIsSkipped(t *testing.T) {
 		}
 	}
 }
+
+func TestContextTokens(t *testing.T) {
+	// inclusive 口径（OpenAI/Gemini）：input 已含缓存命中，原样即是。
+	incl := Usage{InputTokens: 1000, CachedTokens: 800, InputIncludesCache: true}
+	if got := incl.ContextTokens(); got != 1000 {
+		t.Errorf("inclusive 口径完整上下文 = %d, 期望 1000", got)
+	}
+	// exclusive 口径（Claude）：input 不含缓存读/写，须补上。
+	excl := Usage{InputTokens: 200, CacheReadTokens: 5000, CacheCreationTokens: 300}
+	if got := excl.ContextTokens(); got != 5500 {
+		t.Errorf("exclusive 口径完整上下文 = %d, 期望 5500", got)
+	}
+}

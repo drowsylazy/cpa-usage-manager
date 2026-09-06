@@ -134,6 +134,19 @@ func (u Usage) EffectiveTotal() int64 {
 	return b.Sum()
 }
 
+// ContextTokens 返回完整输入上下文的 token 数：两种口径归一。
+// OpenAI/Gemini 的 InputTokens 已含缓存命中（inclusive），原样即是；
+// Claude 的 InputTokens 不含缓存读/写（exclusive），须补上——
+// 长对话命中缓存后新鲜 input 只有几 K，不补会把密度样本的分母
+// 错算成十几倍（body 不变、分母骤减 → 密度虚高被学习拒绝）。
+func (u Usage) ContextTokens() int64 {
+	ctx := u.InputTokens
+	if !u.InputIncludesCache {
+		ctx += u.CacheReadTokens + u.CacheCreationTokens
+	}
+	return ctx
+}
+
 // merge 把 other 合并进 u，逐字段取较大值。
 //
 // 流式响应中各协议的用量是累计上报的（Claude 在 message_start 给输入、

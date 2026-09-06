@@ -767,6 +767,7 @@ func managementRegistration() rpcManagementRegistration {
 		{Method: "GET", Path: base + "/keys/candidates", Description: "Key 联想候选（kid+标签，轻量）"},
 		{Method: "GET", Path: base + "/reservations/held", Description: "在途预占（进行中请求）视图"},
 		{Method: "GET", Path: base + "/reservations/recent", Description: "最近已完结预占回顾（估算 vs 实结）"},
+		{Method: "GET", Path: base + "/densities", Description: "各模型输入密度学习读数（中位数/MAD/样本数）"},
 		{Method: "GET", Path: base + "/model-routes/health", Description: "路由目标健康（冷却+近期失败）"},
 		{Method: "POST", Path: base + "/keys/issue", Description: "签发 Key"},
 		{Method: "POST", Path: base + "/keys/update", Description: "更新 Key 策略"},

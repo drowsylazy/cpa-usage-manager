@@ -3224,6 +3224,7 @@ function setupHeldAuto() {
     if (document.hidden || $('app').hidden || activeTab !== 'live') return;
     loadHeld().catch(() => {});
     loadRecent().catch(() => {});
+    loadDensities().catch(() => {});
   }, 5000);
 }
 $('held-auto').addEventListener('change', () => {
@@ -3287,6 +3288,38 @@ async function loadRecent() {
     : '暂无已完结的预占记录（随保留期清理）。';
 }
 $('held-refresh').addEventListener('click', () => { loadRecent().catch(() => {}); });
+
+// loadDensities 拉取并渲染「估算密度」：各模型学习到的输入密度读数。
+// 毫密度 ×1000 → 显示为 X.X 字节/token；口径列给出对照（固定混合密度
+// 约为 ASCII 4 / 中文 3 字节每 token），让「学习密度 vs 直觉密度」可读。
+async function loadDensities() {
+  const rows = $('densities-rows'), sub = $('densities-sub');
+  let items;
+  try {
+    const r = await api('/densities');
+    items = r.items || [];
+  } catch (e) {
+    rows.innerHTML = '';
+    return;
+  }
+  rows.innerHTML = items.map(x => {
+    const d = (x.milli_density / 1000).toFixed(1);
+    const mad = (x.milli_mad / 1000).toFixed(1);
+    // 与混合密度直觉的对照：4 字节/token 是英文/代码的常识值。
+    const vs = x.milli_density > 0 ? (x.milli_density / 4000 * 100).toFixed(0) : '';
+    return '<tr>'
+      + '<td class="cell-mono cell-clip" style="max-width:260px" title="' + esc(x.model || '') + '">' + esc(x.model || '-') + '</td>'
+      + '<td class="num" title="请求体字节 ÷ 完整输入上下文 token，近期成功请求的中位数">' + d + ' B/token</td>'
+      + '<td class="num" title="绝对中位差：样本密度的离散程度，越小越稳定">± ' + mad + '</td>'
+      + '<td class="num">' + (x.samples || 0) + '</td>'
+      + '<td title="学习密度相对 4 字节/token 常识值的比值：100% 即与常识一致，低于 100% 说明该模型 tokenizer 更省字节">' + vs + '% of 4B</td>'
+      + '</tr>';
+  }).join('');
+  sub.textContent = items.length
+    ? '各模型输入预占学习到的等效密度（请求体字节 ÷ 输入 token）：折算即按此密度进行，MAD 越小样本越一致'
+    : '暂无密度样本：新流量跑过几条成功请求后自动学习（历史行不带请求体长度）';
+}
+$('held-refresh').addEventListener('click', () => { loadDensities().catch(() => {}); });
 loaders.live = async () => {
   // 密钥标签走全量候选（keysView.cache 只有当前分页页）。
   api('/keys/candidates')
@@ -3294,6 +3327,7 @@ loaders.live = async () => {
     .catch(() => {});
   await loadHeld();
   await loadRecent();
+  await loadDensities();
   stamp();
 };
 

@@ -56,26 +56,31 @@ func TestRecentOutputTokens(t *testing.T) {
 	}
 }
 
-// TestRecentDensities 锁输入密度学习的样本查询：只取该模型成功、
-// body_len>0 且 input_tokens>0 的行，body_len<1024 的短体噪声剔除，
-// 返回毫密度（body_len÷input×1000）升序。
+// TestRecentDensities 锁输入密度学习的样本查询：分母是完整上下文
+// （input + cache_read + cache_creation——Claude 口径 input 不含缓存读写），
+// 只取该模型成功、body_len>0 且上下文>0 的行，body_len<1024 的短体噪声
+// 剔除，返回毫密度（body_len÷上下文×1000）升序。
 func TestRecentDensities(t *testing.T) {
 	s := openTestStore(t, filepath.Join(t.TempDir(), "cpa.db"), "recent-density")
 	ctx := context.Background()
 	base := time.Now().UTC().Add(-time.Hour)
 
-	mk := func(id, model, result string, bodyLen, inTok int64, at time.Time) Request {
+	mk := func(id, model, result string, bodyLen, inTok, cacheRead, cacheCreate int64, at time.Time) Request {
 		return Request{ID: id, TS: at, Model: model, Result: result,
-			BodyLen: bodyLen, InputTokens: inTok, TotalTokens: inTok}
+			BodyLen: bodyLen, InputTokens: inTok, CacheReadTokens: cacheRead,
+			CacheCreationTokens: cacheCreate, TotalTokens: inTok + cacheRead + cacheCreate}
 	}
 	rows := []Request{
-		mk("d-1", "m", ResultOK, 730_000, 100_000, base.Add(1*time.Minute)),      // 7300
-		mk("d-2", "m", ResultOK, 400_000, 50_000, base.Add(2*time.Minute)),       // 8000
-		mk("d-err", "m", ResultError, 700_000, 100_000, base.Add(3*time.Minute)), // 失败行剔除
-		mk("d-nolen", "m", ResultOK, 0, 90_000, base.Add(4*time.Minute)),         // 无 body_len 剔除
-		mk("d-noin", "m", ResultOK, 500_000, 0, base.Add(5*time.Minute)),         // 无输入 token 剔除
-		mk("d-short", "m", ResultOK, 512, 80, base.Add(6*time.Minute)),           // 短体噪声剔除
-		mk("d-3", "m", ResultOK, 210_000, 30_000, base.Add(7*time.Minute)),       // 7000
+		mk("d-1", "m", ResultOK, 730_000, 100_000, 0, 0, base.Add(1*time.Minute)), // 7300
+		mk("d-2", "m", ResultOK, 400_000, 50_000, 0, 0, base.Add(2*time.Minute)),  // 8000
+		// Claude 口径：input=2000 但缓存读 98000——上下文 100K，
+		// 密度 7300（与 d-1 同），分母不补会错算成 365000。
+		mk("d-claude", "m", ResultOK, 730_000, 2_000, 98_000, 0, base.Add(3*time.Minute)),
+		mk("d-err", "m", ResultError, 700_000, 100_000, 0, 0, base.Add(4*time.Minute)), // 失败行剔除
+		mk("d-nolen", "m", ResultOK, 0, 90_000, 0, 0, base.Add(5*time.Minute)),         // 无 body_len 剔除
+		mk("d-noctx", "m", ResultOK, 500_000, 0, 0, 0, base.Add(6*time.Minute)),        // 上下文全零剔除
+		mk("d-short", "m", ResultOK, 512, 80, 0, 0, base.Add(7*time.Minute)),           // 短体噪声剔除
+		mk("d-3", "m", ResultOK, 210_000, 30_000, 0, 0, base.Add(8*time.Minute)),       // 7000
 	}
 	for _, r := range rows {
 		if err := s.RecordPassiveUsage(ctx, r, PassiveDedupeHint{Models: []string{r.Model}, Near: r.TS}); err != nil {
@@ -87,12 +92,53 @@ func TestRecentDensities(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 3 {
-		t.Fatalf("应只返回 3 条有效密度样本，得到 %d: %v", len(got), got)
+	// d-claude 的缓存读补进分母后与 d-1 同为 7300，有效样本 4 条。
+	if len(got) != 4 {
+		t.Fatalf("应只返回 4 条有效密度样本，得到 %d: %v", len(got), got)
 	}
-	for i, want := range []int64{7000, 7300, 8000} {
+	for i, want := range []int64{7000, 7300, 7300, 8000} {
 		if got[i] != want {
 			t.Fatalf("密度样本[%d] = %d want %d（应升序）", i, got[i], want)
 		}
+	}
+}
+
+// TestModelDensities 锁密度读数接口：每模型返回中位数/MAD/样本数，
+// 只列有样本的模型，按模型名排序。
+func TestModelDensities(t *testing.T) {
+	s := openTestStore(t, filepath.Join(t.TempDir(), "cpa.db"), "model-densities")
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Hour)
+
+	// 模型 a：8 条一致的 7300 毫密度 → 中位 7300、MAD 0。
+	for i := 0; i < 8; i++ {
+		r := Request{ID: "a-" + time.Duration(i).String(), TS: base.Add(time.Duration(i) * time.Minute),
+			Model: "a", Result: ResultOK, BodyLen: 730_000, InputTokens: 100_000, TotalTokens: 100_000}
+		if err := s.RecordPassiveUsage(ctx, r, PassiveDedupeHint{Models: []string{"a"}, Near: r.TS}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 模型 b：3 条 4000 毫密度（低密度模型）。
+	for i := 0; i < 3; i++ {
+		r := Request{ID: "b-" + time.Duration(i).String(), TS: base.Add(time.Duration(i) * time.Minute),
+			Model: "b", Result: ResultOK, BodyLen: 400_000, InputTokens: 100_000, TotalTokens: 100_000}
+		if err := s.RecordPassiveUsage(ctx, r, PassiveDedupeHint{Models: []string{"b"}, Near: r.TS}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 模型 c：只有失败行，不出现。
+
+	got, err := s.ModelDensities(ctx, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Model != "a" || got[1].Model != "b" {
+		t.Fatalf("应返回 a、b 两个模型（按名排序）: %+v", got)
+	}
+	if got[0].MilliDensity != 7300 || got[0].MilliMAD != 0 || got[0].Samples != 8 {
+		t.Fatalf("模型 a 读数异常: %+v", got[0])
+	}
+	if got[1].MilliDensity != 4000 || got[1].Samples != 3 {
+		t.Fatalf("模型 b 读数异常: %+v", got[1])
 	}
 }

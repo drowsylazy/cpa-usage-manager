@@ -565,10 +565,13 @@ func (s *Store) RecentOutputTokens(ctx context.Context, model string, limit int)
 	return out, nil
 }
 
-// RecentDensities 返回某模型近期请求的输入密度样本（body_len ÷ 输入 token，
-// 放大为 ×1000 的整数避免浮点），供输入预占学习真实字节/token 密度。
-// 只取执行器路径且宿主/上游报告了输入 token 的成功行（body_len>0 且
-// input_tokens>0）；被动路径不带 body_len，零输入行密度无意义，都被排除。
+// RecentDensities 返回某模型近期请求的输入密度样本（body_len ÷ 完整上下文
+// token，放大为 ×1000 的整数避免浮点），供输入预占学习真实字节/token 密度。
+// 分母用「完整上下文」= input + cache_read + cache_creation（Claude 口径的
+// input 不含缓存读写，不补会把长对话命中缓存后的密度错算成十几倍）；
+// OpenAI/Gemini 的 input 已含缓存命中，三列相加时 cache_read/cache_creation
+// 为 0，同一公式两种口径都成立。只取执行器路径且上游报告了 token 的成功行
+// （body_len>0）；被动路径不带 body_len，零上下文行密度无意义，都被排除。
 func (s *Store) RecentDensities(ctx context.Context, model string, limit int) ([]int64, error) {
 	if limit <= 0 || limit > 2000 {
 		limit = 200
@@ -576,22 +579,23 @@ func (s *Store) RecentDensities(ctx context.Context, model string, limit int) ([
 	out := make([]int64, 0, 64)
 	err := s.Read(ctx, func(q Querier) error {
 		rows, err := q.QueryContext(ctx,
-			`SELECT body_len, input_tokens FROM requests
-			 WHERE model = ? AND result = ? AND body_len > 0 AND input_tokens > 0
+			`SELECT body_len, input_tokens + cache_read_tokens + cache_creation_tokens FROM requests
+			 WHERE model = ? AND result = ? AND body_len > 0
+			   AND input_tokens + cache_read_tokens + cache_creation_tokens > 0
 			 ORDER BY ts DESC LIMIT ?`, model, ResultOK, limit)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var bodyLen, inTok int64
-			if err := rows.Scan(&bodyLen, &inTok); err != nil {
+			var bodyLen, ctxTok int64
+			if err := rows.Scan(&bodyLen, &ctxTok); err != nil {
 				return err
 			}
 			if bodyLen < 1024 {
 				continue // 极短请求体的密度噪声大（包装 JSON 占比过高），不进样本
 			}
-			out = append(out, bodyLen*1000/inTok)
+			out = append(out, bodyLen*1000/ctxTok)
 		}
 		return rows.Err()
 	})
@@ -602,7 +606,77 @@ func (s *Store) RecentDensities(ctx context.Context, model string, limit int) ([
 	return out, nil
 }
 
-// RecentReservation 是最近已完结预占的回顾行（GET /reservations/recent）：
+// ModelDensity 是实时页「估算密度」面板的读数行：某模型近期学习到的
+// 输入密度（中位数 ± MAD，毫单位 ×1000）与样本量。
+type ModelDensity struct {
+	Model        string `json:"model"`
+	MilliDensity int64  `json:"milli_density"` // 中位密度 ×1000（7300 = 7.3 字节/token）
+	MilliMAD     int64  `json:"milli_mad"`     // 绝对中位差 ×1000，0 = 样本完全一致
+	Samples      int64  `json:"samples"`       // 有效样本条数
+}
+
+// ModelDensities 返回全部有密度样本的模型读数（每模型最多取近期 limit 条
+// 样本算中位数，与预占校准同口径），按模型名排序。给实时页展示
+// 「当前学习到的等效密度」，让校准状态可见（哪些模型在学习、值是多少）。
+func (s *Store) ModelDensities(ctx context.Context, limit int) ([]ModelDensity, error) {
+	if limit <= 0 || limit > 2000 {
+		limit = 200
+	}
+	var models []string
+	err := s.Read(ctx, func(q Querier) error {
+		rows, err := q.QueryContext(ctx,
+			`SELECT DISTINCT model FROM requests
+			 WHERE result = ? AND body_len > 0
+			   AND input_tokens + cache_read_tokens + cache_creation_tokens > 0
+			 ORDER BY model`, ResultOK)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var m string
+			if err := rows.Scan(&m); err != nil {
+				return err
+			}
+			models = append(models, m)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ModelDensity, 0, len(models))
+	for _, m := range models {
+		samples, err := s.RecentDensities(ctx, m, limit)
+		if err != nil {
+			return nil, err
+		}
+		n := len(samples)
+		if n == 0 {
+			continue
+		}
+		med := samples[n/2]
+		if n%2 == 0 {
+			med = (samples[n/2-1] + samples[n/2]) / 2
+		}
+		var diffs []int64
+		for _, v := range samples {
+			d := v - med
+			if d < 0 {
+				d = -d
+			}
+			diffs = append(diffs, d)
+		}
+		sort.Slice(diffs, func(i, j int) bool { return diffs[i] < diffs[j] })
+		mad := diffs[len(diffs)/2]
+		if len(diffs)%2 == 0 {
+			mad = (diffs[len(diffs)/2-1] + diffs[len(diffs)/2]) / 2
+		}
+		out = append(out, ModelDensity{Model: m, MilliDensity: med, MilliMAD: mad, Samples: int64(n)})
+	}
+	return out, nil
+}
+
 // 预占估算 vs 实际结算的对照，用于实时页「最近预占」面板。
 type RecentReservation struct {
 	ID              string      `json:"id"`
