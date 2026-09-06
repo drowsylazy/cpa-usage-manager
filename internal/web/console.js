@@ -3312,9 +3312,13 @@ async function loadDensities() {
     const vs = x.milli_density > 0 ? (x.milli_density / 4000 * 100).toFixed(0) : '';
     const rd = x.cache_read_bp > 0 ? (x.cache_read_bp / 100).toFixed(0) + '%' : '—';
     const wr = x.cache_create_bp > 0 ? (x.cache_create_bp / 100).toFixed(0) + '%' : '—';
+    // 组成漂移（agent compact 后摘要替代原始代码）：近期窗口密度已偏离
+    // 历史基准，预占改跟近期密度，约 20 条新流量完成接管。
+    const drift = x.drifted
+      ? ' <span class="pill warn" title="近期请求体构成与历史明显不同（如 compact 后摘要替代原始代码），已改按近期密度折算">已漂移</span>' : '';
     return '<tr>'
-      + '<td class="cell-mono cell-clip" style="max-width:260px" title="' + esc(x.model || '') + '">' + esc(x.model || '-') + '</td>'
-      + '<td class="num" title="请求体字节 ÷ 完整输入上下文 token，近期成功请求的中位数">' + d + ' B/token</td>'
+      + '<td class="cell-mono cell-clip" style="max-width:260px" title="' + esc(x.model || '') + '">' + esc(x.model || '-') + drift + '</td>'
+      + '<td class="num" title="请求体字节 ÷ 完整输入上下文 token，近期成功请求的中位数（漂移时取近期窗口）">' + d + ' B/token</td>'
       + '<td class="num" title="绝对中位差：样本密度的离散程度，越小越稳定">± ' + mad + '</td>'
       + '<td class="num" title="近期 token 加权：缓存读占完整输入上下文的份额（token 计）">' + rd + '</td>'
       + '<td class="num" title="近期 token 加权：缓存写占完整输入上下文的份额（token 计）">' + wr + '</td>'

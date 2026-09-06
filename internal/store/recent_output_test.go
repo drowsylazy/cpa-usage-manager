@@ -96,10 +96,109 @@ func TestRecentDensities(t *testing.T) {
 	if len(got) != 4 {
 		t.Fatalf("应只返回 4 条有效密度样本，得到 %d: %v", len(got), got)
 	}
-	for i, want := range []int64{7000, 7300, 7300, 8000} {
+	// 新样本在前（时间倒序）：d-3(7000) → d-claude(7300) → d-2(8000) → d-1(7300)。
+	for i, want := range []int64{7000, 7300, 8000, 7300} {
 		if got[i] != want {
-			t.Fatalf("密度样本[%d] = %d want %d（应升序）", i, got[i], want)
+			t.Fatalf("密度样本[%d] = %d want %d（应新样本在前）", i, got[i], want)
 		}
+	}
+}
+
+// TestEstimateDensityDrift 锁漂移适应：全窗 7300 毫密度的模型在 compact
+// 后（近期 ~10400 毫密度，实测占比 100%→50% 场景的反推值），
+// 全窗中位数要新样本过半才能拉动；近期窗口中位数漂出带即改跟，
+// 10 条新流量先部分恢复（窗口半新半旧）、20 条完全接管。
+func TestEstimateDensityDrift(t *testing.T) {
+	// 30 条旧构成 7300 + 10 条新构成 10430（新样本在前）。
+	var samples []int64
+	for i := 0; i < 10; i++ {
+		samples = append(samples, 10430)
+	}
+	for i := 0; i < 30; i++ {
+		samples = append(samples, 7300)
+	}
+	est, ok := EstimateDensity(samples)
+	if !ok {
+		t.Fatal("样本量足够应可用")
+	}
+	if !est.Drifted {
+		t.Fatalf("近期密度明显漂出全窗带应判定漂移: %+v", est)
+	}
+	// 近期窗口 20 条 = 10 新 + 10 旧 → 中位数 (7300+10430)/2 = 8865，
+	// 比全窗 7300 已向新构成移近一半（对应用户实测 70% → ~85% 占比）。
+	if est.Milli != 8865 {
+		t.Fatalf("漂移后应改跟近期窗口中位数: got %d want 8865", est.Milli)
+	}
+	if est.Samples != 40 {
+		t.Fatalf("样本数应为全窗 40: %d", est.Samples)
+	}
+
+	// 20 条新流量（窗口完全换血）→ 完全接管新密度。
+	samples = samples[:0]
+	for i := 0; i < 20; i++ {
+		samples = append(samples, 10430)
+	}
+	for i := 0; i < 20; i++ {
+		samples = append(samples, 7300)
+	}
+	est, ok = EstimateDensity(samples)
+	if !ok || !est.Drifted || est.Milli != 10430 {
+		t.Fatalf("窗口完全换血应完全接管: %+v ok=%v", est, ok)
+	}
+
+	// 未漂移：近期窗口与全窗一致 → 全窗中位数、不标漂移。
+	samples = nil
+	for i := 0; i < 20; i++ {
+		samples = append(samples, 7300)
+	}
+	for i := 0; i < 20; i++ {
+		samples = append(samples, 7300)
+	}
+	est, ok = EstimateDensity(samples)
+	if !ok || est.Drifted || est.Milli != 7300 {
+		t.Fatalf("一致样本不应漂移: %+v ok=%v", est, ok)
+	}
+
+	// 漂移幅度在带内（15%）→ 不切换：近期 8000 vs 全窗 7300 = +9.6%。
+	samples = nil
+	for i := 0; i < 20; i++ {
+		samples = append(samples, 8000)
+	}
+	for i := 0; i < 20; i++ {
+		samples = append(samples, 7300)
+	}
+	est, ok = EstimateDensity(samples)
+	if !ok || est.Drifted {
+		t.Fatalf("带内偏移不应判漂移: %+v ok=%v", est, ok)
+	}
+
+	// 样本不足窗口（n <= driftWindow）没有「基准 vs 近期」区分度，
+	// 直接全窗中位数、不标漂移。
+	est, ok = EstimateDensity([]int64{10430, 10430, 7300, 7300, 7300, 7300, 7300, 7300, 7300, 7300})
+	if !ok || est.Drifted {
+		t.Fatalf("n<=driftWindow 不做漂移探测: %+v ok=%v", est, ok)
+	}
+
+	// 偶发异质请求不触发误切换：近期窗口 20 条里只有 5 条漂移值，
+	// 中位数仍是 7300。
+	samples = nil
+	for i := 0; i < 5; i++ {
+		samples = append(samples, 15000)
+	}
+	for i := 0; i < 15; i++ {
+		samples = append(samples, 7300)
+	}
+	for i := 0; i < 20; i++ {
+		samples = append(samples, 7300)
+	}
+	est, ok = EstimateDensity(samples)
+	if !ok || est.Drifted {
+		t.Fatalf("少数异质请求不应触发漂移（近期中位数仍是 7300）: %+v ok=%v", est, ok)
+	}
+
+	// 样本 <3 条不可用。
+	if _, ok := EstimateDensity([]int64{7300, 7300}); ok {
+		t.Fatal("样本 <3 应不可用")
 	}
 }
 

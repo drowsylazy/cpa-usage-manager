@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -336,13 +335,15 @@ type outputCalEntry struct {
 	at  time.Time
 }
 
-// densityCalEntry 是 denCal 缓存桶：milliDensity 是该模型近期
-// body_len÷input_tokens 中位数 ×1000（7.3 字节/token 存 7300）；
-// mad 是样本绝对中位差（同为毫单位），供折算值做离散度锚定的接受带；
-// ok=false 表示无有效样本，输入估算回退固定混合密度。
+// densityCalEntry 是 denCal 缓存桶：milliDensity 是该模型近期采纳的
+// body_len÷input_tokens 密度 ×1000（7.3 字节/token 存 7300）；
+// mad 是全窗样本绝对中位差（同为毫单位）；ok=false 表示无有效样本，
+// 输入估算回退固定混合密度。drifted 标记近期窗口判定组成突变、
+// 已改跟近期密度（agent compact 场景）。
 type densityCalEntry struct {
 	milliDensity int64
 	mad          int64
+	drifted      bool
 	ok           bool
 	at           time.Time
 }
@@ -486,28 +487,24 @@ func (s *Service) buildPlanFromMeta(ctx context.Context, model string, meta Requ
 	return plan, nil
 }
 
-// calibratedInput 输入预占的密度学习：按该模型近期 body_len÷input_tokens
-// 的中位数把当前请求体折算成 token。fallback 是固定混合密度的估算值，
-// 无样本（新模型/历史行无 body_len）时原样返回。
+// calibratedInput 输入预占的密度学习：按该模型近期采纳的
+// body_len÷input_tokens 密度把当前请求体折算成 token。fallback 是固定
+// 混合密度的估算值，无样本（新模型/历史行无 body_len）时原样返回。
 //
-// 接受判定分两层：
-//   - 离散度锚定的相对带：折算密度须落在样本 中位数 ± max(3×MAD, 15%)。
-//     带宽锚在样本自身的稳定性上（样本越一致越敢信），而不是锚在
-//     「混合密度接近真相」的假设上——学习本身就是为了发现它不接近
-//     （实测 glm-5.3 密度 7.3 字节/token，对混合估算的 /3.93 只有 0.54×，
-//     旧版锚在 fallback 的 [0.5×,1.5×] 带对这类场景只剩 8% 余量，
-//     内容再密一点就被静默拒绝、永远回退高估的固定估算）。
-//   - 极宽的绝对 sanity 带：折算值须在 fallback 的 [0.2×, 5×] 内。这只
-//     防「样本与当前请求体构成完全无关」的单位级错误（如上游谎报 token、
-//     请求体突变成 base64 图片密集型），不再拦截正常的模型间 tokenizer
-//     密度差异。
-//
-// 两层任一拒绝都回退固定估算兜底。
+// 预测时无从得知当前请求的真实密度（token 要结算才有），所以这里没有
+// 「逐请求接受带」——旧版按折算值反推等效密度再比对样本带是同义反复
+// （反推值恒等于样本密度本身），从不拒绝任何请求，属死代码，已删。
+// 组成突变（agent compact 后摘要散文替代原始代码，密度从 ~7.3 漂到
+// ~10 字节/token）的适应在**学习侧**完成：EstimateDensity 的近期窗口
+// 漂移探测，约 10 条新流量即改跟新密度。这里只保留极宽的绝对 sanity
+// 带 [0.2×, 5×]（锚在混合密度估算上），拦「样本与当前请求体构成
+// 完全无关」的单位级错误（如上游谎报 token、请求体突变成 base64
+// 图片密集型）。
 func (s *Service) calibratedInput(model string, bodyLen, fallback, maxEstimate int64) int64 {
 	if bodyLen <= 0 {
 		return fallback
 	}
-	milli, mad, ok := s.densityMedianCached(model)
+	milli, _, ok := s.densityMedianCached(model)
 	if !ok {
 		return fallback
 	}
@@ -516,17 +513,7 @@ func (s *Service) calibratedInput(model string, bodyLen, fallback, maxEstimate i
 	if in <= 0 {
 		in = 1
 	}
-	// 相对带：当前请求的等效密度 = bodyLen×1000/in，与样本中位数的偏差
-	// 须在 max(3×MAD, 15%×中位数) 内。MAD=0（样本几乎完全一致）时由
-	// 15% 下限兜底。
-	lo, hi := milli-max(mad*3, milli*15/100), milli+max(mad*3, milli*15/100)
-	if lo < 0 {
-		lo = 0
-	}
-	if effMilli := bodyLen * 1000 / in; effMilli < lo || effMilli > hi {
-		return fallback
-	}
-	// 绝对 sanity 带：只拦构成级错误，不拦模型间密度差异。
+	// 绝对 sanity 带：只拦构成级错误，不拦模型间密度差异与正常漂移。
 	if aLo, aHi := fallback/5, fallback*5; aHi >= fallback && (in < aLo || in > aHi) {
 		return fallback
 	}
@@ -536,9 +523,10 @@ func (s *Service) calibratedInput(model string, bodyLen, fallback, maxEstimate i
 	return in
 }
 
-// densityMedianCached 返回模型近期输入密度中位数（×1000 整数）、样本
-// 绝对中位差 MAD（×1000）与是否可用，60s 分桶缓存与输出校准同款。
-// 样本 <3 条视为不可用。
+// densityMedianCached 返回模型近期采纳的输入密度（×1000 整数）、全窗
+// MAD 与是否可用，60s 分桶缓存与输出校准同款。样本 <3 条视为不可用。
+// 采纳值含漂移探测（EstimateDensity）：近期窗口中位数漂出全窗带时
+// 改跟近期，compact 类组成突变后约 10 条新流量即恢复。
 func (s *Service) densityMedianCached(model string) (int64, int64, bool) {
 	now := time.Now()
 	s.denCalMu.Lock()
@@ -549,41 +537,16 @@ func (s *Service) densityMedianCached(model string) (int64, int64, bool) {
 		}
 	}
 	s.denCalMu.Unlock()
-	store := func(med, mad int64, ok bool) {
-		s.denCalMu.Lock()
-		if s.denCal == nil {
-			s.denCal = make(map[string]densityCalEntry)
-		}
-		s.denCal[model] = densityCalEntry{milliDensity: med, mad: mad, ok: ok, at: now}
-		s.denCalMu.Unlock()
-	}
 	// 查询失败（库瞬时忙）时样本为空，按「样本不足」回退混合密度。
 	samples, _ := s.st.RecentDensities(context.Background(), model, densityCalSamples)
-	n := len(samples)
-	if n < 3 {
-		store(0, 0, false)
-		return 0, 0, false
+	est, ok := store.EstimateDensity(samples)
+	s.denCalMu.Lock()
+	if s.denCal == nil {
+		s.denCal = make(map[string]densityCalEntry)
 	}
-	med := samples[n/2]
-	if n%2 == 0 {
-		med = (samples[n/2-1] + samples[n/2]) / 2
-	}
-	// MAD：|样本-中位数| 的中位数——对离群样本（偶发异常行）远比标准差稳健。
-	var diffs []int64
-	for _, v := range samples {
-		d := v - med
-		if d < 0 {
-			d = -d
-		}
-		diffs = append(diffs, d)
-	}
-	sort.Slice(diffs, func(i, j int) bool { return diffs[i] < diffs[j] })
-	mad := diffs[len(diffs)/2]
-	if len(diffs)%2 == 0 {
-		mad = (diffs[len(diffs)/2-1] + diffs[len(diffs)/2]) / 2
-	}
-	store(med, mad, true)
-	return med, mad, true
+	s.denCal[model] = densityCalEntry{milliDensity: est.Milli, mad: est.MAD, drifted: est.Drifted, ok: ok, at: now}
+	s.denCalMu.Unlock()
+	return est.Milli, est.MAD, ok
 }
 
 // cacheSharesCached 返回模型近期缓存读/写占完整上下文的份额（万分比，

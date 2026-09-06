@@ -572,6 +572,9 @@ func (s *Store) RecentOutputTokens(ctx context.Context, model string, limit int)
 // OpenAI/Gemini 的 input 已含缓存命中，三列相加时 cache_read/cache_creation
 // 为 0，同一公式两种口径都成立。只取执行器路径且上游报告了 token 的成功行
 // （body_len>0）；被动路径不带 body_len，零上下文行密度无意义，都被排除。
+//
+// 返回**新样本在前**（时间倒序）：调用方要区分「全窗基准」与「近期窗口」
+// （漂移探测），升序返回会把两者搅在一起。需要升序的调用方自行排序。
 func (s *Store) RecentDensities(ctx context.Context, model string, limit int) ([]int64, error) {
 	if limit <= 0 || limit > 2000 {
 		limit = 200
@@ -599,11 +602,80 @@ func (s *Store) RecentDensities(ctx context.Context, model string, limit int) ([
 		}
 		return rows.Err()
 	})
-	if err != nil {
-		return nil, err
+	return out, err
+}
+
+// DensityEstimate 是密度学习的点估计：milli 为采纳的密度（×1000），
+// Drifted 标记近期窗口判定组成突变、已改跟近期（如 agent compact 后
+// 摘要散文替代原始代码，真实密度从 ~7.3 漂到 ~10 字节/token）。
+type DensityEstimate struct {
+	Milli   int64
+	MAD     int64
+	Drifted bool
+	Samples int
+}
+
+// driftWindow 是漂移探测的近期窗口样本数：取全窗最新 20 条。太大跟不动
+// compact 后的突变（占比从 100% 掉到 50% 再慢慢爬回），太小被偶发异质
+// 请求（一次性贴图等）带偏。
+const driftWindow = 20
+
+// EstimateDensity 从样本（新样本在前）计算密度点估计。基准锚在**漂移
+// 窗口之外**的较旧样本（中位数 + max(MAD, 15%) 带）：全窗 MAD 在组成
+// 突变期会被新旧混合撑大，锚它会让带自解除、永远检不出漂移。近期窗口
+// （最新 driftWindow 条）中位数漂出基准带时判定组成突变、改跟近期窗口
+// 中位数——10 条新流量先部分恢复（窗口半新半旧），窗口换血完毕即完全
+// 接管，恢复速度从「全窗过半」缩短一个量级。样本 <3 条不可用；
+// n <= driftWindow 时没有「基准 vs 近期」区分度，直接全窗中位数。
+func EstimateDensity(samples []int64) (DensityEstimate, bool) {
+	n := len(samples)
+	if n < 3 {
+		return DensityEstimate{}, false
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out, nil
+	asc := append([]int64(nil), samples...)
+	sort.Slice(asc, func(i, j int) bool { return asc[i] < asc[j] })
+	med := medianOf(asc)
+	e := DensityEstimate{Milli: med, MAD: madOf(asc, med), Samples: n}
+	if n <= driftWindow {
+		return e, true
+	}
+	recent := samples[:driftWindow] // 新样本在前
+	older := samples[driftWindow:]
+	recentAsc := append([]int64(nil), recent...)
+	sort.Slice(recentAsc, func(i, j int) bool { return recentAsc[i] < recentAsc[j] })
+	olderAsc := append([]int64(nil), older...)
+	sort.Slice(olderAsc, func(i, j int) bool { return olderAsc[i] < olderAsc[j] })
+	base := medianOf(olderAsc)
+	half := max(madOf(olderAsc, base), base*15/100)
+	rMed := medianOf(recentAsc)
+	if rMed > base+half || rMed < base-half {
+		e.Milli = rMed
+		e.Drifted = true
+	}
+	return e, true
+}
+
+// medianOf 返回升序切片的中位数（偶数取中间两均值）。
+func medianOf(asc []int64) int64 {
+	n := len(asc)
+	if n%2 == 1 {
+		return asc[n/2]
+	}
+	return (asc[n/2-1] + asc[n/2]) / 2
+}
+
+// madOf 返回 |样本-中位数| 的中位数（升序 diffs）。
+func madOf(asc []int64, med int64) int64 {
+	diffs := make([]int64, len(asc))
+	for i, v := range asc {
+		d := v - med
+		if d < 0 {
+			d = -d
+		}
+		diffs[i] = d
+	}
+	sort.Slice(diffs, func(i, j int) bool { return diffs[i] < diffs[j] })
+	return medianOf(diffs)
 }
 
 // CacheShares 是某模型近期请求的缓存构成读数：缓存读/缓存写占完整输入
@@ -665,6 +737,8 @@ type ModelDensity struct {
 	MilliDensity int64  `json:"milli_density"` // 中位密度 ×1000（7300 = 7.3 字节/token）
 	MilliMAD     int64  `json:"milli_mad"`     // 绝对中位差 ×1000，0 = 样本完全一致
 	Samples      int64  `json:"samples"`       // 有效样本条数
+	// Drifted 标记近期窗口判定组成突变、密度已改跟近期（agent compact 场景）。
+	Drifted bool `json:"drifted,omitempty"`
 	// CacheReadBP / CacheCreateBP 是缓存读/写占完整上下文的份额（万分比），
 	// 供「金额拆档」读数：预占输入金额正按此份额拆到缓存档计价。
 	CacheReadBP   int64 `json:"cache_read_bp,omitempty"`
@@ -708,28 +782,14 @@ func (s *Store) ModelDensities(ctx context.Context, limit int) ([]ModelDensity, 
 		if err != nil {
 			return nil, err
 		}
-		n := len(samples)
-		if n == 0 {
+		if len(samples) == 0 {
 			continue
 		}
-		med := samples[n/2]
-		if n%2 == 0 {
-			med = (samples[n/2-1] + samples[n/2]) / 2
+		est, ok := EstimateDensity(samples)
+		if !ok {
+			continue
 		}
-		var diffs []int64
-		for _, v := range samples {
-			d := v - med
-			if d < 0 {
-				d = -d
-			}
-			diffs = append(diffs, d)
-		}
-		sort.Slice(diffs, func(i, j int) bool { return diffs[i] < diffs[j] })
-		mad := diffs[len(diffs)/2]
-		if len(diffs)%2 == 0 {
-			mad = (diffs[len(diffs)/2-1] + diffs[len(diffs)/2]) / 2
-		}
-		row := ModelDensity{Model: m, MilliDensity: med, MilliMAD: mad, Samples: int64(n)}
+		row := ModelDensity{Model: m, MilliDensity: est.Milli, MilliMAD: est.MAD, Samples: int64(est.Samples), Drifted: est.Drifted}
 		// 缓存构成与密度读数同面板展示，顺便取齐；查询失败不致整个接口失败。
 		if cs, ok, err := s.RecentCacheShares(ctx, m, limit); err == nil && ok {
 			row.CacheReadBP, row.CacheCreateBP = cs.ReadBP, cs.CreateBP

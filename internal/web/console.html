@@ -352,7 +352,7 @@
         <tbody id="densities-rows"></tbody>
       </table>
     </div>
-    <p class="note tbl-foot" id="densities-note">密度 = 近期成功请求的 请求体字节 ÷ 完整输入上下文 token（含缓存读/写）的中位数；缓存占比用于预占金额拆档（输入按 新鲜/缓存读/缓存写 三档分摊）；样本来自执行器路径（历史行与被动统计不带请求体长度）。</p>
+    <p class="note tbl-foot" id="densities-note">密度 = 近期成功请求的 请求体字节 ÷ 完整输入上下文 token（含缓存读/写）的中位数；「已漂移」表示近期请求体构成突变（如 agent compact），预占已改按近期密度折算；缓存占比用于预占金额拆档；样本来自执行器路径（历史行与被动统计不带请求体长度）。</p>
   </article>
 </section>
 
