@@ -3280,11 +3280,13 @@ async function loadRecent() {
       + '<td class="num">' + fmtTok(x.reserved_tokens || 0) + '</td>'
       + '<td class="num">' + (x.status === 'settled' && x.settled_tokens > 0 ? fmtTok(x.settled_tokens) : '—') + '</td>'
       + '<td class="ctr">' + ratio + '</td>'
+      + '<td class="num">' + (x.held_micro_usd > 0 ? fmtCur(x.held_micro_usd) : '—') + '</td>'
+      + '<td class="num">' + (x.status === 'settled' && x.settled_micro_usd > 0 ? fmtCur(x.settled_micro_usd) : '—') + '</td>'
       + '<td class="num" title="' + esc(x.created_at || '') + ' 创建">' + (x.age_ms > 0 ? fmtDur(Math.round(x.age_ms / 1000)) : '-') + '</td>'
       + '</tr>';
   }).join('');
   note.textContent = items.length
-    ? '实际占比 = 实际消耗 ÷ 预估 Token。70%–130% 为健康区间（双向）；低于区间说明预估虚高，高于区间说明预估不足。'
+    ? '实际占比 = 实际消耗 ÷ 预估 Token。70%–130% 为健康区间（双向）；金额列为预占 vs 实扣对照（缓存拆档让预占金额贴近实扣）。'
     : '暂无已完结的预占记录（随保留期清理）。';
 }
 $('held-refresh').addEventListener('click', () => { loadRecent().catch(() => {}); });
@@ -3292,6 +3294,7 @@ $('held-refresh').addEventListener('click', () => { loadRecent().catch(() => {})
 // loadDensities 拉取并渲染「估算密度」：各模型学习到的输入密度读数。
 // 毫密度 ×1000 → 显示为 X.X 字节/token；口径列给出对照（固定混合密度
 // 约为 ASCII 4 / 中文 3 字节每 token），让「学习密度 vs 直觉密度」可读。
+// 缓存读/写占比是金额拆档口径：预占输入金额按此份额拆到三档计价。
 async function loadDensities() {
   const rows = $('densities-rows'), sub = $('densities-sub');
   let items;
@@ -3307,16 +3310,20 @@ async function loadDensities() {
     const mad = (x.milli_mad / 1000).toFixed(1);
     // 与混合密度直觉的对照：4 字节/token 是英文/代码的常识值。
     const vs = x.milli_density > 0 ? (x.milli_density / 4000 * 100).toFixed(0) : '';
+    const rd = x.cache_read_bp > 0 ? (x.cache_read_bp / 100).toFixed(0) + '%' : '—';
+    const wr = x.cache_create_bp > 0 ? (x.cache_create_bp / 100).toFixed(0) + '%' : '—';
     return '<tr>'
       + '<td class="cell-mono cell-clip" style="max-width:260px" title="' + esc(x.model || '') + '">' + esc(x.model || '-') + '</td>'
       + '<td class="num" title="请求体字节 ÷ 完整输入上下文 token，近期成功请求的中位数">' + d + ' B/token</td>'
       + '<td class="num" title="绝对中位差：样本密度的离散程度，越小越稳定">± ' + mad + '</td>'
+      + '<td class="num" title="近期 token 加权：缓存读占完整输入上下文的份额（token 计）">' + rd + '</td>'
+      + '<td class="num" title="近期 token 加权：缓存写占完整输入上下文的份额（token 计）">' + wr + '</td>'
       + '<td class="num">' + (x.samples || 0) + '</td>'
       + '<td title="学习密度相对 4 字节/token 常识值的比值：100% 即与常识一致，低于 100% 说明该模型 tokenizer 更省字节">' + vs + '% of 4B</td>'
       + '</tr>';
   }).join('');
   sub.textContent = items.length
-    ? '各模型输入预占学习到的等效密度（请求体字节 ÷ 输入 token）：折算即按此密度进行，MAD 越小样本越一致'
+    ? '各模型输入预占学习到的等效密度与缓存构成：密度决定 token 折算，缓存占比决定金额拆档'
     : '暂无密度样本：新流量跑过几条成功请求后自动学习（历史行不带请求体长度）';
 }
 $('held-refresh').addEventListener('click', () => { loadDensities().catch(() => {}); });

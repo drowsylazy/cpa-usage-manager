@@ -292,6 +292,10 @@ func main() {
 				cost = 0
 			}
 			costTotal += cost
+			// body_len 供密度学习：按 6–8 字节/token 的拟真密度反推，
+			// 让「估算密度」面板有可学习的样本（失败行也带——密度查询
+			// 只取 result=ok，多写无害且与执行器路径「先落库后知结果」一致）。
+			bodyLen := int64(float64(in+cacheR+cacheW) * (6 + rng.Float64()*2))
 
 			r := store.Request{
 				ID:       fmt.Sprintf("seed-%d-%d-%d", now.UnixNano(), d, i),
@@ -306,6 +310,7 @@ func main() {
 				InputTokens: in, OutputTokens: out, ReasoningTokens: reasoning,
 				CachedTokens: cached, CacheReadTokens: cacheR, CacheCreationTokens: cacheW,
 				TotalTokens: total,
+				BodyLen:     bodyLen,
 				LatencyMS:   latency, TTFTMS: ttft, GenerationMS: gen, TPSMilli: tpsMilli,
 				CostMicroUSD: cost, Priced: priced,
 			}
@@ -390,11 +395,11 @@ func main() {
 	// 6 条已完结（4 settled 覆盖占比健康/虚高/不足三档 + 2 released），
 	// settled 的 tokens 是实际消耗（估算的 40%–145% 不等），按完结时刻倒序。
 	for i, fin := range []struct {
-		id, model                              string
-		held, paid                             money.Micro
-		tokens, actual                         int64
-		ok                                     bool
-		ago                                    time.Duration
+		id, model      string
+		held, paid     money.Micro
+		tokens, actual int64
+		ok             bool
+		ago            time.Duration
 	}{
 		{"seed-rec-1", "agentrouter/glm-5.3", 2_460_000, 138_469, 588_000, 225_400, true, 90 * time.Second},
 		{"seed-rec-2", "agentrouter/glm-5.3", 2_460_000, 5_947, 587_900, 512_600, true, 4 * time.Minute},

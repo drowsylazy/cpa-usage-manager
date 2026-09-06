@@ -151,3 +151,141 @@ func TestSettleNoResponseZeroCost(t *testing.T) {
 		t.Fatalf("不存在的预占应报 NotFound: %v", err)
 	}
 }
+
+// seedCacheHistory 为模型插入带缓存 token 的成功行（Claude 口径：
+// input 不含 cache_read/cache_creation），供缓存份额学习采样。
+func seedCacheHistory(t *testing.T, st *store.Store, model string, rows [][3]int64) {
+	t.Helper()
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Duration(len(rows)+1) * time.Minute)
+	for i, c := range rows {
+		r := store.Request{
+			ID: model + "-cache-" + time.Duration(i).String(), TS: base.Add(time.Duration(i) * time.Minute),
+			Model: model, Result: store.ResultOK,
+			InputTokens: c[0], CacheReadTokens: c[1], CacheCreationTokens: c[2],
+			TotalTokens: c[0] + c[1] + c[2],
+		}
+		if err := st.RecordPassiveUsage(ctx, r, store.PassiveDedupeHint{Models: []string{model}, Near: r.TS}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestReserveCacheTieredCost 锁金额拆档：模型近期流量带缓存构成时，
+// 输入侧预占按学习份额拆成 新鲜×输入价 + 读×读价 + 写×写价 三档，
+// 而非最贵档全额；无样本模型保持最贵档兜底。
+func TestReserveCacheTieredCost(t *testing.T) {
+	s, st := testService(t)
+	ctx := context.Background()
+	// 输入 $3 / 输出 $12 / 读 $0.6 / 写 $3.75（每 M，四档齐备）。
+	if _, err := st.UpsertPricingRule(ctx, store.PricingRule{
+		MatchKind: store.MatchExact, Pattern: "gpt-cache", Priority: 10, Enabled: true,
+		PriceInput: 3_000_000, PriceOutput: 12_000_000, PriceCacheRead: 600_000, PriceCacheCreation: 3_750_000,
+		Source: store.PricingSourceManual,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	issued, err := s.IssueKey(ctx, IssueRequest{AllowedModels: []string{"gpt-*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 历史：每条 20000 上下文，其中读 16000、写 2000、新鲜 2000 →
+	// 读份额 80%、写份额 10%（万分比 8000/1000）。
+	seedCacheHistory(t, st, "gpt-cache", [][3]int64{
+		{2000, 16000, 2000}, {2000, 16000, 2000}, {2000, 16000, 2000},
+	})
+
+	res, err := s.Reserve(ctx, ReservationRequest{
+		KeyID: issued.KID, Model: "gpt-cache",
+		EstimatedTokens: 200_000, EstimatedInput: 190_000, EstimatedOutput: 10_000,
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 拆档：190K 输入 → 新鲜 19000×$3 + 读 152000×$0.6 + 写 19000×$3.75
+	// = 57000 + 91200 + 71250 = 219450；输出 10K×$12 = 120000。合计 339450。
+	// 对照：不拆档的最贵口径是 190K×$3.75 = 712500，拆档后金额贴近真实构成。
+	if res.HeldMicroUSD != 339_450 {
+		t.Fatalf("缓存拆档预占金额异常: got %d want 339450", res.HeldMicroUSD)
+	}
+
+	// 无样本模型回退最贵档兜底：输入侧 max(3, 0.6, 3.75)=3.75。
+	tieredPricingRule(t, s, "gpt-nocache")
+	fallback, err := s.Reserve(ctx, ReservationRequest{
+		KeyID: issued.KID, Model: "gpt-nocache", // gpt-nocache 无历史
+		EstimatedTokens: 200_000, EstimatedInput: 190_000, EstimatedOutput: 10_000,
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// gpt-nocache 规则四档：输入 $3 / 输出 $12 / 读 $0.6 / 写 $0 → 最贵 $3。
+	if fallback.HeldMicroUSD != 190_000*3_000_000/1_000_000+10_000*12_000_000/1_000_000 {
+		t.Fatalf("无样本应回退输入侧最贵档: got %d", fallback.HeldMicroUSD)
+	}
+
+	// 样本不足（<3 条）同样回退最贵档。
+	if _, err := st.UpsertPricingRule(ctx, store.PricingRule{
+		MatchKind: store.MatchExact, Pattern: "gpt-thin", Priority: 10, Enabled: true,
+		PriceInput: 3_000_000, PriceOutput: 12_000_000, PriceCacheRead: 600_000, PriceCacheCreation: 3_750_000,
+		Source: store.PricingSourceManual,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seedCacheHistory(t, st, "gpt-thin", [][3]int64{{2000, 16000, 2000}})
+	thin, err := s.Reserve(ctx, ReservationRequest{
+		KeyID: issued.KID, Model: "gpt-thin",
+		EstimatedTokens: 200_000, EstimatedInput: 190_000, EstimatedOutput: 10_000,
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// gpt-thin 规则含写价 3.75：最贵档 = 190K×3.75 + 10K×12 = 832500。
+	if thin.HeldMicroUSD != 190_000*3_750_000/1_000_000+10_000*12_000_000/1_000_000 {
+		t.Fatalf("样本不足应回退输入侧最贵档: got %d want 832500", thin.HeldMicroUSD)
+	}
+}
+
+// TestReserveCNYConversion 锁预占侧的 CNY 折算：CNY 规则四档价以
+// micro-CNY 存储，预占金额必须与结算同口径按当前汇率折算成 micro-USD
+// （此前预占侧漏折算，CNY 价格被当 USD 数值直接扣，虚占约汇率倍数）。
+func TestReserveCNYConversion(t *testing.T) {
+	s, st := testService(t)
+	ctx := context.Background()
+	if _, err := st.UpsertPricingRule(ctx, store.PricingRule{
+		MatchKind: store.MatchExact, Pattern: "cny-model", Priority: 10, Enabled: true,
+		// ¥3/M 输入、¥12/M 输出、¥0.6/M 缓存读（micro-CNY）。
+		PriceInput: 3_000_000, PriceOutput: 12_000_000, PriceCacheRead: 600_000,
+		Currency: store.PricingCurrencyCNY, Source: store.PricingSourceManual,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	issued, err := s.IssueKey(ctx, IssueRequest{AllowedModels: []string{"cny-*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 别名模式 cny-model 需允许该模型名——直接用模式名当模型名。
+	res, err := s.Reserve(ctx, ReservationRequest{
+		KeyID: issued.KID, Model: "cny-model",
+		EstimatedTokens: 200_000, EstimatedInput: 190_000, EstimatedOutput: 10_000,
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 无缓存样本 → 输入侧最贵档 ¥3/M × 190K + 输出 ¥12/M × 10K = ¥690 CNY，
+	// 按当前实时汇率 ceil 折算（测试机可能连上真实汇率源或走兜底 7.20）。
+	rate := s.ExchangeRate(ctx).USDToCNY
+	if !rate.Valid() {
+		t.Fatalf("汇率应有效: %v", rate)
+	}
+	native := money.Micro(190_000*3_000_000/1_000_000 + 10_000*12_000_000/1_000_000)
+	want := (int64(native)*1_000_000 + int64(rate) - 1) / int64(rate)
+	if int64(res.HeldMicroUSD) != want {
+		t.Fatalf("CNY 预占应按当前汇率折算: got %d want %d（native=%d rate=%v）",
+			res.HeldMicroUSD, want, native, rate)
+	}
+}

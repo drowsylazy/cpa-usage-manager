@@ -332,7 +332,7 @@
       <table class="data" id="recent-table">
         <thead><tr>
           <th>完结时间</th><th>密钥</th><th>模型</th><th>状态</th>
-          <th class="num">预估 Token</th><th class="num">实际消耗</th><th class="ctr">实际占比</th><th class="num">耗时</th>
+          <th class="num">预估 Token</th><th class="num">实际消耗</th><th class="ctr">实际占比</th><th class="num">预占金额</th><th class="num">实扣金额</th><th class="num">耗时</th>
         </tr></thead>
         <tbody id="recent-rows"></tbody>
       </table>
@@ -347,12 +347,12 @@
     <div class="table-wrap">
       <table class="data" id="densities-table">
         <thead><tr>
-          <th>模型</th><th class="num">等效密度</th><th class="num">离散度 (±MAD)</th><th class="num">样本数</th><th>口径</th>
+          <th>模型</th><th class="num">等效密度</th><th class="num">离散度 (±MAD)</th><th class="num">缓存读占比</th><th class="num">缓存写占比</th><th class="num">样本数</th><th>口径</th>
         </tr></thead>
         <tbody id="densities-rows"></tbody>
       </table>
     </div>
-    <p class="note tbl-foot" id="densities-note">密度 = 近期成功请求的 请求体字节 ÷ 完整输入上下文 token（含缓存读/写）的中位数；样本来自执行器路径（历史行与被动统计不带请求体长度）。</p>
+    <p class="note tbl-foot" id="densities-note">密度 = 近期成功请求的 请求体字节 ÷ 完整输入上下文 token（含缓存读/写）的中位数；缓存占比用于预占金额拆档（输入按 新鲜/缓存读/缓存写 三档分摊）；样本来自执行器路径（历史行与被动统计不带请求体长度）。</p>
   </article>
 </section>
 

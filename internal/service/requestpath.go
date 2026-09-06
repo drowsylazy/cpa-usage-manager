@@ -315,13 +315,17 @@ func (s *Service) BuildReservePlanFromMeta(ctx context.Context, model string, me
 // ---------- 输出预占的历史校准 ----------
 
 // outputCalTTL / outputCalSamples 是输出 P95 校准的缓存窗口与样本量；
-// densityCalTTL / densityCalSamples 是输入密度学习的同款参数。
+// densityCalTTL / densityCalSamples 是输入密度学习的同款参数；
+// shareCalTTL / shareCalSamples 是缓存份额学习（金额拆档）的同款参数。
 const (
 	outputCalTTL     = 60 * time.Second
 	outputCalSamples = 500
 
 	densityCalTTL     = 60 * time.Second
 	densityCalSamples = 200
+
+	shareCalTTL     = 60 * time.Second
+	shareCalSamples = 200
 )
 
 // outputCalEntry 是 outCal 缓存桶：p95 为加权分位值，ok=false 表示
@@ -341,6 +345,16 @@ type densityCalEntry struct {
 	mad          int64
 	ok           bool
 	at           time.Time
+}
+
+// cacheShareCalEntry 是 shareCal 缓存桶：readBP/createBP 是该模型近期
+// 缓存读/写占完整上下文的份额（万分比，token 加权），供预占金额拆档；
+// ok=false 表示无有效样本，金额回退「输入侧最贵档」的保守口径。
+type cacheShareCalEntry struct {
+	readBP   int64
+	createBP int64
+	ok       bool
+	at       time.Time
 }
 
 // calibratedOutput 输出预占的历史校准（service 级 60s 缓存，按模型分桶）。
@@ -570,6 +584,34 @@ func (s *Service) densityMedianCached(model string) (int64, int64, bool) {
 	}
 	store(med, mad, true)
 	return med, mad, true
+}
+
+// cacheSharesCached 返回模型近期缓存读/写占完整上下文的份额（万分比，
+// token 加权合计），60s 分桶缓存与密度/输出校准同款；样本 <3 条不可用。
+// 该份额只用于预占金额的档位拆分：结算恒按真实 token 逐档计，份额偏差
+// 只影响在途预占的金额观感，不影响账本。
+func (s *Service) cacheSharesCached(model string) (readBP, createBP int64, ok bool) {
+	now := time.Now()
+	s.shareCalMu.Lock()
+	if s.shareCal != nil {
+		if e, hit := s.shareCal[model]; hit && now.Sub(e.at) < shareCalTTL {
+			s.shareCalMu.Unlock()
+			return e.readBP, e.createBP, e.ok
+		}
+	}
+	s.shareCalMu.Unlock()
+	cs, hit, err := s.st.RecentCacheShares(context.Background(), model, shareCalSamples)
+	ok = err == nil && hit && cs.Samples >= 3
+	if ok {
+		readBP, createBP = cs.ReadBP, cs.CreateBP
+	}
+	s.shareCalMu.Lock()
+	if s.shareCal == nil {
+		s.shareCal = make(map[string]cacheShareCalEntry)
+	}
+	s.shareCal[model] = cacheShareCalEntry{readBP: readBP, createBP: createBP, ok: ok, at: now}
+	s.shareCalMu.Unlock()
+	return readBP, createBP, ok
 }
 
 func bearerToken(headers http.Header) string {

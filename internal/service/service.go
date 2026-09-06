@@ -197,6 +197,11 @@ type Service struct {
 	// 回退固定混合密度。
 	denCalMu sync.Mutex
 	denCal   map[string]densityCalEntry
+	// shareCal* 是缓存份额学习（缓存读/写占完整上下文的万分比）的 60s
+	// 分桶缓存，与 outCal/denCal 同款；ok=false 表示样本不足，预占金额
+	// 回退输入侧最贵档的保守口径。
+	shareCalMu sync.Mutex
+	shareCal   map[string]cacheShareCalEntry
 	// notifyCfg* 是告警设置的 60s TTL 缓存：结算热路径每次都要比对单请求
 	// 异常阈值，不能逐请求读 preferences；SaveNotifySettings 时失效。
 	notifyCfgMu  sync.Mutex
@@ -474,17 +479,12 @@ func (s *Service) Reserve(ctx context.Context, r ReservationRequest) (store.Rese
 			return store.Reservation{}, err
 		}
 	case r.EstimatedInput > 0 || r.EstimatedOutput > 0:
-		// 分档预占：输入估算按输入侧最贵档（缓存读/写只会发生在输入侧，
-		// 取三者最高保覆盖），输出估算按输出价。此前整段估算按四档最高价
-		// 计，长上下文请求（输出价常为输入价数倍）的预占与兜底金额被
-		// 系统性放大数倍（实测 agent 流量 7.05 → 2.46 USD）。
-		inPrice := rule.PriceInput
-		for _, p := range []money.Price{rule.PriceCacheRead, rule.PriceCacheCreation} {
-			if p > inPrice {
-				inPrice = p
-			}
-		}
-		cin, err := money.CostForTokens(r.EstimatedInput, inPrice)
+		// 分档预占：输出估算按输出价；输入估算按模型近期学习到的缓存构成
+		// 拆成 新鲜输入×输入价 + 缓存读×读价 + 缓存写×写价 三档（token
+		// 加权份额），无样本回退「输入侧最贵档」的保守口径。此前输入
+		// 恒按最贵档全额计，agent 长对话 90%+ 上下文走缓存读（约 0.1× 价）
+		// 时预占金额被放大近十倍——Token 维度收敛后金额成了最后的大误差源。
+		cin, err := s.tieredInputCost(r.Model, r.EstimatedInput, rule)
 		if err != nil {
 			return store.Reservation{}, err
 		}
@@ -505,6 +505,15 @@ func (s *Service) Reserve(ctx context.Context, r ReservationRequest) (store.Rese
 		}
 		var err error
 		cost, err = money.CostForTokens(r.EstimatedTokens, maxPrice)
+		if err != nil {
+			return store.Reservation{}, err
+		}
+	}
+	// CNY 规则四档价以 micro-CNY 存储，预占必须与结算同口径折算成
+	// micro-USD（额度、held 金额与缺用量结算兜底全按 USD 账本扣减）——
+	// 此前预占侧漏了这步，CNY 价格被当 USD 数值直接扣，虚占约汇率倍数。
+	if rule.BillingMode != store.BillingModeFree {
+		cost, err = s.usdCost(cost, rule)
 		if err != nil {
 			return store.Reservation{}, err
 		}
@@ -532,6 +541,48 @@ func (s *Service) Reserve(ctx context.Context, r ReservationRequest) (store.Rese
 	})
 	return res, err
 }
+
+// tieredInputCost 把输入侧预占金额按模型近期学习到的缓存构成拆档：
+// 新鲜输入 × PriceInput + 缓存读份额 × PriceCacheRead + 缓存写份额 ×
+// PriceCacheCreation，镜像结算侧 costForRule 的逐档计费。无该模型样本
+// （<3 条成功请求）时回退「输入侧最贵档全额」——预占宁可高估也不漏。
+// 份额是 token 加权统计值，偏差只影响在途预占的金额观感；结算恒按
+// 真实 token 逐档计，账本不受影响。
+func (s *Service) tieredInputCost(model string, input int64, rule store.PricingRule) (money.Micro, error) {
+	if input <= 0 {
+		return 0, nil
+	}
+	readBP, createBP, ok := s.cacheSharesCached(model)
+	if !ok {
+		inPrice := rule.PriceInput
+		for _, p := range []money.Price{rule.PriceCacheRead, rule.PriceCacheCreation} {
+			if p > inPrice {
+				inPrice = p
+			}
+		}
+		return money.CostForTokens(input, inPrice)
+	}
+	// 份额拆分（万分比）：三部分之和恰为 input，不留整除残差。
+	readTx := input * readBP / 10000
+	createTx := input * createBP / 10000
+	if readTx+createTx > input {
+		readTx, createTx = 0, 0
+	}
+	freshTx := input - readTx - createTx
+	parts := make([]money.Micro, 0, 3)
+	for _, x := range []struct {
+		t int64
+		p money.Price
+	}{{freshTx, rule.PriceInput}, {readTx, rule.PriceCacheRead}, {createTx, rule.PriceCacheCreation}} {
+		v, err := money.CostForTokens(x.t, x.p)
+		if err != nil {
+			return 0, err
+		}
+		parts = append(parts, v)
+	}
+	return money.SumCeil(parts...)
+}
+
 func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req *store.Request, noResponse bool) (store.Reservation, error) {
 	r, err := s.st.GetReservation(ctx, id)
 	if err != nil {

@@ -103,6 +103,100 @@ func TestRecentDensities(t *testing.T) {
 	}
 }
 
+// TestRecentCacheShares 锁缓存份额学习的数据源查询：分子取
+// MAX(cache_read_tokens, cached_tokens) 归一两种口径（OpenAI 记 cached 含于
+// input、cache_read 列为 0；Claude 记 cache_read、input 不含），分母为完整
+// 上下文 input+cache_read+cache_creation，token 加权合计（大请求权重更大），
+// 只取成功且上下文>0 的行。
+func TestRecentCacheShares(t *testing.T) {
+	s := openTestStore(t, filepath.Join(t.TempDir(), "cpa.db"), "recent-shares")
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Hour)
+
+	mk := func(id, model, result string, in, cached, cacheR, cacheW int64, at time.Time) Request {
+		return Request{ID: id, TS: at, Model: model, Result: result,
+			InputTokens: in, CachedTokens: cached, CacheReadTokens: cacheR,
+			CacheCreationTokens: cacheW, TotalTokens: in + cacheR + cacheW}
+	}
+	rows := []Request{
+		// Claude 口径：input 不含缓存。读 8000、写 2000、新鲜 2000 → 上下文 12000。
+		mk("s-claude", "m", ResultOK, 2000, 0, 8000, 2000, base.Add(1*time.Minute)),
+		// OpenAI 口径：input 已含缓存命中 3000（cached 列）、cache_read 列为 0
+		// → 上下文 5000、分子 3000。
+		mk("s-openai", "m", ResultOK, 5000, 3000, 0, 0, base.Add(2*time.Minute)),
+		// 失败行剔除（上下文再大也不进样本）。
+		mk("s-err", "m", ResultError, 100000, 90000, 0, 0, base.Add(3*time.Minute)),
+		// 其他模型剔除。
+		mk("s-other", "m2", ResultOK, 1000, 0, 900, 0, base.Add(4*time.Minute)),
+		// 零上下文剔除。
+		mk("s-zero", "m", ResultOK, 0, 0, 0, 0, base.Add(5*time.Minute)),
+	}
+	for _, r := range rows {
+		if err := s.RecordPassiveUsage(ctx, r, PassiveDedupeHint{Models: []string{r.Model}, Near: r.TS}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cs, ok, err := s.RecentCacheShares(ctx, "m", 100)
+	if err != nil || !ok {
+		t.Fatalf("模型 m 应有份额样本: ok=%v err=%v", ok, err)
+	}
+	// 分子合计 = Claude 读 8000 + OpenAI 命中 3000 = 11000；写 2000；
+	// 分母 = 12000 + 5000 = 17000。
+	// 读份额 = 11000/17000 ≈ 64.7% → 6470 万分比；写份额 = 2000/17000 ≈ 11.8% → 1176。
+	if want := int64(11000 * 10000 / 17000); cs.ReadBP != want {
+		t.Fatalf("缓存读份额异常: got %d want %d", cs.ReadBP, want)
+	}
+	if want := int64(2000 * 10000 / 17000); cs.CreateBP != want {
+		t.Fatalf("缓存写份额异常: got %d want %d", cs.CreateBP, want)
+	}
+	if cs.Samples != 2 || cs.ContextTx != 17000 {
+		t.Fatalf("样本规模异常: %+v", cs)
+	}
+
+	// 无样本模型返回 ok=false。
+	if _, ok, err := s.RecentCacheShares(ctx, "none", 100); err != nil || ok {
+		t.Fatalf("无样本模型应 ok=false: ok=%v err=%v", ok, err)
+	}
+	// 全失败模型同样 ok=false。
+	if _, ok, err := s.RecentCacheShares(ctx, "m-err", 100); err != nil || ok {
+		t.Fatalf("全失败行模型应 ok=false: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestRecentCacheSharesWeighting 锁 token 加权语义：份额按 token 合计
+// 而非逐条中位数——两条读占比 90% 的小请求 + 一条读占比 10% 的大请求，
+// token 加权后整体读份额被大请求拉低（中位数口径会给 90%）。
+func TestRecentCacheSharesWeighting(t *testing.T) {
+	s := openTestStore(t, filepath.Join(t.TempDir(), "cpa.db"), "recent-shares-w")
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Hour)
+	rows := []Request{
+		// 两条 1000 token 上下文、读 900（90%）。
+		{ID: "w-1", TS: base, Model: "m", Result: ResultOK, InputTokens: 1000, CacheReadTokens: 900, TotalTokens: 1900},
+		{ID: "w-2", TS: base.Add(time.Minute), Model: "m", Result: ResultOK, InputTokens: 1000, CacheReadTokens: 900, TotalTokens: 1900},
+		// 一条 100000 token 上下文、读 10000（10%）。
+		{ID: "w-3", TS: base.Add(2 * time.Minute), Model: "m", Result: ResultOK, InputTokens: 90000, CacheReadTokens: 10000, TotalTokens: 100000},
+	}
+	for _, r := range rows {
+		if err := s.RecordPassiveUsage(ctx, r, PassiveDedupeHint{Models: []string{"m"}, Near: r.TS}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cs, ok, err := s.RecentCacheShares(ctx, "m", 100)
+	if err != nil || !ok {
+		t.Fatalf("应有样本: ok=%v err=%v", ok, err)
+	}
+	// 加权：读 (900+900+10000) / 上下文 (1900+1900+100000) ≈ 12.06%。
+	if want := int64(11800 * 10000 / 103800); cs.ReadBP != want {
+		t.Fatalf("token 加权份额异常: got %d want %d（中位数口径会是 9000）", cs.ReadBP, want)
+	}
+	if want := int64(11800 * 10000 / 103800); want > 2000 {
+		// 计算意图保底：加权结果应明显低于 90% 的中位数口径。
+		t.Fatalf("加权份额应被大请求拉低: %d", cs.ReadBP)
+	}
+}
+
 // TestModelDensities 锁密度读数接口：每模型返回中位数/MAD/样本数，
 // 只列有样本的模型，按模型名排序。
 func TestModelDensities(t *testing.T) {
@@ -110,10 +204,16 @@ func TestModelDensities(t *testing.T) {
 	ctx := context.Background()
 	base := time.Now().UTC().Add(-time.Hour)
 
-	// 模型 a：8 条一致的 7300 毫密度 → 中位 7300、MAD 0。
+	// 模型 a：8 条一致的 7300 毫密度 → 中位 7300、MAD 0；其中 4 条带
+	// 缓存读 50000（body_len 同步放大保持密度一致），份额读数应随之出现。
 	for i := 0; i < 8; i++ {
+		cacheR, bodyLen := int64(0), int64(730_000)
+		if i < 4 {
+			cacheR, bodyLen = 50_000, 1_095_000 // 上下文 150K，密度同为 7300
+		}
 		r := Request{ID: "a-" + time.Duration(i).String(), TS: base.Add(time.Duration(i) * time.Minute),
-			Model: "a", Result: ResultOK, BodyLen: 730_000, InputTokens: 100_000, TotalTokens: 100_000}
+			Model: "a", Result: ResultOK, BodyLen: bodyLen, InputTokens: 100_000,
+			CacheReadTokens: cacheR, TotalTokens: 100_000 + cacheR}
 		if err := s.RecordPassiveUsage(ctx, r, PassiveDedupeHint{Models: []string{"a"}, Near: r.TS}); err != nil {
 			t.Fatal(err)
 		}
@@ -137,6 +237,15 @@ func TestModelDensities(t *testing.T) {
 	}
 	if got[0].MilliDensity != 7300 || got[0].MilliMAD != 0 || got[0].Samples != 8 {
 		t.Fatalf("模型 a 读数异常: %+v", got[0])
+	}
+	// 模型 a 缓存份额：4 条带读 50000、上下文 150000，4 条无缓存、上下文
+	// 100000 → 读合计 200000 / 上下文合计 1000000 = 20%。
+	if got[0].CacheReadBP != 2000 || got[0].CacheCreateBP != 0 {
+		t.Fatalf("模型 a 缓存份额读数异常: %+v", got[0])
+	}
+	// 模型 b 无缓存流量：份额字段为 0。
+	if got[1].CacheReadBP != 0 || got[1].CacheCreateBP != 0 {
+		t.Fatalf("模型 b 缓存份额应为 0: %+v", got[1])
 	}
 	if got[1].MilliDensity != 4000 || got[1].Samples != 3 {
 		t.Fatalf("模型 b 读数异常: %+v", got[1])

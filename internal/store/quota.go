@@ -606,6 +606,58 @@ func (s *Store) RecentDensities(ctx context.Context, model string, limit int) ([
 	return out, nil
 }
 
+// CacheShares 是某模型近期请求的缓存构成读数：缓存读/缓存写占完整输入
+// 上下文的份额（万分比整数，token 加权合计而非逐条中位数——拆档计价关心
+// 的是「这一模型流量的钱落在哪几档」，头部大请求天然应占更大权重）。
+type CacheShares struct {
+	ReadBP    int64 `json:"read_bp"`    // 缓存读份额（万分比，10000 = 100%）
+	CreateBP  int64 `json:"create_bp"`  // 缓存写份额（万分比）
+	Samples   int64 `json:"samples"`    // 样本条数
+	ContextTx int64 `json:"context_tx"` // 合计完整上下文 token（样本规模参考）
+}
+
+// RecentCacheShares 返回某模型近期成功请求的缓存构成。分子分母与
+// RecentDensities 同一套归一：分母 = input + cache_read + cache_creation；
+// 分子取 MAX(cache_read_tokens, cached_tokens)——OpenAI 系把命中记进
+// cached_tokens（含于 input、cache_read 列为 0），Claude 系记进
+// cache_read_tokens（input 不含、cached 列为 0），MAX 对两种口径都取到
+// 该行真实的缓存读量且不会重复计（两列同时非零时取大者保守）。
+// 失败行与零上下文行不进样本；无有效样本返回 ok=false。
+func (s *Store) RecentCacheShares(ctx context.Context, model string, limit int) (CacheShares, bool, error) {
+	if limit <= 0 || limit > 2000 {
+		limit = 200
+	}
+	var cs CacheShares
+	err := s.Read(ctx, func(q Querier) error {
+		return q.QueryRowContext(ctx,
+			`SELECT COALESCE(SUM(MAX(cache_read_tokens, cached_tokens)), 0),
+			        COALESCE(SUM(cache_creation_tokens), 0),
+			        COUNT(*),
+			        COALESCE(SUM(input_tokens + cache_read_tokens + cache_creation_tokens), 0)
+			 FROM (SELECT input_tokens, cache_read_tokens, cache_creation_tokens, cached_tokens
+			       FROM requests
+			       WHERE model = ? AND result = ? AND input_tokens + cache_read_tokens + cache_creation_tokens > 0
+			       ORDER BY ts DESC LIMIT ?)`, model, ResultOK, limit).
+			Scan(&cs.ReadBP, &cs.CreateBP, &cs.Samples, &cs.ContextTx)
+	})
+	if err != nil {
+		return CacheShares{}, false, err
+	}
+	if cs.Samples == 0 || cs.ContextTx <= 0 {
+		return CacheShares{}, false, nil
+	}
+	// 万分比取整：份额只用于拆档估算，千分之一 token 级的精度没有意义。
+	cs.ReadBP = cs.ReadBP * 10000 / cs.ContextTx
+	cs.CreateBP = cs.CreateBP * 10000 / cs.ContextTx
+	if cs.ReadBP > 10000 {
+		cs.ReadBP = 10000
+	}
+	if cs.CreateBP > 10000 {
+		cs.CreateBP = 10000
+	}
+	return cs, true, nil
+}
+
 // ModelDensity 是实时页「估算密度」面板的读数行：某模型近期学习到的
 // 输入密度（中位数 ± MAD，毫单位 ×1000）与样本量。
 type ModelDensity struct {
@@ -613,11 +665,16 @@ type ModelDensity struct {
 	MilliDensity int64  `json:"milli_density"` // 中位密度 ×1000（7300 = 7.3 字节/token）
 	MilliMAD     int64  `json:"milli_mad"`     // 绝对中位差 ×1000，0 = 样本完全一致
 	Samples      int64  `json:"samples"`       // 有效样本条数
+	// CacheReadBP / CacheCreateBP 是缓存读/写占完整上下文的份额（万分比），
+	// 供「金额拆档」读数：预占输入金额正按此份额拆到缓存档计价。
+	CacheReadBP   int64 `json:"cache_read_bp,omitempty"`
+	CacheCreateBP int64 `json:"cache_create_bp,omitempty"`
 }
 
 // ModelDensities 返回全部有密度样本的模型读数（每模型最多取近期 limit 条
-// 样本算中位数，与预占校准同口径），按模型名排序。给实时页展示
-// 「当前学习到的等效密度」，让校准状态可见（哪些模型在学习、值是多少）。
+// 样本算中位数，与预占校准同口径），按模型名排序，并附带缓存构成份额
+// （金额拆档口径）。给实时页展示「当前学习到的等效密度」，让校准状态
+// 可见（哪些模型在学习、值是多少）。
 func (s *Store) ModelDensities(ctx context.Context, limit int) ([]ModelDensity, error) {
 	if limit <= 0 || limit > 2000 {
 		limit = 200
@@ -672,7 +729,12 @@ func (s *Store) ModelDensities(ctx context.Context, limit int) ([]ModelDensity, 
 		if len(diffs)%2 == 0 {
 			mad = (diffs[len(diffs)/2-1] + diffs[len(diffs)/2]) / 2
 		}
-		out = append(out, ModelDensity{Model: m, MilliDensity: med, MilliMAD: mad, Samples: int64(n)})
+		row := ModelDensity{Model: m, MilliDensity: med, MilliMAD: mad, Samples: int64(n)}
+		// 缓存构成与密度读数同面板展示，顺便取齐；查询失败不致整个接口失败。
+		if cs, ok, err := s.RecentCacheShares(ctx, m, limit); err == nil && ok {
+			row.CacheReadBP, row.CacheCreateBP = cs.ReadBP, cs.CreateBP
+		}
+		out = append(out, row)
 	}
 	return out, nil
 }
