@@ -1283,9 +1283,9 @@ func buildRequest(svc *service.Service, reservation store.Reservation, req rpcEx
 		Tier:              meta.ResolvedTier,
 		ThinkingIntensity: meta.ResolvedThinking,
 		// body_len 落库供输入密度学习（body_len ÷ input_tokens 的样本对）。
-		BodyLen:     int64(meta.BodyLen),
-		LatencyMS:   millisBetween(startedAt, completedAt),
-		TTFTMS:      millisBetween(startedAt, firstChunkAt),
+		BodyLen:      int64(meta.BodyLen),
+		LatencyMS:    millisBetween(startedAt, completedAt),
+		TTFTMS:       millisBetween(startedAt, firstChunkAt),
 		GenerationMS: millisBetween(firstChunkAt, completedAt),
 		CostMicroUSD: 0,
 		Priced:       true,
