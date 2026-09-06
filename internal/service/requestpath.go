@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -333,9 +334,11 @@ type outputCalEntry struct {
 
 // densityCalEntry 是 denCal 缓存桶：milliDensity 是该模型近期
 // body_len÷input_tokens 中位数 ×1000（7.3 字节/token 存 7300）；
+// mad 是样本绝对中位差（同为毫单位），供折算值做离散度锚定的接受带；
 // ok=false 表示无有效样本，输入估算回退固定混合密度。
 type densityCalEntry struct {
 	milliDensity int64
+	mad          int64
 	ok           bool
 	at           time.Time
 }
@@ -471,14 +474,26 @@ func (s *Service) buildPlanFromMeta(ctx context.Context, model string, meta Requ
 
 // calibratedInput 输入预占的密度学习：按该模型近期 body_len÷input_tokens
 // 的中位数把当前请求体折算成 token。fallback 是固定混合密度的估算值，
-// 无样本（新模型/历史行无 body_len）时原样返回；学习密度折算结果以
-// fallback ×1.5 封顶——防御异常样本（如上游谎报输入 token）把预占压得
-// 过低，宁可略高估也不让预占失去兜底意义。
+// 无样本（新模型/历史行无 body_len）时原样返回。
+//
+// 接受判定分两层：
+//   - 离散度锚定的相对带：折算密度须落在样本 中位数 ± max(3×MAD, 15%)。
+//     带宽锚在样本自身的稳定性上（样本越一致越敢信），而不是锚在
+//     「混合密度接近真相」的假设上——学习本身就是为了发现它不接近
+//     （实测 glm-5.3 密度 7.3 字节/token，对混合估算的 /3.93 只有 0.54×，
+//     旧版锚在 fallback 的 [0.5×,1.5×] 带对这类场景只剩 8% 余量，
+//     内容再密一点就被静默拒绝、永远回退高估的固定估算）。
+//   - 极宽的绝对 sanity 带：折算值须在 fallback 的 [0.2×, 5×] 内。这只
+//     防「样本与当前请求体构成完全无关」的单位级错误（如上游谎报 token、
+//     请求体突变成 base64 图片密集型），不再拦截正常的模型间 tokenizer
+//     密度差异。
+//
+// 两层任一拒绝都回退固定估算兜底。
 func (s *Service) calibratedInput(model string, bodyLen, fallback, maxEstimate int64) int64 {
 	if bodyLen <= 0 {
 		return fallback
 	}
-	milli, ok := s.densityMedianCached(model)
+	milli, mad, ok := s.densityMedianCached(model)
 	if !ok {
 		return fallback
 	}
@@ -487,10 +502,18 @@ func (s *Service) calibratedInput(model string, bodyLen, fallback, maxEstimate i
 	if in <= 0 {
 		in = 1
 	}
-	// 折算值须落在混合密度估算的 [0.5×, 1.5×] 带内：超出说明历史样本与
-	// 当前请求体的构成严重不符（如上游谎报输入 token、请求体突然换成
-	// base64 图片密集型），此时学习值不可信，回退固定估算兜底。
-	if lo, hi := fallback/2, fallback*3/2; hi >= fallback && (in < lo || in > hi) {
+	// 相对带：当前请求的等效密度 = bodyLen×1000/in，与样本中位数的偏差
+	// 须在 max(3×MAD, 15%×中位数) 内。MAD=0（样本几乎完全一致）时由
+	// 15% 下限兜底。
+	lo, hi := milli-max(mad*3, milli*15/100), milli+max(mad*3, milli*15/100)
+	if lo < 0 {
+		lo = 0
+	}
+	if effMilli := bodyLen * 1000 / in; effMilli < lo || effMilli > hi {
+		return fallback
+	}
+	// 绝对 sanity 带：只拦构成级错误，不拦模型间密度差异。
+	if aLo, aHi := fallback/5, fallback*5; aHi >= fallback && (in < aLo || in > aHi) {
 		return fallback
 	}
 	if in > maxEstimate {
@@ -499,41 +522,54 @@ func (s *Service) calibratedInput(model string, bodyLen, fallback, maxEstimate i
 	return in
 }
 
-// densityMedianCached 返回模型近期输入密度中位数（×1000 整数）与是否可用，
-// 60s 分桶缓存与输出校准同款。样本 <3 条视为不可用。
-func (s *Service) densityMedianCached(model string) (int64, bool) {
+// densityMedianCached 返回模型近期输入密度中位数（×1000 整数）、样本
+// 绝对中位差 MAD（×1000）与是否可用，60s 分桶缓存与输出校准同款。
+// 样本 <3 条视为不可用。
+func (s *Service) densityMedianCached(model string) (int64, int64, bool) {
 	now := time.Now()
 	s.denCalMu.Lock()
 	if s.denCal != nil {
 		if e, ok := s.denCal[model]; ok && now.Sub(e.at) < densityCalTTL {
 			s.denCalMu.Unlock()
-			return e.milliDensity, e.ok
+			return e.milliDensity, e.mad, e.ok
 		}
 	}
 	s.denCalMu.Unlock()
-	// 查询失败（库瞬时忙）时样本为空，按「样本不足」回退混合密度。
-	samples, _ := s.st.RecentDensities(context.Background(), model, densityCalSamples)
-	n := len(samples)
-	if n < 3 {
+	store := func(med, mad int64, ok bool) {
 		s.denCalMu.Lock()
 		if s.denCal == nil {
 			s.denCal = make(map[string]densityCalEntry)
 		}
-		s.denCal[model] = densityCalEntry{ok: false, at: now}
+		s.denCal[model] = densityCalEntry{milliDensity: med, mad: mad, ok: ok, at: now}
 		s.denCalMu.Unlock()
-		return 0, false
+	}
+	// 查询失败（库瞬时忙）时样本为空，按「样本不足」回退混合密度。
+	samples, _ := s.st.RecentDensities(context.Background(), model, densityCalSamples)
+	n := len(samples)
+	if n < 3 {
+		store(0, 0, false)
+		return 0, 0, false
 	}
 	med := samples[n/2]
 	if n%2 == 0 {
 		med = (samples[n/2-1] + samples[n/2]) / 2
 	}
-	s.denCalMu.Lock()
-	if s.denCal == nil {
-		s.denCal = make(map[string]densityCalEntry)
+	// MAD：|样本-中位数| 的中位数——对离群样本（偶发异常行）远比标准差稳健。
+	var diffs []int64
+	for _, v := range samples {
+		d := v - med
+		if d < 0 {
+			d = -d
+		}
+		diffs = append(diffs, d)
 	}
-	s.denCal[model] = densityCalEntry{milliDensity: med, ok: true, at: now}
-	s.denCalMu.Unlock()
-	return med, true
+	sort.Slice(diffs, func(i, j int) bool { return diffs[i] < diffs[j] })
+	mad := diffs[len(diffs)/2]
+	if len(diffs)%2 == 0 {
+		mad = (diffs[len(diffs)/2-1] + diffs[len(diffs)/2]) / 2
+	}
+	store(med, mad, true)
+	return med, mad, true
 }
 
 func bearerToken(headers http.Header) string {

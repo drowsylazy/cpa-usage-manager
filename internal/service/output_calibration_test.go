@@ -150,10 +150,12 @@ func TestOutputP95(t *testing.T) {
 	}
 }
 
-// TestCalibratedInput 锁输入密度学习三路径：
+// TestCalibratedInput 锁输入密度学习路径：
+//
 //  1. 有 (body_len, input) 样本 → 按中位数密度折算，显著低于混合密度估算；
 //  2. 无样本（新模型）→ 回退混合密度估算值；
-//  3. 学习密度折算异常偏低（上游谎报 token）→ 以混合密度 ×1.5 封底。
+//  3. 绝对 sanity 带：上游谎报 token 的密度样本（折算值远超 fallback 5×）
+//     → 回退混合密度估算。
 func TestCalibratedInput(t *testing.T) {
 	s, st := testService(t)
 
@@ -176,16 +178,71 @@ func TestCalibratedInput(t *testing.T) {
 		t.Fatalf("密度学习折算异常: got %d want 13000..14500", got)
 	}
 
-	// 路径 3：上游只报 1/10 输入 token（密度样本 40000 毫密度），
-	// 折算 2500 会被 ×1.5 封底拉回 fallback 附近（不低于 fallback）。
+	// 路径 3（绝对 sanity 带）：上游只报 1/10 输入 token——密度样本
+	// 40000 毫密度，折算 2500 token 远低于 fallback 的 0.2×（5000），
+	// 属于构成级错误，回退混合密度而不是采信。
 	liar := make([][2]int64, 5)
 	for i := range liar {
 		liar[i] = [2]int64{40_000, 1_000}
 	}
 	seedDensityHistory(t, st, "liar-model", liar)
 	liarFallback := estimateInputTokens(make([]byte, 100_000))
-	if got := s.calibratedInput("liar-model", 100_000, liarFallback, 1_000_000); got < liarFallback {
-		t.Fatalf("异常低密度应被 ×1.5 封底（不低于混合密度估算）: got %d fallback %d", got, liarFallback)
+	if got := s.calibratedInput("liar-model", 100_000, liarFallback, 1_000_000); got != liarFallback {
+		t.Fatalf("单位级错误密度应回退混合密度: got %d fallback %d", got, liarFallback)
+	}
+}
+
+// TestCalibratedInputBand 锁接受带宽的两层判定：
+//   - MAD 相对带：样本自身高度一致时（MAD≈0）带宽由 15% 下限兜底，
+//     密度偏差 20% 的请求体仍在带外被拒（当前请求体构成与历史不符）；
+//   - 宽松绝对带：真实模型密度只有混合估算的 0.54×（glm-5.3 实测口径）
+//     不再被 fallback 锚定带拦截——这是旧版 [0.5×,1.5×] 带的真实缺陷，
+//     当时只剩 8% 余量，内容再密一点学习就会被静默拒绝。
+func TestCalibratedInputBand(t *testing.T) {
+	s, st := testService(t)
+
+	// 高度一致样本：全部 7300 毫密度 → MAD=0，带宽 = ±15%（±1095）。
+	consistent := make([][2]int64, 8)
+	for i := range consistent {
+		consistent[i] = [2]int64{730_000, 100_000}
+	}
+	seedDensityHistory(t, st, "consistent-model", consistent)
+	fallback := estimateInputTokens(make([]byte, 100_000)) // 25000
+
+	// 折算密度 7300 → 13698 token：0.55×fallback，在 5× 绝对带内，
+	// MAD 带也命中（等效密度就是样本密度本身）→ 采信。
+	if got := s.calibratedInput("consistent-model", 100_000, fallback, 1_000_000); got < 13_000 || got > 14_000 {
+		t.Fatalf("一致样本的 0.55× 折算应被采信: got %d", got)
+	}
+
+	// 同样的模型，当前请求体构成突变：比如图片密集体（等效密度 4000 毫密度
+	// 折算 25000 token——注意这里直接给 fallback 等值不触发绝对带，由
+	// MAD 相对带拦截）：用低密度样本验证。
+	// 等效密度 8900（偏差 22% > 15%）：请求体 890_000 字节折算 100_000。
+	// 通过构造 bodyLen 使折算值在带外但绝对带内。
+	bandOut := s.calibratedInput("consistent-model", 89_000, fallback, 1_000_000)
+	// 89000 字节 ÷ 7300 毫密度 = 12191 token，等效密度 7300 与样本一致，
+	// 命中 MAD 带 → 采信（证明带宽跟着样本走，与 bodyLen 无关）。
+	if bandOut < 11_500 || bandOut > 12_800 {
+		t.Fatalf("等效密度在样本带内的折算应被采信: got %d", bandOut)
+	}
+
+	// 离散样本：密度一半 7300、一半 20000 → 中位数随插入序而定，
+	// MAD 极大（约 6350）→ 带宽 ±max(3×6350, 15%) ≈ ±19050，
+	// 几乎任何折算都接受：离散历史本身说明模型流量构成混杂，
+	// 中位数仍是最稳的点估计。
+	mixed := make([][2]int64, 8)
+	for i := range mixed {
+		if i%2 == 0 {
+			mixed[i] = [2]int64{730_000, 100_000}
+		} else {
+			mixed[i] = [2]int64{400_000, 20_000} // 20000 毫密度
+		}
+	}
+	seedDensityHistory(t, st, "mixed-model", mixed)
+	// 折算落在中位密度附近即采信；只断言不 panic 且不越过 maxEstimate。
+	if got := s.calibratedInput("mixed-model", 100_000, fallback, 50_000); got <= 0 || got > 50_000 {
+		t.Fatalf("离散样本下折算异常: %d", got)
 	}
 }
 

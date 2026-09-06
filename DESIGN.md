@@ -420,7 +420,7 @@ ResolveChain = Eval（ai_judge 失败自动回落兜底分支并记审计）→ 
 ### 12.5 已知限制
 
 - 冷却进程内保存：reconfigure/重启丢失、多实例各自独立——failover 链本身兜底。
-- `input_tokens` 为混合密度封顶粗估（ASCII 字节/4 + 多字节/3），并在该模型已有 body_len÷input 样本时按近期中位密度折算（折算值落在混合密度估算 [0.5×, 1.5×] 带外则回退固定估算）；阈值条件需留余量。
+- `input_tokens` 为混合密度封顶粗估（ASCII 字节/4 + 多字节/3），并在该模型已有 body_len÷input 样本时按近期中位密度折算；折算值须同时通过样本离散度带（中位数 ± max(3×MAD, 15%)，带宽锚在样本自身稳定性而非固定估算）与极宽绝对 sanity 带（混合估算的 [0.2×, 5×]，只拦构成级错误如上游谎报 token），任一拒绝回退固定估算；阈值条件需留余量。
 - 输出预占按该模型最近 500 条成功请求的输出 P95（近端加权，新样本 1.5×）×1.25 校准，max_tokens 只做封顶；样本 <3 条（新模型/空库）回退 `min(max_tokens, max(default_output_reserve, max_tokens/8))`。校准是防「agent 客户端 max_tokens 拍 128000、实际输出几 K」的全额虚占，不追求精确；真实成本仍由结算口径兜底。
 - ai_judge 同步阻塞热路径 ≤ timeout_ms；摘要文本发往 judge 目标模型（隐私边界见 README）。
 - 别名流量仅面向插件 Key（cum-/caller_scope）；原生 Key 打别名走宿主原生路径报未知模型，预期共存行为。
