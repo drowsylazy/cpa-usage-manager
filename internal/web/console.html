@@ -342,6 +342,21 @@
 
   <article class="panel">
     <div class="panel-head">
+      <div><h2 class="panel-title">预占精度 · 按模型</h2><p class="panel-sub" id="acc-sub">各模型实际占比（实结 ÷ 预估）的分位数聚合：P50 是中位表现，P95 接近长尾上界，两者都落在 70%–130% 即健康</p></div>
+    </div>
+    <div class="table-wrap">
+      <table class="data" id="accuracy-table">
+        <thead><tr>
+          <th>模型</th><th class="num">样本数</th><th class="num">P50 实际占比</th><th class="num">P95 实际占比</th>
+        </tr></thead>
+        <tbody id="accuracy-rows"></tbody>
+      </table>
+    </div>
+    <p class="note tbl-foot" id="accuracy-note">占比 = 已结算预占的 实结 token ÷ 预估 token（与「最近预占」单条徽标同口径）。P50 偏低=系统性虚占（长期占用额度余量），P95 偏高=长尾请求预估不足（结算超扣）。</p>
+  </article>
+
+  <article class="panel">
+    <div class="panel-head">
       <div><h2 class="panel-title">估算密度</h2><p class="panel-sub" id="densities-sub">各模型输入预占学习到的等效密度（请求体字节 ÷ 输入 token）：折算即按此密度进行，±MAD 越小样本越一致</p></div>
     </div>
     <div class="table-wrap">

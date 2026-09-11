@@ -81,6 +81,7 @@ func (a *API) register() {
 	a.route("/keys/candidates", a.keyCandidates)
 	a.route("/reservations/held", a.heldReservations)
 	a.route("/reservations/recent", a.recentReservations)
+	a.route("/reservations/accuracy", a.reservationsAccuracy)
 	a.route("/densities", a.densities)
 	a.route("/densities/reset", a.densitiesReset)
 	a.route("/model-routes/health", a.modelRoutesHealth)
@@ -397,6 +398,22 @@ func (a *API) recentReservations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	items, e := a.st.ListRecentReservations(r.Context(), 10)
+	if e != nil {
+		jsonOut(w, map[string]string{"error": e.Error()}, 500)
+		return
+	}
+	jsonOut(w, map[string]any{"items": items, "count": len(items)}, 200)
+}
+
+// reservationsAccuracy 返回按模型聚合的预占精度分位数（P50/P95 实际占比），
+// 供实时页「预占精度 · 按模型」面板：系统性虚占/低估在分位数上一眼可见，
+// 不必逐条扫「最近预占」列表。
+func (a *API) reservationsAccuracy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.WriteHeader(405)
+		return
+	}
+	items, e := a.st.ReservationAccuracy(r.Context(), 20000)
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 500)
 		return

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -931,6 +932,88 @@ func (s *Store) ListRecentReservations(ctx context.Context, limit int) ([]Recent
 		return rows.Err()
 	})
 	return out, err
+}
+
+// ReservationAccuracy 是实时页「预占精度 · 按模型」的聚合读数行：
+// 某模型已结算预占的 实结 token ÷ 预估 token 的 P50/P95 分位数。
+// 逐条「最近预占」列表只能看到个案，系统性偏差（长期虚占吃掉额度余量、
+// 长尾请求预估不足导致超扣）要靠分位数才能一眼定位。
+type ReservationAccuracy struct {
+	Model   string `json:"model"`
+	Samples int64  `json:"samples"`
+	// P50RatioMilli / P95RatioMilli：占比 ×1000（870 = 87%）。健康带
+	// 70%–130%，与「最近预占」单条占比徽标同口径。
+	P50RatioMilli int64 `json:"p50_ratio_milli"`
+	P95RatioMilli int64 `json:"p95_ratio_milli"`
+}
+
+// ReservationAccuracy 聚合各模型的预占精度分位数。样本取最近 limit 条
+// 已结算且两侧 token 均为正的预占（released 未走到结算、零值行无占比
+// 意义），整窗按完结时刻倒序截断后按模型分组——与「密度学习只看近期」
+// 同一哲学：估算精度反映的是当前请求体构成，远古样本混进来只会掩盖漂移。
+// 输出按样本数降序（流量大的模型读数最可信，排前面）。
+func (s *Store) ReservationAccuracy(ctx context.Context, limit int) ([]ReservationAccuracy, error) {
+	if limit <= 0 || limit > 50000 {
+		limit = 20000
+	}
+	byModel := map[string][]float64{}
+	err := s.Read(ctx, func(q Querier) error {
+		rows, err := q.QueryContext(ctx,
+			`SELECT model, reserved_tokens, settled_tokens
+			 FROM reservations
+			 WHERE status = 'settled' AND reserved_tokens > 0 AND settled_tokens > 0
+			 ORDER BY COALESCE(settled_at, released_at) DESC LIMIT ?`, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var model string
+			var reserved, settled int64
+			if err := rows.Scan(&model, &reserved, &settled); err != nil {
+				return err
+			}
+			byModel[model] = append(byModel[model], float64(settled)/float64(reserved))
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ReservationAccuracy, 0, len(byModel))
+	for model, ratios := range byModel {
+		sort.Float64s(ratios)
+		out = append(out, ReservationAccuracy{
+			Model:         model,
+			Samples:       int64(len(ratios)),
+			P50RatioMilli: ratioPercentileMilli(ratios, 0.50),
+			P95RatioMilli: ratioPercentileMilli(ratios, 0.95),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Samples != out[j].Samples {
+			return out[i].Samples > out[j].Samples
+		}
+		return out[i].Model < out[j].Model
+	})
+	return out, nil
+}
+
+// ratioPercentileMilli 取已升序样本的分位数（最近邻秩，ceil(q*n)-1），
+// 返回占比 ×1000。样本非空时才应调用。
+func ratioPercentileMilli(sorted []float64, q float64) int64 {
+	n := len(sorted)
+	if n == 0 {
+		return 0
+	}
+	idx := int(math.Ceil(q*float64(n))) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= n {
+		idx = n - 1
+	}
+	return int64(math.Round(sorted[idx] * 1000))
 }
 
 // ListHeldReservations 返回全部在途（status='held'）预占，按创建时间倒序，

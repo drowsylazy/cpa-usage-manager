@@ -20,6 +20,7 @@ func TestLiveTabTableArity(t *testing.T) {
 	}{
 		{"held-table", 7},
 		{"recent-table", 7},
+		{"accuracy-table", 4},
 		{"densities-table", 6},
 	} {
 		block := tableHeadBlock(t, html, c.id)

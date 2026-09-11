@@ -73,6 +73,7 @@ function setupHeldAuto() {
     if (document.hidden || $('app').hidden || activeTab !== 'live') return;
     loadHeld().catch(() => {});
     loadRecent().catch(() => {});
+    loadAccuracy().catch(() => {});
     loadDensities().catch(() => {});
   }, 5000);
 }
@@ -149,6 +150,36 @@ async function loadRecent() {
     : '暂无已完结的预占记录（随保留期清理）。';
 }
 $('held-refresh').addEventListener('click', () => { loadRecent().catch(() => {}); });
+
+// loadAccuracy 拉取并渲染「预占精度 · 按模型」：已结算预占的 实结 ÷ 预估
+// 分位数聚合（P50 中位 / P95 长尾）。逐条「最近预占」只能看个案，系统性
+// 虚占或低估要在分位数上才看得出来；健康带 70%–130% 与单条徽标同口径。
+async function loadAccuracy() {
+  const rows = $('accuracy-rows'), sub = $('acc-sub');
+  let items;
+  try {
+    const r = await api('/reservations/accuracy');
+    items = r.items || [];
+  } catch (e) {
+    rows.innerHTML = '';
+    return;
+  }
+  const pctPill = (milli, label) => {
+    if (!milli) return '<span class="pill" title="无有效样本">—</span>';
+    const pct = Math.round(milli / 10);
+    const cls = pct >= 70 && pct <= 130 ? 'pill live' : pct > 130 ? 'pill alarm' : 'pill warn';
+    return '<span class="' + cls + '" title="' + label + '">' + pct + '%</span>';
+  };
+  rows.innerHTML = items.map(x => '<tr>'
+    + '<td class="cell-mono cell-clip" style="max-width:260px" title="' + esc(x.model || '') + '">' + esc(x.model || '-') + '</td>'
+    + '<td class="num">' + fmtInt(x.samples) + '</td>'
+    + '<td class="num">' + pctPill(x.p50_ratio_milli, 'P50：半数请求的占比在此以下') + '</td>'
+    + '<td class="num">' + pctPill(x.p95_ratio_milli, 'P95：95% 的请求的占比在此以下，长尾上界') + '</td>'
+    + '</tr>').join('');
+  sub.textContent = items.length
+    ? '各模型实际占比分位数（实结 ÷ 预估）：P50 看中位表现，P95 看长尾上界'
+    : '暂无已结算预占样本：跑过流量后此处给出各模型的估算精度聚合';
+}
 
 // loadDensities 拉取并渲染「估算密度」：各模型学习到的输入密度读数。
 // 毫密度 ×1000 → 显示为 X.X 字节/token；口径列给出对照（固定混合密度
@@ -231,6 +262,7 @@ loaders.live = async () => {
     .catch(() => {});
   await loadHeld();
   await loadRecent();
+  await loadAccuracy();
   await loadDensities();
   stamp();
 };
