@@ -34,6 +34,9 @@ var (
 	ErrConcurrencyExceeded = errors.New("service: 并发额度不足")
 	ErrModelNotAllowed     = errors.New("service: 模型不在 Key 允许清单")
 	ErrUnknownPricing      = errors.New("service: 模型没有计价规则")
+	// ErrInvalidArgument 是请求参数不合法（缺字段/取值越界），httpapi
+	// 统一映射为 400，区别于内部故障的 500。
+	ErrInvalidArgument = errors.New("service: 参数不合法")
 )
 
 // maxPlausibleTPSMilli 是自算 TPS 的可信上限（3000 token/s，单位毫 TPS）。

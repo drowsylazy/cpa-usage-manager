@@ -3,6 +3,7 @@ package httpapi
 import (
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -81,6 +82,7 @@ func (a *API) register() {
 	a.route("/reservations/held", a.heldReservations)
 	a.route("/reservations/recent", a.recentReservations)
 	a.route("/densities", a.densities)
+	a.route("/densities/reset", a.densitiesReset)
 	a.route("/model-routes/health", a.modelRoutesHealth)
 	a.route("/keys/issue", a.issue)
 	a.route("/keys/update", a.updateKey)
@@ -415,6 +417,33 @@ func (a *API) densities(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOut(w, map[string]any{"items": items, "count": len(items)}, 200)
+}
+
+// densitiesReset 把某模型的学习基线推到此刻：此前的密度与缓存构成样本
+// 不再参与预占折算，新流量按当前请求体构成重新学习。请求记录与账本
+// 一行不动。典型用途是 agent /compact 之类的构成突变后一次性重新起算。
+func (a *API) densitiesReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		w.WriteHeader(405)
+		return
+	}
+	noStore(w)
+	var in struct {
+		Model string `json:"model"`
+	}
+	if e := decode(r, &in); e != nil {
+		jsonOut(w, map[string]string{"error": e.Error()}, 400)
+		return
+	}
+	if e := a.svc.ResetModelDensity(r.Context(), in.Model, "console"); e != nil {
+		status := 500
+		if errors.Is(e, service.ErrInvalidArgument) || errors.Is(e, store.ErrNotFound) {
+			status = 400
+		}
+		jsonOut(w, map[string]string{"error": e.Error()}, status)
+		return
+	}
+	jsonOut(w, map[string]any{"ok": true, "model": in.Model}, 200)
 }
 
 func (a *API) issue(w http.ResponseWriter, r *http.Request) {

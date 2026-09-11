@@ -538,7 +538,10 @@ func (s *Service) densityMedianCached(model string) (int64, int64, bool) {
 	}
 	s.denCalMu.Unlock()
 	// 查询失败（库瞬时忙）时样本为空，按「样本不足」回退混合密度。
-	samples, _ := s.st.RecentDensities(context.Background(), model, densityCalSamples)
+	// 学习基线（面板「重置」写入）之后的样本才算数；查基线失败按未重置
+	// 处理（宁可沿用旧样本，也不因一次读库抖动回退固定估算）。
+	since, _ := s.st.DensityEpoch(context.Background(), model)
+	samples, _ := s.st.RecentDensities(context.Background(), model, densityCalSamples, since)
 	est, ok := store.EstimateDensity(samples)
 	s.denCalMu.Lock()
 	if s.denCal == nil {
@@ -563,7 +566,9 @@ func (s *Service) cacheSharesCached(model string) (readBP, createBP int64, ok bo
 		}
 	}
 	s.shareCalMu.Unlock()
-	cs, hit, err := s.st.RecentCacheShares(context.Background(), model, shareCalSamples)
+	// 学习基线（面板「重置」写入）之后的样本才算数，与密度学习同口径。
+	since, _ := s.st.DensityEpoch(context.Background(), model)
+	cs, hit, err := s.st.RecentCacheShares(context.Background(), model, shareCalSamples, since)
 	ok = err == nil && hit && cs.Samples >= 3
 	if ok {
 		readBP, createBP = cs.ReadBP, cs.CreateBP

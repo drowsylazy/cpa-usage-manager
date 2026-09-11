@@ -88,7 +88,7 @@ func TestRecentDensities(t *testing.T) {
 		}
 	}
 
-	got, err := s.RecentDensities(ctx, "m", 100)
+	got, err := s.RecentDensities(ctx, "m", 100, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func TestRecentCacheShares(t *testing.T) {
 		}
 	}
 
-	cs, ok, err := s.RecentCacheShares(ctx, "m", 100)
+	cs, ok, err := s.RecentCacheShares(ctx, "m", 100, time.Time{})
 	if err != nil || !ok {
 		t.Fatalf("模型 m 应有份额样本: ok=%v err=%v", ok, err)
 	}
@@ -254,11 +254,11 @@ func TestRecentCacheShares(t *testing.T) {
 	}
 
 	// 无样本模型返回 ok=false。
-	if _, ok, err := s.RecentCacheShares(ctx, "none", 100); err != nil || ok {
+	if _, ok, err := s.RecentCacheShares(ctx, "none", 100, time.Time{}); err != nil || ok {
 		t.Fatalf("无样本模型应 ok=false: ok=%v err=%v", ok, err)
 	}
 	// 全失败模型同样 ok=false。
-	if _, ok, err := s.RecentCacheShares(ctx, "m-err", 100); err != nil || ok {
+	if _, ok, err := s.RecentCacheShares(ctx, "m-err", 100, time.Time{}); err != nil || ok {
 		t.Fatalf("全失败行模型应 ok=false: ok=%v err=%v", ok, err)
 	}
 }
@@ -282,7 +282,7 @@ func TestRecentCacheSharesWeighting(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cs, ok, err := s.RecentCacheShares(ctx, "m", 100)
+	cs, ok, err := s.RecentCacheShares(ctx, "m", 100, time.Time{})
 	if err != nil || !ok {
 		t.Fatalf("应有样本: ok=%v err=%v", ok, err)
 	}
@@ -348,5 +348,80 @@ func TestModelDensities(t *testing.T) {
 	}
 	if got[1].MilliDensity != 4000 || got[1].Samples != 3 {
 		t.Fatalf("模型 b 读数异常: %+v", got[1])
+	}
+}
+
+// TestDensityEpochFilter 锁学习基线：基线（面板「重置」写入）之前的样本
+// 不再参与密度与缓存构成学习；基线之后不足 3 条时不可用（回退固定估算）。
+func TestDensityEpochFilter(t *testing.T) {
+	s := openTestStore(t, filepath.Join(t.TempDir(), "cpa.db"), "density-epoch")
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Hour)
+
+	// 三条旧构成样本（7300 毫密度）+ 一条旧缓存构成。
+	for i := 0; i < 3; i++ {
+		r := Request{ID: "old-" + time.Duration(i).String(), TS: base.Add(time.Duration(i) * time.Minute),
+			Model: "m", Result: ResultOK, BodyLen: 730_000, InputTokens: 100_000,
+			CacheReadTokens: 50_000, TotalTokens: 150_000}
+		if err := s.RecordPassiveUsage(ctx, r, PassiveDedupeHint{Models: []string{"m"}, Near: r.TS}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 重置基线：设在旧样本之后、新样本之前。
+	cut := base.Add(10 * time.Minute)
+	if err := s.SetDensityEpoch(ctx, "m", cut); err != nil {
+		t.Fatal(err)
+	}
+	// 基线拉到之后：旧样本被排除，读数不可用。
+	if samples, err := s.RecentDensities(ctx, "m", 100, cut); err != nil || len(samples) != 0 {
+		t.Fatalf("基线后无样本应返回空: %v %v", samples, err)
+	}
+	if _, ok, err := s.RecentCacheShares(ctx, "m", 100, cut); err != nil || ok {
+		t.Fatalf("基线后无样本份额应 ok=false: ok=%v err=%v", ok, err)
+	}
+	// 零值基线退化为全部样本（未重置路径）。
+	if samples, err := s.RecentDensities(ctx, "m", 100, time.Time{}); err != nil || len(samples) != 3 {
+		t.Fatalf("零值基线应取全部样本: %v %v", samples, err)
+	}
+
+	// 新构成样本（10430 毫密度：同体量请求真实 token 少三成）落基线之后。
+	for i := 0; i < 3; i++ {
+		r := Request{ID: "new-" + time.Duration(i).String(), TS: base.Add(time.Duration(20+i) * time.Minute),
+			Model: "m", Result: ResultOK, BodyLen: 730_000, InputTokens: 70_000, TotalTokens: 70_000}
+		if err := s.RecordPassiveUsage(ctx, r, PassiveDedupeHint{Models: []string{"m"}, Near: r.TS}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	samples, err := s.RecentDensities(ctx, "m", 100, cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 3 {
+		t.Fatalf("基线后应有 3 条新样本，得到 %d: %v", len(samples), samples)
+	}
+	est, ok := EstimateDensity(samples)
+	if !ok || est.Milli < 10_000 {
+		t.Fatalf("基线后应按新构成学习（10430 附近）: %+v ok=%v", est, ok)
+	}
+
+	// 读数行：重置过的模型即使样本不足也要留在列表（面板显示待学习态）。
+	if err := s.SetDensityEpoch(ctx, "fresh-model", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.ModelDensities(ctx, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *ModelDensity
+	for i := range rows {
+		if rows[i].Model == "fresh-model" {
+			found = &rows[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("有基线的模型应保留在读数列表: %+v", rows)
+	}
+	if found.Samples != 0 || found.ResetAt == nil {
+		t.Fatalf("无新样本的重置行应显示 Samples=0 且带 ResetAt: %+v", *found)
 	}
 }

@@ -3306,30 +3306,61 @@ async function loadDensities() {
     return;
   }
   rows.innerHTML = items.map(x => {
-    const d = (x.milli_density / 1000).toFixed(1);
-    const mad = (x.milli_mad / 1000).toFixed(1);
-    // 与混合密度直觉的对照：4 字节/token 是英文/代码的常识值。
-    const vs = x.milli_density > 0 ? (x.milli_density / 4000 * 100).toFixed(0) : '';
-    const rd = x.cache_read_bp > 0 ? (x.cache_read_bp / 100).toFixed(0) + '%' : '—';
-    const wr = x.cache_create_bp > 0 ? (x.cache_create_bp / 100).toFixed(0) + '%' : '—';
-    // 组成漂移（agent compact 后摘要替代原始代码）：近期窗口密度已偏离
-    // 历史基准，预占改跟近期密度，约 20 条新流量完成接管。
-    const drift = x.drifted
+    const drifted = x.drifted
       ? ' <span class="pill warn" title="近期请求体构成与历史明显不同（如 compact 后摘要替代原始代码），已改按近期密度折算">已漂移</span>' : '';
+    let cells;
+    if (!x.samples) {
+      // 重置后不足 3 条新样本：密度读数无意义，显示待学习态（不再触发
+      // 漂移/口径列，避免把 0 当成真实读数）。
+      cells = '<td class="num">—</td><td class="num">—</td><td class="num">—</td>'
+        + '<td class="num">—</td><td class="num">0</td>'
+        + '<td>待学习</td>';
+    } else {
+      const d = (x.milli_density / 1000).toFixed(1);
+      const mad = (x.milli_mad / 1000).toFixed(1);
+      // 与混合密度直觉的对照：4 字节/token 是英文/代码的常识值。
+      const vs = x.milli_density > 0 ? (x.milli_density / 4000 * 100).toFixed(0) + '% of 4B' : '';
+      const rd = x.cache_read_bp > 0 ? (x.cache_read_bp / 100).toFixed(0) + '%' : '—';
+      const wr = x.cache_create_bp > 0 ? (x.cache_create_bp / 100).toFixed(0) + '%' : '—';
+      cells = '<td class="num" title="请求体字节 ÷ 完整输入上下文 token，近期成功请求的中位数（漂移时取近期窗口）">' + d + ' B/token</td>'
+        + '<td class="num" title="绝对中位差：样本密度的离散程度，越小越稳定">± ' + mad + '</td>'
+        + '<td class="num" title="近期 token 加权：缓存读占完整输入上下文的份额（token 计）">' + rd + '</td>'
+        + '<td class="num" title="近期 token 加权：缓存写占完整输入上下文的份额（token 计）">' + wr + '</td>'
+        + '<td class="num">' + x.samples + '</td>'
+        + '<td title="学习密度相对 4 字节/token 常识值的比值：100% 即与常识一致，低于 100% 说明该模型 tokenizer 更省字节">' + vs + '</td>';
+    }
+    // 重置过则标出基线时刻（悬浮可见），提示读数只统计基线之后的流量。
+    const resetTip = x.reset_at
+      ? ' · 学习基线已重置为 ' + fmtDT(x.reset_at, true) + '，只统计此后的流量' : '';
     return '<tr>'
-      + '<td class="cell-mono cell-clip" style="max-width:260px" title="' + esc(x.model || '') + '">' + esc(x.model || '-') + drift + '</td>'
-      + '<td class="num" title="请求体字节 ÷ 完整输入上下文 token，近期成功请求的中位数（漂移时取近期窗口）">' + d + ' B/token</td>'
-      + '<td class="num" title="绝对中位差：样本密度的离散程度，越小越稳定">± ' + mad + '</td>'
-      + '<td class="num" title="近期 token 加权：缓存读占完整输入上下文的份额（token 计）">' + rd + '</td>'
-      + '<td class="num" title="近期 token 加权：缓存写占完整输入上下文的份额（token 计）">' + wr + '</td>'
-      + '<td class="num">' + (x.samples || 0) + '</td>'
-      + '<td title="学习密度相对 4 字节/token 常识值的比值：100% 即与常识一致，低于 100% 说明该模型 tokenizer 更省字节">' + vs + '% of 4B</td>'
+      + '<td class="cell-mono cell-clip" style="max-width:260px" title="' + esc((x.model || '') + resetTip) + '">' + esc(x.model || '-') + drifted + '</td>'
+      + cells
+      + '<td class="w-act"><button type="button" class="btn small" data-den-reset="' + esc(x.model || '') + '">重置</button></td>'
       + '</tr>';
   }).join('');
   sub.textContent = items.length
     ? '各模型输入预占学习到的等效密度与缓存构成：密度决定 token 折算，缓存占比决定金额拆档'
     : '暂无密度样本：新流量跑过几条成功请求后自动学习（历史行不带请求体长度）';
 }
+// 重置某模型的学习基线：确认后把基线推到此刻，此后按当前请求体构成
+// 重新学习（跑够 3 条新流量恢复读数）；请求记录与账本不受影响。
+$('densities-rows').addEventListener('click', e => {
+  const b = e.target.closest('button[data-den-reset]');
+  if (!b) return;
+  const model = b.dataset.denReset;
+  openSheet({
+    title: '重置估算密度', danger: true, okText: '确认重置',
+    body: '<p>将把模型 <b class="mono">' + esc(model) + '</b> 的密度学习基线推到此刻。</p>'
+      + '<p>此前的密度与缓存占比样本不再参与预占折算；此后按当前请求体构成重新学习，'
+      + '跑够 3 条成功请求后恢复读数。请求记录与账本不受影响。</p>',
+    note: '适用场景：agent 执行 /compact 之类的请求体构成突变后，旧样本已被污染，不等漂移探测逐步接管而一次性重新起算。',
+    onOk: async () => {
+      await post('/densities/reset', { model: model });
+      toast('已重置「' + model + '」的学习基线，新流量将重新学习', 'ok');
+      await loadDensities();
+    },
+  });
+});
 $('held-refresh').addEventListener('click', () => { loadDensities().catch(() => {}); });
 loaders.live = async () => {
   // 密钥标签走全量候选（keysView.cache 只有当前分页页）。

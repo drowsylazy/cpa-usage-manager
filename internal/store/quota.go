@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -565,6 +566,51 @@ func (s *Store) RecentOutputTokens(ctx context.Context, model string, limit int)
 	return out, nil
 }
 
+// densityEpochKey 是 preferences 里记录「学习基线」的键前缀：值为此模型的
+// UnixMilli，早于它的样本不再参与密度/缓存构成学习（面板「重置」按钮写入）。
+// 存 preferences 而非新表：与既有自由 KV 同域，天然随备份/恢复同行；
+// 只改学习口径，requests 记录与账本一行不动。
+const densityEpochKey = "density_epoch:"
+
+// DensityEpoch 返回模型的学习基线；零值表示从未重置。
+func (s *Store) DensityEpoch(ctx context.Context, model string) (time.Time, error) {
+	raw, ok, err := s.GetPreference(ctx, densityEpochKey+model)
+	if err != nil || !ok {
+		return time.Time{}, err
+	}
+	ms, e := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if e != nil || ms <= 0 {
+		return time.Time{}, nil
+	}
+	return time.UnixMilli(ms).UTC(), nil
+}
+
+// DensityEpochs 一次读出全部模型的学习基线（毫秒），供面板列表整体渲染，
+// 避免逐模型查 preferences。
+func (s *Store) DensityEpochs(ctx context.Context) (map[string]int64, error) {
+	kv, err := s.ListPreferences(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64)
+	for k, v := range kv {
+		if !strings.HasPrefix(k, densityEpochKey) {
+			continue
+		}
+		ms, e := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if e != nil || ms <= 0 {
+			continue
+		}
+		out[strings.TrimPrefix(k, densityEpochKey)] = ms
+	}
+	return out, nil
+}
+
+// SetDensityEpoch 写入模型的学习基线：早于该时刻的样本不再参与学习。
+func (s *Store) SetDensityEpoch(ctx context.Context, model string, at time.Time) error {
+	return s.SetPreference(ctx, densityEpochKey+model, strconv.FormatInt(at.UTC().UnixMilli(), 10))
+}
+
 // RecentDensities 返回某模型近期请求的输入密度样本（body_len ÷ 完整上下文
 // token，放大为 ×1000 的整数避免浮点），供输入预占学习真实字节/token 密度。
 // 分母用「完整上下文」= input + cache_read + cache_creation（Claude 口径的
@@ -572,10 +618,12 @@ func (s *Store) RecentOutputTokens(ctx context.Context, model string, limit int)
 // OpenAI/Gemini 的 input 已含缓存命中，三列相加时 cache_read/cache_creation
 // 为 0，同一公式两种口径都成立。只取执行器路径且上游报告了 token 的成功行
 // （body_len>0）；被动路径不带 body_len，零上下文行密度无意义，都被排除。
+// since 非零时只取该时刻之后的样本（面板「重置估算密度」写入的学习基线），
+// 零值退化为「全部样本」（ts > 0 对真实行恒成立）。
 //
 // 返回**新样本在前**（时间倒序）：调用方要区分「全窗基准」与「近期窗口」
 // （漂移探测），升序返回会把两者搅在一起。需要升序的调用方自行排序。
-func (s *Store) RecentDensities(ctx context.Context, model string, limit int) ([]int64, error) {
+func (s *Store) RecentDensities(ctx context.Context, model string, limit int, since time.Time) ([]int64, error) {
 	if limit <= 0 || limit > 2000 {
 		limit = 200
 	}
@@ -583,9 +631,9 @@ func (s *Store) RecentDensities(ctx context.Context, model string, limit int) ([
 	err := s.Read(ctx, func(q Querier) error {
 		rows, err := q.QueryContext(ctx,
 			`SELECT body_len, input_tokens + cache_read_tokens + cache_creation_tokens FROM requests
-			 WHERE model = ? AND result = ? AND body_len > 0
+			 WHERE model = ? AND result = ? AND ts > ? AND body_len > 0
 			   AND input_tokens + cache_read_tokens + cache_creation_tokens > 0
-			 ORDER BY ts DESC LIMIT ?`, model, ResultOK, limit)
+			 ORDER BY ts DESC LIMIT ?`, model, ResultOK, since.UTC().UnixMilli(), limit)
 		if err != nil {
 			return err
 		}
@@ -694,8 +742,9 @@ type CacheShares struct {
 // cached_tokens（含于 input、cache_read 列为 0），Claude 系记进
 // cache_read_tokens（input 不含、cached 列为 0），MAX 对两种口径都取到
 // 该行真实的缓存读量且不会重复计（两列同时非零时取大者保守）。
-// 失败行与零上下文行不进样本；无有效样本返回 ok=false。
-func (s *Store) RecentCacheShares(ctx context.Context, model string, limit int) (CacheShares, bool, error) {
+// 失败行与零上下文行不进样本；since 语义与 RecentDensities 一致
+// （面板「重置估算密度」的学习基线）。无有效样本返回 ok=false。
+func (s *Store) RecentCacheShares(ctx context.Context, model string, limit int, since time.Time) (CacheShares, bool, error) {
 	if limit <= 0 || limit > 2000 {
 		limit = 200
 	}
@@ -708,8 +757,9 @@ func (s *Store) RecentCacheShares(ctx context.Context, model string, limit int) 
 			        COALESCE(SUM(input_tokens + cache_read_tokens + cache_creation_tokens), 0)
 			 FROM (SELECT input_tokens, cache_read_tokens, cache_creation_tokens, cached_tokens
 			       FROM requests
-			       WHERE model = ? AND result = ? AND input_tokens + cache_read_tokens + cache_creation_tokens > 0
-			       ORDER BY ts DESC LIMIT ?)`, model, ResultOK, limit).
+			       WHERE model = ? AND result = ? AND ts > ?
+			         AND input_tokens + cache_read_tokens + cache_creation_tokens > 0
+			       ORDER BY ts DESC LIMIT ?)`, model, ResultOK, since.UTC().UnixMilli(), limit).
 			Scan(&cs.ReadBP, &cs.CreateBP, &cs.Samples, &cs.ContextTx)
 	})
 	if err != nil {
@@ -739,6 +789,10 @@ type ModelDensity struct {
 	Samples      int64  `json:"samples"`       // 有效样本条数
 	// Drifted 标记近期窗口判定组成突变、密度已改跟近期（agent compact 场景）。
 	Drifted bool `json:"drifted,omitempty"`
+	// ResetAt 非空表示该模型的学习基线被手动重置过（面板「重置」按钮）：
+	// 基线之前的样本不再参与学习，基线之后不足 3 条时 Samples=0（面板
+	// 显示「待学习」，新流量跑够 3 条后按当前构成重新接管）。
+	ResetAt *time.Time `json:"reset_at,omitempty"`
 	// CacheReadBP / CacheCreateBP 是缓存读/写占完整上下文的份额（万分比），
 	// 供「金额拆档」读数：预占输入金额正按此份额拆到缓存档计价。
 	CacheReadBP   int64 `json:"cache_read_bp,omitempty"`
@@ -747,14 +801,23 @@ type ModelDensity struct {
 
 // ModelDensities 返回全部有密度样本的模型读数（每模型最多取近期 limit 条
 // 样本算中位数，与预占校准同口径），按模型名排序，并附带缓存构成份额
-// （金额拆档口径）。给实时页展示「当前学习到的等效密度」，让校准状态
-// 可见（哪些模型在学习、值是多少）。
+// （金额拆档口径）与学习基线。给实时页展示「当前学习到的等效密度」，
+// 让校准状态可见（哪些模型在学习、值是多少、是否被重置过）。
+//
+// 模型集合 = 有样本的模型 ∪ 有重置基线的模型：重置后样本归零仍要留在
+// 列表里，否则刚点完「重置」的行会消失，用户无从确认操作生效、也无从
+// 再点第二次（面板显示「待学习」，跑够 3 条新流量自然恢复读数）。
 func (s *Store) ModelDensities(ctx context.Context, limit int) ([]ModelDensity, error) {
 	if limit <= 0 || limit > 2000 {
 		limit = 200
 	}
+	epochs, err := s.DensityEpochs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(epochs))
 	var models []string
-	err := s.Read(ctx, func(q Querier) error {
+	err = s.Read(ctx, func(q Querier) error {
 		rows, err := q.QueryContext(ctx,
 			`SELECT DISTINCT model FROM requests
 			 WHERE result = ? AND body_len > 0
@@ -770,28 +833,41 @@ func (s *Store) ModelDensities(ctx context.Context, limit int) ([]ModelDensity, 
 				return err
 			}
 			models = append(models, m)
+			seen[m] = true
 		}
 		return rows.Err()
 	})
 	if err != nil {
 		return nil, err
 	}
+	// 有基线但不在请求样本里的模型（重置后尚无新流量）补进列表。
+	for m := range epochs {
+		if !seen[m] {
+			models = append(models, m)
+		}
+	}
+	sort.Strings(models)
 	out := make([]ModelDensity, 0, len(models))
 	for _, m := range models {
-		samples, err := s.RecentDensities(ctx, m, limit)
+		var since time.Time
+		if ms, ok := epochs[m]; ok {
+			since = time.UnixMilli(ms).UTC()
+		}
+		samples, err := s.RecentDensities(ctx, m, limit, since)
 		if err != nil {
 			return nil, err
 		}
-		if len(samples) == 0 {
-			continue
-		}
 		est, ok := EstimateDensity(samples)
-		if !ok {
-			continue
+		if !ok && since.IsZero() {
+			continue // 无样本且从未重置：不该出现在列表里
 		}
 		row := ModelDensity{Model: m, MilliDensity: est.Milli, MilliMAD: est.MAD, Samples: int64(est.Samples), Drifted: est.Drifted}
+		if !since.IsZero() {
+			at := since
+			row.ResetAt = &at
+		}
 		// 缓存构成与密度读数同面板展示，顺便取齐；查询失败不致整个接口失败。
-		if cs, ok, err := s.RecentCacheShares(ctx, m, limit); err == nil && ok {
+		if cs, ok, err := s.RecentCacheShares(ctx, m, limit, since); err == nil && ok {
 			row.CacheReadBP, row.CacheCreateBP = cs.ReadBP, cs.CreateBP
 		}
 		out = append(out, row)

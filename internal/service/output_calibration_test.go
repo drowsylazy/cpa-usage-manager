@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"testing"
 	"time"
@@ -21,6 +22,28 @@ func seedOutputHistory(t *testing.T, st *store.Store, model string, outputs []in
 func seedDensityHistory(t *testing.T, st *store.Store, model string, pairs [][2]int64) {
 	t.Helper()
 	seedRows(t, st, model, nil, pairs)
+}
+
+// seedDensityHistoryAt 是 seedDensityHistory 的显式起始时刻版本：
+// 用于「学习基线设在过去、样本落在基线之后」的重置类测试。
+func seedDensityHistoryAt(t *testing.T, st *store.Store, model string, pairs [][2]int64, start time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	batch := seedRowBatch
+	seedRowBatch++
+	for i, p := range pairs {
+		r := store.Request{
+			ID:    model + "-den-at-" + strconv.FormatInt(batch, 10) + "-" + strconv.Itoa(i),
+			TS:    start.Add(time.Duration(i) * time.Second),
+			Model: model, Result: store.ResultOK, InputTokens: p[1], BodyLen: p[0], TotalTokens: p[1],
+		}
+		if err := st.RecordPassiveUsage(ctx, r, store.PassiveDedupeHint{Models: []string{model}, Near: r.TS}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(pairs); n > 0 {
+		seedRowLast = start.Add(time.Duration(n-1) * time.Second)
+	}
 }
 
 // seedRows 落一批成功请求行：outputs 非空时按输出样本写入（body_len=0），
@@ -318,6 +341,61 @@ func TestCalibratedInputDrift(t *testing.T) {
 	got = s.calibratedInput("drift-model", 730_000, fallback, 10_000_000)
 	if got < 69_000 || got > 71_000 {
 		t.Fatalf("窗口换血完毕应完全接管新密度: got %d want ~70000", got)
+	}
+}
+
+// TestResetModelDensity 锁「重置估算密度」：把学习基线推到此刻后，
+// 旧样本立即退出折算（不等 60s 缓存过期）、新流量按当前构成重新学习。
+//
+// 时间全部显式给出（不依赖 seedRows 的包级游标）：跨测试残留的
+// seedRowLast 可能把本测试的「旧样本」推到未来，导致基线拦不住它们。
+func TestResetModelDensity(t *testing.T) {
+	s, st := testService(t)
+	ctx := context.Background()
+	seedRowLast = time.Time{} // 清跨测试残留的批次游标
+
+	// 旧构成：8 条 7300 毫密度，落在 1 小时前。730KB 体估 100K。
+	history := make([][2]int64, 0, 8)
+	for i := 0; i < 8; i++ {
+		history = append(history, [2]int64{730_000, 100_000})
+	}
+	seedDensityHistoryAt(t, st, "reset-model", history, time.Now().UTC().Add(-time.Hour))
+	fallback := estimateInputTokens(make([]byte, 730_000))
+	if got := s.calibratedInput("reset-model", 730_000, fallback, 10_000_000); got < 99_000 || got > 101_000 {
+		t.Fatalf("重置前应按旧密度折算 100K: got %d", got)
+	}
+
+	// 重置：基线推到此刻，旧样本立即退出（缓存同步失效，不等 60s）。
+	if err := s.ResetModelDensity(ctx, "reset-model", "test"); err != nil {
+		t.Fatal(err)
+	}
+	// 基线之后还没样本 → 回退固定混合密度（而非沿用旧读数）。
+	got := s.calibratedInput("reset-model", 730_000, fallback, 10_000_000)
+	if got != fallback {
+		t.Fatalf("重置后无新样本应回退固定估算: got %d want %d", got, fallback)
+	}
+	// 缓存份额同样失效 → 金额拆档回退输入侧最贵档。
+	if _, _, ok := s.cacheSharesCached("reset-model"); ok {
+		t.Fatal("重置后缓存份额应不可用")
+	}
+
+	// 新构成（同体量请求真实 token 少三成）跑够 3 条 → 按新构成接管。
+	// 落在基线之后（真实场景里新流量天然晚于重置时刻）。
+	post := make([][2]int64, 0, 3)
+	for i := 0; i < 3; i++ {
+		post = append(post, [2]int64{730_000, 70_000})
+	}
+	seedDensityHistoryAt(t, st, "reset-model", post, time.Now().UTC().Add(time.Minute))
+	s.denCalMu.Lock()
+	s.denCal = nil
+	s.denCalMu.Unlock()
+	if got := s.calibratedInput("reset-model", 730_000, fallback, 10_000_000); got < 69_000 || got > 71_000 {
+		t.Fatalf("重置后应按新构成学习: got %d want ~70000", got)
+	}
+
+	// 空模型名拒绝。
+	if err := s.ResetModelDensity(ctx, "   ", "test"); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("空模型名应报参数错误: %v", err)
 	}
 }
 

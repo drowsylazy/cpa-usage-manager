@@ -139,6 +139,36 @@ func (s *Service) rotateAutoBackups(dir string, keep int) {
 	}
 }
 
+// ResetModelDensity 把某模型的输入密度学习基线设为此刻：基线之前的样本
+// 不再参与密度与缓存构成学习，基线之后按当前请求体构成重新学习（跑够
+// 3 条成功请求后自动接管）。请求记录与账本一行不动，只影响预占估算口径。
+//
+// 典型用途：agent /compact 之类的构成突变后，旧样本已被污染，与其等漂移
+// 探测逐步接管，不如一次性把基线推到突变之后。
+func (s *Service) ResetModelDensity(ctx context.Context, model, actor string) error {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return fmt.Errorf("%w: 缺少模型名", ErrInvalidArgument)
+	}
+	at := time.Now().UTC()
+	if err := s.st.SetDensityEpoch(ctx, model, at); err != nil {
+		return err
+	}
+	// 学习缓存立即失效：否则 60s 窗口内仍按旧样本折算（面板也会显示
+	// 重置前的读数，看起来像没生效）。
+	s.denCalMu.Lock()
+	s.denCal = nil
+	s.denCalMu.Unlock()
+	s.shareCalMu.Lock()
+	s.shareCal = nil
+	s.shareCalMu.Unlock()
+	_ = s.st.AppendAudit(ctx, store.AuditEvent{
+		Actor: actor, Action: "density.reset", EntityType: "model", EntityID: model,
+		Detail: map[string]any{"since": at.Format(time.RFC3339)},
+	})
+	return nil
+}
+
 // Restore 用上传的快照替换库内容，并记审计。
 //
 // 注意：备份文件不含 key-peppers。恢复到另一台机器时必须同时带上
