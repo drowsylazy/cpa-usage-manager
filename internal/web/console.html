@@ -326,13 +326,13 @@
 
   <article class="panel">
     <div class="panel-head">
-      <div><h2 class="panel-title">最近预占</h2><p class="panel-sub" id="recent-sub">最近 10 条已完结请求的预估与实际消耗 token 对照：实际占比落在 70%–130% 之间即估算健康</p></div>
+      <div><h2 class="panel-title">最近预占</h2><p class="panel-sub" id="recent-sub">最近 10 条已完结请求的预估与实际消耗对照：实际占比落在 70%–130% 之间即估算健康</p></div>
     </div>
     <div class="table-wrap tall">
       <table class="data" id="recent-table">
         <thead><tr>
           <th>完结时间</th><th>密钥</th><th>模型</th><th>状态</th>
-          <th class="num">预估 Token</th><th class="num">实际消耗</th><th class="ctr">实际占比</th><th class="num">预占金额</th><th class="num">实扣金额</th><th class="num">耗时</th>
+          <th class="num">Token 预估 → 实际</th><th class="num">金额 预占 → 实扣</th><th class="num">耗时</th>
         </tr></thead>
         <tbody id="recent-rows"></tbody>
       </table>
@@ -342,17 +342,17 @@
 
   <article class="panel">
     <div class="panel-head">
-      <div><h2 class="panel-title">估算密度</h2><p class="panel-sub" id="densities-sub">各模型输入预占学习到的等效密度（请求体字节 ÷ 输入 token）：折算即按此密度进行，MAD 越小样本越一致</p></div>
+      <div><h2 class="panel-title">估算密度</h2><p class="panel-sub" id="densities-sub">各模型输入预占学习到的等效密度（请求体字节 ÷ 输入 token）：折算即按此密度进行，±MAD 越小样本越一致</p></div>
     </div>
     <div class="table-wrap">
       <table class="data" id="densities-table">
         <thead><tr>
-          <th>模型</th><th class="num">等效密度</th><th class="num">离散度 (±MAD)</th><th class="num">缓存读占比</th><th class="num">缓存写占比</th><th class="num">样本数</th><th>口径</th><th class="w-act"></th>
+          <th>模型</th><th class="num">等效密度</th><th class="num">缓存构成（读 / 写）</th><th class="num">样本数</th><th>状态</th><th class="w-act"></th>
         </tr></thead>
         <tbody id="densities-rows"></tbody>
       </table>
     </div>
-    <p class="note tbl-foot" id="densities-note">密度 = 近期成功请求的 请求体字节 ÷ 完整输入上下文 token（含缓存读/写）的中位数；「已漂移」表示近期请求体构成突变（如 agent compact），预占已改按近期密度折算；缓存占比用于预占金额拆档；样本来自执行器路径（历史行与被动统计不带请求体长度）。</p>
+    <p class="note tbl-foot" id="densities-note">密度 = 近期成功请求的 请求体字节 ÷ 完整输入上下文 token 的中位数，±MAD 是样本离散度；缓存构成决定预占输入的金额拆档（读/写按各自档位价计，其余按输入价）。样本只来自执行器路径的请求（被动统计与历史行不带请求体长度）。</p>
   </article>
 </section>
 

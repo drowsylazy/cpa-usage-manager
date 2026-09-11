@@ -48,6 +48,11 @@ func insertRequestTx(ctx context.Context, s *Store, tx *sql.Tx, r Request) error
 	// 上游凭据（宿主会把 api_key 填进 Source）都到不了库。
 	r.Source = RedactSource(r.Source)
 	r.ErrorNote = SanitizeErrorNote(r.ErrorNote)
+	// context_tokens 同口径收口：调用方没给（旧调用点/新路径漏传）时按形状
+	// 就地推导，绝不留下 0——0 会让该行永久退出密度与缓存份额学习。
+	if r.ContextTokens <= 0 {
+		r.ContextTokens = deriveContextTokens(r)
+	}
 	res, err := s.execHotTx(ctx, tx,
 		`INSERT INTO requests (
 			id, ts, key_id, caller_id, model, provider, source, upstream_model,
@@ -56,8 +61,8 @@ func insertRequestTx(ctx context.Context, s *Store, tx *sql.Tx, r Request) error
 			cache_read_tokens, cache_creation_tokens, total_tokens,
 			latency_ms, ttft_ms, generation_ms, tps_milli,
 			thinking_intensity, cost_micro_usd, currency, cost_native_micro, priced, reservation_id,
-			status_code, error_note, body_len
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			status_code, error_note, body_len, context_tokens
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING`,
 		r.ID, r.TS.UTC().UnixMilli(), r.KeyID, r.CallerID, r.Model, r.Provider, r.Source, r.UpstreamModel,
 		r.AuthID, r.AuthLabel, r.AuthType, r.Tier, r.Result,
@@ -65,7 +70,7 @@ func insertRequestTx(ctx context.Context, s *Store, tx *sql.Tx, r Request) error
 		r.CacheReadTokens, r.CacheCreationTokens, r.TotalTokens,
 		r.LatencyMS, r.TTFTMS, r.GenerationMS, r.TPSMilli,
 		r.ThinkingIntensity, int64(r.CostMicroUSD), nativeCurrency(r), int64(r.CostNativeMicro), boolInt(r.Priced), r.ReservationID,
-		r.StatusCode, r.ErrorNote, r.BodyLen)
+		r.StatusCode, r.ErrorNote, r.BodyLen, r.ContextTokens)
 	if err != nil {
 		return fmt.Errorf("写入请求记录 %s 失败: %w", r.ID, err)
 	}
@@ -78,6 +83,40 @@ func insertRequestTx(ctx context.Context, s *Store, tx *sql.Tx, r Request) error
 
 // errDuplicateRequest 是内部哨兵，表示该请求已入库、聚合不应重复累加。
 var errDuplicateRequest = fmt.Errorf("请求记录已存在")
+
+// deriveContextTokens 按形状推导完整输入上下文（context_tokens 的兜底口径，
+// 与迁移 v18 的回填 UPDATE、main.hostInputExclusive 同一规则）。total_tokens
+// 只用作口径**判据**，绝不出现在返回值里——上下文是输入侧的量，混进
+// output_tokens 会把分母抬高。
+//
+// 判据：inclusive 行 total ≈ input+output（缓存已含在 input 内），exclusive
+// 行还要再加缓存读写，取更接近的一方；total 缺失时按形状——cache_read 非零
+// 且与 cached 不等 = Claude exclusive（input 不含缓存读写，须补上），其余
+// （含 cached==cache_read 的宿主镜像形状）视为 inclusive，input 即完整上下文。
+func deriveContextTokens(r Request) int64 {
+	if r.InputTokens <= 0 && r.CacheReadTokens <= 0 {
+		return 0
+	}
+	exclusive := false
+	if r.TotalTokens > 0 {
+		incl := r.InputTokens + r.OutputTokens
+		excl := incl + r.CacheReadTokens + r.CacheCreationTokens
+		exclusive = abs64(r.TotalTokens-excl) < abs64(r.TotalTokens-incl)
+	} else {
+		exclusive = r.CacheReadTokens > 0 && r.CacheReadTokens != r.CachedTokens
+	}
+	if exclusive {
+		return r.InputTokens + r.CacheReadTokens + r.CacheCreationTokens
+	}
+	return r.InputTokens
+}
+
+func abs64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
 
 // upsertRollupTx 把一条请求累加进分钟聚合。
 func upsertRollupTx(ctx context.Context, s *Store, tx *sql.Tx, r Request) error {
@@ -494,6 +533,9 @@ func mergeRequestPairTx(ctx context.Context, tx *sql.Tx, s *Store, keeper, drope
 // 被 mergeRequestPairTx（行已在库）与 absorbIntoExecutorTx（行未入库）共享。
 func fillKeeperZeroTx(ctx context.Context, tx *sql.Tx, s *Store, d Request, keeperID string) error {
 	d.Source = RedactSource(d.Source)
+	if d.ContextTokens <= 0 {
+		d.ContextTokens = deriveContextTokens(d)
+	}
 	_, err := s.execHotTx(ctx, tx,
 		`UPDATE requests SET
 		    input_tokens         = CASE WHEN input_tokens = 0         THEN ? ELSE input_tokens END,
@@ -503,6 +545,7 @@ func fillKeeperZeroTx(ctx context.Context, tx *sql.Tx, s *Store, d Request, keep
 		    cache_read_tokens    = CASE WHEN cache_read_tokens = 0    THEN ? ELSE cache_read_tokens END,
 		    cache_creation_tokens= CASE WHEN cache_creation_tokens = 0 THEN ? ELSE cache_creation_tokens END,
 		    total_tokens         = CASE WHEN total_tokens = 0         THEN ? ELSE total_tokens END,
+		    context_tokens       = CASE WHEN context_tokens = 0       THEN ? ELSE context_tokens END,
 		    ttft_ms              = CASE WHEN ttft_ms = 0              THEN ? ELSE ttft_ms END,
 		    provider             = CASE WHEN provider = ''            THEN ? ELSE provider END,
 		    source               = CASE WHEN source = ''              THEN ? ELSE source END,
@@ -511,7 +554,7 @@ func fillKeeperZeroTx(ctx context.Context, tx *sql.Tx, s *Store, d Request, keep
 		 WHERE id = ?`,
 		d.InputTokens, d.OutputTokens, d.ReasoningTokens,
 		d.CachedTokens, d.CacheReadTokens, d.CacheCreationTokens,
-		d.TotalTokens, d.TTFTMS,
+		d.TotalTokens, d.ContextTokens, d.TTFTMS,
 		d.Provider, d.Source, d.AuthType, d.Tier,
 		keeperID)
 	if err != nil {
@@ -717,16 +760,26 @@ func subtractRollupTx(ctx context.Context, tx *sql.Tx, s *Store, r Request) erro
 }
 
 func backfillRequestTx(ctx context.Context, tx *sql.Tx, s *Store, id string, b UsageBackfill) error {
+	// 回填同样收口推导：调用方漏算时不留 0，避免该行退出学习样本。
+	ctxTok := b.ContextTokens
+	if ctxTok <= 0 {
+		ctxTok = deriveContextTokens(Request{
+			InputTokens:         b.InputTokens,
+			CachedTokens:        b.CachedTokens,
+			CacheReadTokens:     b.CacheReadTokens,
+			CacheCreationTokens: b.CacheCreationTokens,
+		})
+	}
 	_, err := s.execHotTx(ctx, tx,
 		`UPDATE requests SET
 		    input_tokens = ?, output_tokens = ?, reasoning_tokens = ?,
 		    cached_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?,
-		    total_tokens = ?,
+		    total_tokens = ?, context_tokens = ?,
 		    ttft_ms = CASE WHEN ttft_ms = 0 THEN ? ELSE ttft_ms END
 		 WHERE id = ?`,
 		b.InputTokens, b.OutputTokens, b.ReasoningTokens,
 		b.CachedTokens, b.CacheReadTokens, b.CacheCreationTokens,
-		b.TotalTokens, b.TTFTMS, id)
+		b.TotalTokens, ctxTok, b.TTFTMS, id)
 	if err != nil {
 		return fmt.Errorf("回填请求 %s 用量失败: %w", id, err)
 	}
@@ -748,7 +801,7 @@ const requestColumns = `id, ts, key_id, caller_id, model, provider, source, upst
 	cache_read_tokens, cache_creation_tokens, total_tokens,
 	latency_ms, ttft_ms, generation_ms, tps_milli,
 	thinking_intensity, cost_micro_usd, currency, cost_native_micro, priced, reservation_id,
-	status_code, error_note, body_len`
+	status_code, error_note, body_len, context_tokens`
 
 // RequestColumns 是 requests 表完整列清单的包外只读副本：服务层的请求
 // 明细查询必须引用它而不是手抄列清单——v12 曾因副本漏列导致明细接口
@@ -842,7 +895,7 @@ func scanRequest(sc interface{ Scan(...any) error }) (Request, error) {
 		&r.CacheReadTokens, &r.CacheCreationTokens, &r.TotalTokens,
 		&r.LatencyMS, &r.TTFTMS, &r.GenerationMS, &r.TPSMilli,
 		&r.ThinkingIntensity, &cost, &r.Currency, &costNative, &priced, &r.ReservationID,
-		&r.StatusCode, &r.ErrorNote, &r.BodyLen,
+		&r.StatusCode, &r.ErrorNote, &r.BodyLen, &r.ContextTokens,
 	)
 	if err != nil {
 		return Request{}, err

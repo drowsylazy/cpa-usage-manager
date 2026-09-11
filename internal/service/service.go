@@ -640,6 +640,10 @@ func (s *Service) Settle(ctx context.Context, id string, u usageparse.Usage, req
 		req.CacheReadTokens = u.CacheReadTokens
 		req.CacheCreationTokens = u.CacheCreationTokens
 		req.TotalTokens = u.EffectiveTotal()
+		// 完整输入上下文在落库时由 usageparse 归一算好（schema v18）：
+		// 密度/缓存份额学习只读 context_tokens 列，免疫宿主回填把
+		// inclusive 行的 cache_read 填成镜像值的口径污染。
+		req.ContextTokens = u.ContextTokens()
 		req.CostMicroUSD = cost
 		// 原生币种入账：requests 行保留计价规则币种的原生金额。
 		req.Currency = costCurrency

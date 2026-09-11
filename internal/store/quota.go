@@ -613,10 +613,11 @@ func (s *Store) SetDensityEpoch(ctx context.Context, model string, at time.Time)
 
 // RecentDensities 返回某模型近期请求的输入密度样本（body_len ÷ 完整上下文
 // token，放大为 ×1000 的整数避免浮点），供输入预占学习真实字节/token 密度。
-// 分母用「完整上下文」= input + cache_read + cache_creation（Claude 口径的
-// input 不含缓存读写，不补会把长对话命中缓存后的密度错算成十几倍）；
-// OpenAI/Gemini 的 input 已含缓存命中，三列相加时 cache_read/cache_creation
-// 为 0，同一公式两种口径都成立。只取执行器路径且上游报告了 token 的成功行
+// 分母读落库时算好的 context_tokens 派生列（usageparse.ContextTokens 归一
+// 两种口径），**不能**在 SQL 端按 input+cache_read+cache_creation 拼——
+// 宿主回填会把 inclusive 行的 cache_read_tokens 填成 cached_tokens 的镜像
+// 值（input 已含缓存命中，再拼即双计），实测 glm-5.3 密度从 7.3 学成 4.5、
+// 预占恒虚高一倍（占比 58%）。只取执行器路径且上游报告了 token 的成功行
 // （body_len>0）；被动路径不带 body_len，零上下文行密度无意义，都被排除。
 // since 非零时只取该时刻之后的样本（面板「重置估算密度」写入的学习基线），
 // 零值退化为「全部样本」（ts > 0 对真实行恒成立）。
@@ -630,9 +631,9 @@ func (s *Store) RecentDensities(ctx context.Context, model string, limit int, si
 	out := make([]int64, 0, 64)
 	err := s.Read(ctx, func(q Querier) error {
 		rows, err := q.QueryContext(ctx,
-			`SELECT body_len, input_tokens + cache_read_tokens + cache_creation_tokens FROM requests
+			`SELECT body_len, context_tokens FROM requests
 			 WHERE model = ? AND result = ? AND ts > ? AND body_len > 0
-			   AND input_tokens + cache_read_tokens + cache_creation_tokens > 0
+			   AND context_tokens > 0
 			 ORDER BY ts DESC LIMIT ?`, model, ResultOK, since.UTC().UnixMilli(), limit)
 		if err != nil {
 			return err
@@ -736,12 +737,12 @@ type CacheShares struct {
 	ContextTx int64 `json:"context_tx"` // 合计完整上下文 token（样本规模参考）
 }
 
-// RecentCacheShares 返回某模型近期成功请求的缓存构成。分子分母与
-// RecentDensities 同一套归一：分母 = input + cache_read + cache_creation；
-// 分子取 MAX(cache_read_tokens, cached_tokens)——OpenAI 系把命中记进
-// cached_tokens（含于 input、cache_read 列为 0），Claude 系记进
-// cache_read_tokens（input 不含、cached 列为 0），MAX 对两种口径都取到
-// 该行真实的缓存读量且不会重复计（两列同时非零时取大者保守）。
+// RecentCacheShares 返回某模型近期成功请求的缓存构成。分母读落库时算好的
+// context_tokens 派生列（与 RecentDensities 同口径，免疫宿主回填的镜像
+// 污染）；分子取 MAX(cache_read_tokens, cached_tokens)——OpenAI 系把命中
+// 记进 cached_tokens（含于 input、cache_read 列为 0 或被宿主回填成镜像值），
+// Claude 系记进 cache_read_tokens（input 不含、cached 列为 0），MAX 对两种
+// 口径都取到该行真实的缓存读量且不会重复计（两列同时非零时取大者保守）。
 // 失败行与零上下文行不进样本；since 语义与 RecentDensities 一致
 // （面板「重置估算密度」的学习基线）。无有效样本返回 ok=false。
 func (s *Store) RecentCacheShares(ctx context.Context, model string, limit int, since time.Time) (CacheShares, bool, error) {
@@ -754,11 +755,11 @@ func (s *Store) RecentCacheShares(ctx context.Context, model string, limit int, 
 			`SELECT COALESCE(SUM(MAX(cache_read_tokens, cached_tokens)), 0),
 			        COALESCE(SUM(cache_creation_tokens), 0),
 			        COUNT(*),
-			        COALESCE(SUM(input_tokens + cache_read_tokens + cache_creation_tokens), 0)
-			 FROM (SELECT input_tokens, cache_read_tokens, cache_creation_tokens, cached_tokens
+			        COALESCE(SUM(context_tokens), 0)
+			 FROM (SELECT cache_read_tokens, cache_creation_tokens, cached_tokens, context_tokens
 			       FROM requests
 			       WHERE model = ? AND result = ? AND ts > ?
-			         AND input_tokens + cache_read_tokens + cache_creation_tokens > 0
+			         AND context_tokens > 0
 			       ORDER BY ts DESC LIMIT ?)`, model, ResultOK, since.UTC().UnixMilli(), limit).
 			Scan(&cs.ReadBP, &cs.CreateBP, &cs.Samples, &cs.ContextTx)
 	})
@@ -821,7 +822,7 @@ func (s *Store) ModelDensities(ctx context.Context, limit int) ([]ModelDensity, 
 		rows, err := q.QueryContext(ctx,
 			`SELECT DISTINCT model FROM requests
 			 WHERE result = ? AND body_len > 0
-			   AND input_tokens + cache_read_tokens + cache_creation_tokens > 0
+			   AND context_tokens > 0
 			 ORDER BY model`, ResultOK)
 		if err != nil {
 			return err

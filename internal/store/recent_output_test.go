@@ -104,6 +104,56 @@ func TestRecentDensities(t *testing.T) {
 	}
 }
 
+// TestRecentDensitiesMirrorNotDoubled 锁生产实锤的口径缺陷修复：宿主回填会把
+// OpenAI inclusive 行的 cache_read_tokens 填成 cached_tokens 的镜像值，而 input
+// 本身已含缓存命中——旧口径在 SQL 端拼 input+cache_read 让分母翻倍、密度学成
+// 一半（实测 glm-5.3 分母 1.989×、deepseek-v4-flash 1.923×，预占虚高一倍、
+// 「最近预占」实际占比恒 52%）。改为读落库时归一的 context_tokens 后，镜像行
+// 与干净 inclusive 行得到同一密度。
+func TestRecentDensitiesMirrorNotDoubled(t *testing.T) {
+	s := openTestStore(t, filepath.Join(t.TempDir(), "cpa.db"), "density-mirror")
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Hour)
+
+	// 生产行形状：input 225177、cached=cache_read=224896（镜像）、total≈input+output。
+	mirror := Request{ID: "mirror-1", TS: base.Add(time.Minute), Model: "m", Result: ResultOK,
+		BodyLen: 2_043_000, InputTokens: 225_177, CachedTokens: 224_896,
+		CacheReadTokens: 224_896, TotalTokens: 225_401}
+	// 干净 inclusive 行：宿主没回填镜像（cache_read 列为 0），同密度。
+	clean := Request{ID: "clean-1", TS: base.Add(2 * time.Minute), Model: "m", Result: ResultOK,
+		BodyLen: 2_043_000, InputTokens: 225_177, CachedTokens: 224_896, TotalTokens: 225_401}
+	for _, r := range []Request{mirror, clean} {
+		if err := s.RecordPassiveUsage(ctx, r, PassiveDedupeHint{Models: []string{"m"}, Near: r.TS}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.RecentDensities(ctx, "m", 100, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 分母都是 225177（不是 450073）：2043000×1000÷225177 = 9072。
+	if len(got) != 2 {
+		t.Fatalf("应返回 2 条样本，得到 %d: %v", len(got), got)
+	}
+	want := int64(2_043_000 * 1000 / 225_177)
+	for i, v := range got {
+		if v != want {
+			t.Fatalf("密度样本[%d] = %d want %d（镜像行分母被双计会得到 %d）",
+				i, v, want, 2_043_000*1000/(225_177+224_896))
+		}
+	}
+	// 缓存份额同源：镜像行的分子取 MAX(cached, cache_read)=224896、分母 225177，
+	// 读份额接近 100%；旧口径分母翻倍会算成约 50%。
+	cs, ok, err := s.RecentCacheShares(ctx, "m", 100, time.Time{})
+	if err != nil || !ok {
+		t.Fatalf("应有份额样本: ok=%v err=%v", ok, err)
+	}
+	if wantBP := int64(224_896 * 2 * 10000 / (225_177 * 2)); cs.ReadBP != wantBP {
+		t.Fatalf("缓存读份额异常: got %d want %d（双计分母会得到约一半）", cs.ReadBP, wantBP)
+	}
+}
+
 // TestEstimateDensityDrift 锁漂移适应：全窗 7300 毫密度的模型在 compact
 // 后（近期 ~10400 毫密度，实测占比 100%→50% 场景的反推值），
 // 全窗中位数要新样本过半才能拉动；近期窗口中位数漂出带即改跟，

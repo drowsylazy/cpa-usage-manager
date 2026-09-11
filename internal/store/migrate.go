@@ -8,7 +8,7 @@ import (
 
 // SchemaVersion 是本代码期望的数据库 schema 版本。
 // 打开库时若发现库版本更高，说明是被更新版插件写过的库，拒绝降级使用。
-const SchemaVersion = 17
+const SchemaVersion = 18
 
 // migration 是一次版本化迁移。
 type migration struct {
@@ -492,7 +492,41 @@ var migrations = []migration{
 			`ALTER TABLE requests ADD COLUMN body_len INTEGER NOT NULL DEFAULT 0`,
 		},
 	},
+	{
+		version: 18,
+		name:    "request_context_tokens",
+		stmts: []string{
+			// ---- 密度/缓存份额学习的正确分母 ----
+			// v0.8.9 起密度分母由 SQL 端 input+cache_read+cache_creation 拼出，
+			// 但宿主回填会把 OpenAI inclusive 口径行的 cache_read_tokens 填成
+			// cached_tokens 的镜像值（input 已含缓存命中，再拼 cache_read 即
+			// 双计），实测 glm-5.3 密度从 7.3 学成 4.5、占比恒 58%。改为在
+			// 落库时由 usageparse.Usage.ContextTokens()（唯一知道两种口径的
+			// 地方）算好完整上下文存进该列，学习查询只读它，免疫任何写入方
+			// 的口径污染。0 = 未记录（历史行回填路径等）。
+			`ALTER TABLE requests ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0`,
+			// 历史行就地回填：不依赖新流量，升级后读数立刻可用。
+			migration18Backfill,
+		},
+	},
 }
+
+// migration18Backfill 是迁移 v18 对历史行的就地回填语句。判据与
+// deriveContextTokens / main.hostInputExclusive 同一规则：total_tokens 只作
+// 口径判据（inclusive 行 total ≈ input+output，exclusive 行还要加缓存读写，
+// 取更接近的一方），total 缺失时按形状——cache_read 非零且与 cached 不等是
+// Claude exclusive，其余（含 cached==cache_read 的宿主镜像形状）为 inclusive。
+// 返回值恒为输入侧（不含 output_tokens）。独立成常量便于测试直接跑真实语句。
+const migration18Backfill = `UPDATE requests SET context_tokens = CASE
+   WHEN cache_read_tokens > 0
+    AND cache_read_tokens <> cached_tokens
+    AND (total_tokens = 0
+         OR ABS(total_tokens - (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens))
+            < ABS(total_tokens - (input_tokens + output_tokens)))
+     THEN input_tokens + cache_read_tokens + cache_creation_tokens
+   ELSE input_tokens
+ END
+ WHERE context_tokens = 0`
 
 // migrate 把库升级到 SchemaVersion。幂等：已应用的版本会被跳过。
 func migrate(ctx context.Context, db *sql.DB) error {

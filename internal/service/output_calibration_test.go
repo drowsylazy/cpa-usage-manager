@@ -427,3 +427,102 @@ func TestBuildReservePlanDensityCalibration(t *testing.T) {
 		t.Fatalf("输入估算应按学习密度（约 100K）而非混合密度（182K）: %d", plan.InputEstimate)
 	}
 }
+
+// TestReservePlanMirrorCacheNotDoubled 端到端复现生产实锤：宿主回填把
+// OpenAI inclusive 行的 cache_read_tokens 填成 cached_tokens 的镜像值，
+// input 本身已含缓存命中。旧口径在 SQL 端拼 input+cache_read 让密度分母
+// 翻倍、学成一半（实测 glm-5.3 中位 1.991×、deepseek-v4-flash 1.923×），
+// 预占输入估算虚高约一倍 →「最近预占」实际占比恒 52%（=1/1.923）；
+// 同时把缓存读份额从 ~100% 算成 50%，金额被拆到最贵的输入档（预占
+// ¥4.49 vs 实扣 ¥0.76）。修复后：密度按真上下文学习、份额接近全读。
+func TestReservePlanMirrorCacheNotDoubled(t *testing.T) {
+	s, st := testService(t)
+	ctx := context.Background()
+	tieredPricingRule(t, s, "mirror-test")
+
+	// 拟真生产行：body 2.04MB、input 225177（含缓存命中）、cached=cache_read=224896。
+	const bodyLen, ctxTok = int64(2_043_000), int64(225_177)
+	seedMirrorRows(t, st, "mirror-test", bodyLen, ctxTok, 224_896, 12)
+
+	// 同体量请求的输入估算应落在真上下文附近，而不是真上下文 ÷0.5（≈450K）。
+	fallback := estimateInputTokens(make([]byte, bodyLen))
+	got := s.calibratedInput("mirror-test", bodyLen, fallback, 10_000_000)
+	if got < ctxTok*9/10 || got > ctxTok*11/10 {
+		t.Fatalf("输入估算应按真上下文学习（约 %d），镜像双计会得到约 %d: got %d",
+			ctxTok, ctxTok*2, got)
+	}
+
+	// 缓存读份额接近全读；旧口径分母翻倍会算成约 50%。
+	readBP, _, ok := s.cacheSharesCached("mirror-test")
+	if !ok {
+		t.Fatal("镜像行应产出缓存份额样本")
+	}
+	if readBP < 9500 {
+		t.Fatalf("缓存读份额应接近 100%%（镜像行 input 已含缓存）: got %d bp（双计口径约 5000）", readBP)
+	}
+
+	// 金额拆档：预占输入几乎全按缓存读档计，而不是一半被拆到最贵的输入档。
+	issued, err := s.IssueKey(ctx, IssueRequest{AllowedModels: []string{"mirror-*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule, _, err := s.matchPricing(ctx, "mirror-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const inputEst = int64(225_177)
+	res, err := s.Reserve(ctx, ReservationRequest{
+		KeyID: issued.KID, Model: "mirror-test",
+		EstimatedTokens: inputEst, EstimatedInput: inputEst, EstimatedOutput: 0,
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 上界：输入全部按输入价（$3/M → 675531）。全读档应为 $0.6/M → 135106。
+	allInputTier := inputEst * int64(rule.PriceInput) / 1_000_000
+	if int64(res.HeldMicroUSD) >= allInputTier {
+		t.Fatalf("镜像行预占应按缓存读档计（低于全输入档上界 %d）: got %d",
+			allInputTier, int64(res.HeldMicroUSD))
+	}
+	if int64(res.HeldMicroUSD) > inputEst*int64(rule.PriceCacheRead)/1_000_000*2 {
+		t.Fatalf("镜像行预占应贴近缓存读档: got %d", int64(res.HeldMicroUSD))
+	}
+}
+
+// seedMirrorRows 写入 n 条宿主镜像形状的成功行：input 已含缓存命中，
+// cache_read_tokens 是 cached_tokens 的副本。
+func seedMirrorRows(t *testing.T, st *store.Store, model string, bodyLen, inputTok, cached int64, n int) {
+	t.Helper()
+	ctx := context.Background()
+	batch := seedRowBatch
+	seedRowBatch++
+	base := time.Now().UTC().Add(-time.Duration(n+1) * time.Minute)
+	if !seedRowLast.IsZero() && base.Before(seedRowLast) {
+		base = seedRowLast.Add(time.Minute)
+	}
+	for i := 0; i < n; i++ {
+		r := store.Request{
+			ID:    model + "-mirror-" + strconv.FormatInt(batch, 10) + "-" + strconv.Itoa(i),
+			TS:    base.Add(time.Duration(i) * time.Second),
+			Model: model, Result: store.ResultOK, BodyLen: bodyLen,
+			InputTokens: inputTok, CachedTokens: cached, CacheReadTokens: cached,
+			OutputTokens: 200, TotalTokens: inputTok + 200,
+		}
+		if err := st.RecordPassiveUsage(ctx, r, store.PassiveDedupeHint{Models: []string{model}, Near: r.TS}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedRowLast = base.Add(time.Duration(n-1) * time.Second)
+}
+
+// mirrorBody 造一个长度 n 的最小合法请求体（全 ASCII，预占元数据解析用）。
+func mirrorBody(n int64) []byte {
+	body := make([]byte, n)
+	for i := range body {
+		body[i] = 'a'
+	}
+	body[0] = '{'
+	body[len(body)-1] = '}'
+	return body
+}

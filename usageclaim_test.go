@@ -283,3 +283,55 @@ func TestApplyHostUsageOnlyFillsBlanks(t *testing.T) {
 }
 
 func storeRequestForTest() *store.Request { return &store.Request{} }
+
+// TestNormalizeHostDetailDropsMirror 锁宿主镜像回填的去除：宿主给 OpenAI
+// inclusive 行同时填 cached 与等值的 cache_read（生产实锤 glm-5.3），
+// 保留会让分母/份额双计；真实上游不会两列同时非零且相等（OpenAI 只填
+// cached、Claude 只填 cache_read），故按形状清除 cache_read。
+func TestNormalizeHostDetailDropsMirror(t *testing.T) {
+	// 镜像形状 → cache_read 清零，cached 保留（inclusive 语义）。
+	got := normalizeHostDetail(rpcUsageDetail{
+		InputTokens: 225_177, CachedTokens: 224_896, CacheReadTokens: 224_896,
+		OutputTokens: 224, TotalTokens: 225_401,
+	})
+	if got.CacheReadTokens != 0 || got.CachedTokens != 224_896 {
+		t.Fatalf("镜像 cache_read 应被清除: %+v", got)
+	}
+	// Claude 形状（cache_read 非零且与 cached 不等）原样保留。
+	claude := rpcUsageDetail{InputTokens: 405, CacheReadTokens: 242, CacheCreationTokens: 100, OutputTokens: 603}
+	if got := normalizeHostDetail(claude); got != claude {
+		t.Fatalf("Claude 形状不应被改写: %+v", got)
+	}
+	// 无缓存字段不误伤。
+	plain := rpcUsageDetail{InputTokens: 100, OutputTokens: 20}
+	if got := normalizeHostDetail(plain); got != plain {
+		t.Fatalf("无缓存明细不应被改写: %+v", got)
+	}
+}
+
+// TestHostContextTokens 锁宿主明细的完整输入上下文归一：inclusive 行
+// （total ≈ input+output）输入原样；Claude exclusive 行（total 还要加
+// 缓存读写）补上缓存部分；total 缺失时按形状判定。
+func TestHostContextTokens(t *testing.T) {
+	cases := []struct {
+		name string
+		d    rpcUsageDetail
+		want int64
+	}{
+		{"inclusive 行按 total 判定",
+			rpcUsageDetail{InputTokens: 225_177, CachedTokens: 224_896, OutputTokens: 224, TotalTokens: 225_401}, 225_177},
+		{"inclusive 行经去镜像后同理",
+			normalizeHostDetail(rpcUsageDetail{InputTokens: 225_177, CachedTokens: 224_896, CacheReadTokens: 224_896, OutputTokens: 224, TotalTokens: 225_401}), 225_177},
+		{"Claude exclusive 行补缓存读写",
+			rpcUsageDetail{InputTokens: 405, CacheReadTokens: 242, CacheCreationTokens: 100, OutputTokens: 603, TotalTokens: 1350}, 747},
+		{"total 缺失时按 Claude 形状判定",
+			rpcUsageDetail{InputTokens: 2_000, CacheReadTokens: 8_000, CacheCreationTokens: 2_000}, 12_000},
+		{"total 缺失时按 inclusive 形状判定",
+			rpcUsageDetail{InputTokens: 5_000, CachedTokens: 3_000}, 5_000},
+	}
+	for _, c := range cases {
+		if got := hostContextTokens(c.d); got != c.want {
+			t.Fatalf("%s: got %d want %d", c.name, got, c.want)
+		}
+	}
+}

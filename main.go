@@ -1255,14 +1255,16 @@ func backfillFromHostUsage(svc *service.Service, requestID string, rec rpcUsageR
 	if rec.Detail.InputTokens <= 0 && rec.Detail.OutputTokens <= 0 && rec.Detail.TotalTokens <= 0 {
 		return
 	}
+	d := normalizeHostDetail(rec.Detail)
 	err := svc.BackfillRequestUsageByID(context.Background(), requestID, store.UsageBackfill{
-		InputTokens:         rec.Detail.InputTokens,
-		OutputTokens:        rec.Detail.OutputTokens,
-		ReasoningTokens:     rec.Detail.ReasoningTokens,
-		CachedTokens:        rec.Detail.CachedTokens,
-		CacheReadTokens:     rec.Detail.CacheReadTokens,
-		CacheCreationTokens: rec.Detail.CacheCreationTokens,
-		TotalTokens:         rec.Detail.TotalTokens,
+		InputTokens:         d.InputTokens,
+		OutputTokens:        d.OutputTokens,
+		ReasoningTokens:     d.ReasoningTokens,
+		CachedTokens:        d.CachedTokens,
+		CacheReadTokens:     d.CacheReadTokens,
+		CacheCreationTokens: d.CacheCreationTokens,
+		TotalTokens:         d.TotalTokens,
+		ContextTokens:       hostContextTokens(d),
 		TTFTMS:              rec.TTFT.Milliseconds(),
 	})
 	if err != nil {
@@ -2123,6 +2125,9 @@ func handleUsage(body []byte) ([]byte, error) {
 	if err := json.Unmarshal(body, &u); err != nil {
 		return nil, err
 	}
+	// 入口去镜像：宿主在 OpenAI 口径行上把 cache_read 填成 cached 的镜像，
+	// 留着会让后续所有分母/份额双计。归一后的明细贯穿本函数与认领交付。
+	u.Detail = normalizeHostDetail(u.Detail)
 	ctx := context.Background()
 	bf := store.UsageBackfill{
 		InputTokens:         u.Detail.InputTokens,
@@ -2132,6 +2137,7 @@ func handleUsage(body []byte) ([]byte, error) {
 		CacheReadTokens:     u.Detail.CacheReadTokens,
 		CacheCreationTokens: u.Detail.CacheCreationTokens,
 		TotalTokens:         u.Detail.TotalTokens,
+		ContextTokens:       hostContextTokens(u.Detail),
 		TTFTMS:              u.TTFT.Milliseconds(),
 	}
 	hasDetail := bf.InputTokens > 0 || bf.OutputTokens > 0 || bf.TotalTokens > 0
@@ -2225,14 +2231,71 @@ func warnf(format string, args ...any) {
 }
 
 func usageFromRecord(u rpcUsageRecord) usageparse.Usage {
+	return usageFromDetail(u.Detail)
+}
+
+// normalizeHostDetail 去镜像并返回可安全落库的宿主用量明细。
+//
+// 宿主在 OpenAI 口径（input 已含缓存命中）的行上会把 cache_read_input_tokens
+// 也填成 cached_tokens 的副本（实测 agentrouter/glm-5.3 行 input=225177、
+// cached=cache_read=224896、total=input+output）。镜像值保留会让任何
+// 「input + cache_read」式的分母双计、让 MAX(cached, cache_read) 式的份额
+// 分子失真（实测缓存读占比从 ~100% 被算成 50%）。镜像只可能是宿主产物
+// ——真实上游响应里 OpenAI 只填 cached、Claude 只填 cache_read，不会两列
+// 同时非零且相等——故按形状清除。
+func normalizeHostDetail(d rpcUsageDetail) rpcUsageDetail {
+	if d.CachedTokens > 0 && d.CacheReadTokens == d.CachedTokens {
+		d.CacheReadTokens = 0
+	}
+	return d
+}
+
+// hostInputExclusive 判定宿主明细的输入是否不含缓存（Claude exclusive 口径）。
+// 宿主明细不带口径标记，按可用信号判定：
+//  1. total_tokens 是权威判据——inclusive 行 total ≈ input+output（缓存已含在
+//     input 内），exclusive 行还要再加缓存读写；取更接近的一方。允许 thinking
+//     口径差异带来的零头偏差。
+//  2. total 缺失（0）时按形状：cache_read 非零且与 cached 不等 → Claude。
+//  3. 其余（含宿主镜像行——已在 normalizeHostDetail 清零）按 OpenAI inclusive。
+func hostInputExclusive(d rpcUsageDetail) bool {
+	if d.TotalTokens > 0 {
+		incl := d.InputTokens + d.OutputTokens
+		excl := incl + d.CacheReadTokens + d.CacheCreationTokens
+		return abs64(d.TotalTokens-excl) < abs64(d.TotalTokens-incl)
+	}
+	return d.CacheReadTokens > 0 && d.CacheReadTokens != d.CachedTokens
+}
+
+// hostContextTokens 归一宿主明细的完整输入上下文（schema v18 的
+// context_tokens）：OpenAI/Gemini 的 input 已含缓存命中，原样即是；
+// Claude 的 input 不含缓存读写，须补上。
+func hostContextTokens(d rpcUsageDetail) int64 {
+	ctx := d.InputTokens
+	if hostInputExclusive(d) {
+		ctx += d.CacheReadTokens + d.CacheCreationTokens
+	}
+	return ctx
+}
+
+func abs64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// usageFromDetail 把宿主上报的用量明细转成归一 Usage。明细须先经
+// normalizeHostDetail 去镜像；口径按 total/形状判定（hostInputExclusive）。
+func usageFromDetail(d rpcUsageDetail) usageparse.Usage {
 	return usageparse.Usage{
-		InputTokens:         u.Detail.InputTokens,
-		OutputTokens:        u.Detail.OutputTokens,
-		ReasoningTokens:     u.Detail.ReasoningTokens,
-		CachedTokens:        u.Detail.CachedTokens,
-		CacheReadTokens:     u.Detail.CacheReadTokens,
-		CacheCreationTokens: u.Detail.CacheCreationTokens,
-		TotalTokens:         u.Detail.TotalTokens,
+		InputTokens:         d.InputTokens,
+		OutputTokens:        d.OutputTokens,
+		ReasoningTokens:     d.ReasoningTokens,
+		CachedTokens:        d.CachedTokens,
+		CacheReadTokens:     d.CacheReadTokens,
+		CacheCreationTokens: d.CacheCreationTokens,
+		TotalTokens:         d.TotalTokens,
+		InputIncludesCache:  !hostInputExclusive(d),
 	}
 }
 
@@ -2292,8 +2355,11 @@ func usageRecordToRequest(st *store.Store, u rpcUsageRecord) store.Request {
 		CacheReadTokens:     u.Detail.CacheReadTokens,
 		CacheCreationTokens: u.Detail.CacheCreationTokens,
 		TotalTokens:         u.Detail.TotalTokens,
-		LatencyMS:           u.Latency.Milliseconds(),
-		TTFTMS:              u.TTFT.Milliseconds(),
+		// 完整输入上下文（schema v18）：被动行的密度分母来源。body_len 为 0
+		// 不进密度样本，但份额口径与执行器行同源。
+		ContextTokens: hostContextTokens(u.Detail),
+		LatencyMS:     u.Latency.Milliseconds(),
+		TTFTMS:        u.TTFT.Milliseconds(),
 		// 被动路径拿不到请求体，body_len 保持 0（密度学习的样本只来自
 		// 执行器路径，被动行不进样本查询）。
 	}

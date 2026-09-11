@@ -297,6 +297,9 @@ type UsageBackfill struct {
 	CacheCreationTokens int64
 	TotalTokens         int64
 	TTFTMS              int64
+	// ContextTokens 是调用方算好的完整输入上下文（schema v18）：宿主记录
+	// 不带口径标记，由调用方做去镜像归一后传入，回填与初始落库同口径。
+	ContextTokens int64
 }
 
 // Request 是一条逐请求记录（tracker 明细与 credit-manager 账本合并）。
@@ -356,6 +359,12 @@ type Request struct {
 	// 被动路径）。与 input_tokens 一起构成输入密度学习的样本对：
 	// body_len ÷ input_tokens = 该请求的真实字节/token 密度。
 	BodyLen int64 `json:"body_len,omitempty"`
+	// ContextTokens 是归一后的完整输入上下文 token（schema v18；0=未记录）：
+	// inclusive 口径（OpenAI/Gemini）= input_tokens 原值，exclusive 口径
+	// （Claude）= input + cache_read + cache_creation，落库时由
+	// usageparse.Usage.ContextTokens() 算好。密度与缓存份额学习只读该列——
+	// 在 SQL 端按 input+cache_read 拼分母会被宿主回填的镜像值双计。
+	ContextTokens int64 `json:"context_tokens,omitempty"`
 }
 
 // AuditEvent 是一条审计事件。

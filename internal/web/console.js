@@ -3271,22 +3271,32 @@ async function loadRecent() {
       state = '<span class="pill warn" title="未走到结算即释放：上游错误、无响应或超时清扫，未产生扣费">已释放</span>';
       ratio = '<span class="pill" title="预占已全额退回，未扣费">退回</span>';
     }
+    // Token 与金额各自合成一列（预估 → 实际），占比徽标并入 Token 列：
+    // 原先 10 列排布把「预估/实际/占比」三个强关联读数拆到三列，视线要横跨
+    // 整行才能对照，宽屏与窄屏都难读。
+    const tok = '<span class="cell-pair">'
+      + '<span class="pre">' + fmtTok(x.reserved_tokens || 0) + '</span>'
+      + '<span class="arrow">→</span>'
+      + '<span class="act">' + (x.status === 'settled' && x.settled_tokens > 0 ? fmtTok(x.settled_tokens) : '—') + '</span>'
+      + '</span>';
+    const cash = '<span class="cell-pair">'
+      + '<span class="pre">' + (x.held_micro_usd > 0 ? fmtCur(x.held_micro_usd) : '—') + '</span>'
+      + '<span class="arrow">→</span>'
+      + '<span class="act">' + (x.status === 'settled' && x.settled_micro_usd > 0 ? fmtCur(x.settled_micro_usd) : '—') + '</span>'
+      + '</span>';
     return '<tr>'
       + '<td class="cell-mono" title="' + esc(x.finished_at || '') + '">' + (x.finished_at ? rel(x.finished_at) : '-') + '</td>'
       + '<td class="cell-mono cell-clip" style="max-width:180px" title="' + esc(label ? label + ' · ' + x.key_id : x.key_id || '') + '">'
       + esc(label || x.key_id || '-') + '</td>'
       + '<td class="cell-mono cell-clip" style="max-width:220px" title="' + esc(x.model || '') + '">' + esc(x.model || '-') + '</td>'
       + '<td>' + state + '</td>'
-      + '<td class="num">' + fmtTok(x.reserved_tokens || 0) + '</td>'
-      + '<td class="num">' + (x.status === 'settled' && x.settled_tokens > 0 ? fmtTok(x.settled_tokens) : '—') + '</td>'
-      + '<td class="ctr">' + ratio + '</td>'
-      + '<td class="num">' + (x.held_micro_usd > 0 ? fmtCur(x.held_micro_usd) : '—') + '</td>'
-      + '<td class="num">' + (x.status === 'settled' && x.settled_micro_usd > 0 ? fmtCur(x.settled_micro_usd) : '—') + '</td>'
+      + '<td class="num">' + tok + ' ' + ratio + '</td>'
+      + '<td class="num">' + cash + '</td>'
       + '<td class="num" title="' + esc(x.created_at || '') + ' 创建">' + (x.age_ms > 0 ? fmtDur(Math.round(x.age_ms / 1000)) : '-') + '</td>'
       + '</tr>';
   }).join('');
   note.textContent = items.length
-    ? '实际占比 = 实际消耗 ÷ 预估 Token。70%–130% 为健康区间（双向）；金额列为预占 vs 实扣对照（缓存拆档让预占金额贴近实扣）。'
+    ? '实际占比 = 实际消耗 ÷ 预估 Token（Token 列的箭头右侧为实际值）。70%–130% 为健康区间；金额列对照预占与实扣，缓存拆档让两者贴近。'
     : '暂无已完结的预占记录（随保留期清理）。';
 }
 $('held-refresh').addEventListener('click', () => { loadRecent().catch(() => {}); });
@@ -3306,40 +3316,43 @@ async function loadDensities() {
     return;
   }
   rows.innerHTML = items.map(x => {
-    const drifted = x.drifted
-      ? ' <span class="pill warn" title="近期请求体构成与历史明显不同（如 compact 后摘要替代原始代码），已改按近期密度折算">已漂移</span>' : '';
     let cells;
     if (!x.samples) {
       // 重置后不足 3 条新样本：密度读数无意义，显示待学习态（不再触发
-      // 漂移/口径列，避免把 0 当成真实读数）。
-      cells = '<td class="num">—</td><td class="num">—</td><td class="num">—</td>'
-        + '<td class="num">—</td><td class="num">0</td>'
-        + '<td>待学习</td>';
+      // 漂移/状态列，避免把 0 当成真实读数）。
+      cells = '<td class="num">—</td><td class="num">—</td><td class="num">0</td>'
+        + '<td><span class="pill warn" title="学习基线已重置，等新流量跑够 3 条自动恢复读数">待学习</span></td>';
     } else {
       const d = (x.milli_density / 1000).toFixed(1);
       const mad = (x.milli_mad / 1000).toFixed(1);
-      // 与混合密度直觉的对照：4 字节/token 是英文/代码的常识值。
-      const vs = x.milli_density > 0 ? (x.milli_density / 4000 * 100).toFixed(0) + '% of 4B' : '';
       const rd = x.cache_read_bp > 0 ? (x.cache_read_bp / 100).toFixed(0) + '%' : '—';
       const wr = x.cache_create_bp > 0 ? (x.cache_create_bp / 100).toFixed(0) + '%' : '—';
-      cells = '<td class="num" title="请求体字节 ÷ 完整输入上下文 token，近期成功请求的中位数（漂移时取近期窗口）">' + d + ' B/token</td>'
-        + '<td class="num" title="绝对中位差：样本密度的离散程度，越小越稳定">± ' + mad + '</td>'
-        + '<td class="num" title="近期 token 加权：缓存读占完整输入上下文的份额（token 计）">' + rd + '</td>'
-        + '<td class="num" title="近期 token 加权：缓存写占完整输入上下文的份额（token 计）">' + wr + '</td>'
+      // 密度与离散度同列（读数 + ±MAD 小字），缓存读写同列：这两组各自
+      // 是「一个读数 + 一个精度/结构说明」，拆成四列后每列都很空。
+      cells = '<td class="num"><span class="cell-pair">'
+        + '<span class="pre" title="请求体字节 ÷ 完整输入上下文 token 的中位数（最近成功请求）">' + d + ' B/token</span>'
+        + '<span class="arrow">±</span><span class="act" title="绝对中位差：样本密度的离散程度，越小越稳定">' + mad + '</span>'
+        + '</span></td>'
+        + '<td class="num"><span class="cell-pair">'
+        + '<span class="pre" title="缓存读占完整输入上下文的份额（token 加权），预占输入按此比例拆到缓存读档计价">读 ' + rd + '</span>'
+        + '<span class="arrow">/</span><span class="act" title="缓存写占完整输入上下文的份额（token 加权），按缓存写档计价">写 ' + wr + '</span>'
+        + '</span></td>'
         + '<td class="num">' + x.samples + '</td>'
-        + '<td title="学习密度相对 4 字节/token 常识值的比值：100% 即与常识一致，低于 100% 说明该模型 tokenizer 更省字节">' + vs + '</td>';
+        + '<td>' + (x.drifted
+          ? '<span class="pill warn" title="近期请求体构成与历史明显不同（如 compact 后摘要替代原始代码），已改按近期密度折算">已漂移</span>'
+          : '<span class="pill live" title="近期样本与历史密度的离散度在正常带内">学习中</span>') + '</td>';
     }
     // 重置过则标出基线时刻（悬浮可见），提示读数只统计基线之后的流量。
     const resetTip = x.reset_at
       ? ' · 学习基线已重置为 ' + fmtDT(x.reset_at, true) + '，只统计此后的流量' : '';
     return '<tr>'
-      + '<td class="cell-mono cell-clip" style="max-width:260px" title="' + esc((x.model || '') + resetTip) + '">' + esc(x.model || '-') + drifted + '</td>'
+      + '<td class="cell-mono cell-clip" style="max-width:260px" title="' + esc((x.model || '') + resetTip) + '">' + esc(x.model || '-') + '</td>'
       + cells
       + '<td class="w-act"><button type="button" class="btn small" data-den-reset="' + esc(x.model || '') + '">重置</button></td>'
       + '</tr>';
   }).join('');
   sub.textContent = items.length
-    ? '各模型输入预占学习到的等效密度与缓存构成：密度决定 token 折算，缓存占比决定金额拆档'
+    ? '各模型输入预占学习到的等效密度与缓存构成：密度决定 token 折算，缓存构成决定金额拆档'
     : '暂无密度样本：新流量跑过几条成功请求后自动学习（历史行不带请求体长度）';
 }
 // 重置某模型的学习基线：确认后把基线推到此刻，此后按当前请求体构成

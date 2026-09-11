@@ -256,6 +256,11 @@ func main() {
 					}
 				} else {
 					cached = int64(float64(in) * (0.2 + rng.Float64()*0.5)) // 含于输入
+					// 复现宿主回填的镜像形状：OpenAI 口径行的 cache_read 会被
+					// 填成 cached 的副本（input 已含缓存命中，再拼即双计）。
+					// 生产实测 1056 条镜像 / 5 条干净，种子必须一致，否则密度
+					// 面板与预占金额的验证都绕过了真实口径。
+					cacheR = cached
 				}
 			}
 			reasoning := int64(0)
@@ -285,17 +290,31 @@ func main() {
 				tpsMilli = int64(tps * 1000)
 			}
 
-			total := in + out + cacheR + cacheW
+			// total 按各自口径上报：OpenAI/Gemini 的 in 已含缓存命中，
+			// total = in + out；Claude 的 in 不含缓存读写，total 还要加
+			// 缓存读写。这个差异是 context_tokens 口径判据的依据，种子
+			// 必须如实还原，否则面板读数验证的是假口径。
+			total := in + out
+			if m.provider == "anthropic" {
+				total = in + out + cacheR + cacheW
+			}
 			cost := priceOf(m, in-cached, out, cacheR, cacheW)
 			priced := m.inPrice != 0 || m.outPrice != 0
 			if isFail {
 				cost = 0
 			}
 			costTotal += cost
-			// body_len 供密度学习：按 6–8 字节/token 的拟真密度反推，
-			// 让「估算密度」面板有可学习的样本（失败行也带——密度查询
-			// 只取 result=ok，多写无害且与执行器路径「先落库后知结果」一致）。
-			bodyLen := int64(float64(in+cacheR+cacheW) * (6 + rng.Float64()*2))
+			// body_len 供密度学习：按 6–8 字节/token 的拟真密度反推，让
+			// 「估算密度」面板有可学习的样本（失败行也带——密度查询只取
+			// result=ok，多写无害且与执行器路径「先落库后知结果」一致）。
+			// 反推用**真实输入上下文**：OpenAI 口径的 in 已含缓存命中，
+			// Claude 口径的 in 不含缓存读写——用错分母会让种子密度失真，
+			// 掩盖面板读数是否真实。
+			ctxTok := in
+			if m.provider == "anthropic" {
+				ctxTok = in + cacheR + cacheW
+			}
+			bodyLen := int64(float64(ctxTok) * (6 + rng.Float64()*2))
 
 			r := store.Request{
 				ID:       fmt.Sprintf("seed-%d-%d-%d", now.UnixNano(), d, i),

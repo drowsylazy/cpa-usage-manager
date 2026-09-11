@@ -674,6 +674,13 @@ table.data td.cell-clip{max-width:340px;overflow:hidden;text-overflow:ellipsis}
   font-variant-numeric:tabular-nums;font-size:12px;justify-content:flex-end;width:100%}
 .cell-lat .arrow{color:var(--line3)}
 .cell-lat .ttft{color:var(--fg3)}
+/* 实时页：预估→实际、密度±MAD、读/写 这类「主读数 + 伴随读数」对合并进一格。
+   伴随值降一级色阶，箭头/分隔符用最浅线色，避免与主读数争夺注意力。 */
+.cell-pair{display:inline-flex;align-items:baseline;gap:5px;font-family:var(--mono);
+  font-variant-numeric:tabular-nums;font-size:12px;justify-content:flex-end;width:100%}
+.cell-pair .pre{color:var(--fg)}
+.cell-pair .act{color:var(--fg2)}
+.cell-pair .arrow{color:var(--line3)}
 
 /* ── 徽标 / 空态 / 骨架 ───────────────────────────────────────── */
 .pill{
