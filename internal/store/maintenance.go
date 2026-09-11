@@ -84,7 +84,7 @@ func (s *Store) BackupTo(ctx context.Context, w io.Writer, opts BackupOptions) (
 // RestoreResult 汇报一次恢复导入的行数。
 //
 // UndecryptableKeys / PepperWarning 由 service 层在恢复成功后自检填充
-//（用当前 pepper 集逐个试解 plugin_keys.encrypted_material）：快照不含
+// （用当前 pepper 集逐个试解 plugin_keys.encrypted_material）：快照不含
 // key-peppers，恢复到 pepper 不同的环境时密钥会全部不可用——必须在恢复
 // 完成的同一响应里把这件事说清楚，不能等用户发现所有 Key 401 才知道。
 type RestoreResult struct {

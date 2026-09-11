@@ -140,7 +140,7 @@ func (s *Service) RunAutoBackup(ctx context.Context, dir string, keep int) (stri
 }
 
 // writePepperSidecar 把当前 pepper 集序列化为 LoadPeppers 兼容的 JSON 对象
-//（id→base64），写到 .bak 同名 .peppers 侧车（0600）。返回侧车路径。
+// （id→base64），写到 .bak 同名 .peppers 侧车（0600）。返回侧车路径。
 func (s *Service) writePepperSidecar(bakPath string) (string, error) {
 	m := make(map[string]string, len(s.peppers.Items))
 	for id, p := range s.peppers.Items {
