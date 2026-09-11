@@ -695,7 +695,14 @@ func jsonStr(v json.RawMessage) string {
 // 面板发的是裸数字（token_limit: 500000），但历史上金额字段走的是字符串口径，
 // 两种都得接。只用 jsonStr 会把裸数字读成空串（json.Unmarshal 到 string 失败
 // 但错误被忽略），进而报「必须是整数」——一个只在数字入参时触发的伪校验失败。
+//
+// JSON null 显式报错（encoding/json 对 null 解到整数是静默 no-op 返回 0）：
+// 限额语义里 0=禁用、null=清空，静默 null→0 会把「清空限额」翻转成「禁用」。
+// 现有调用方都在外层预检 string(v)=="null"，这里是给未来调用方的兜底防线。
 func jsonInt64(v json.RawMessage) (int64, error) {
+	if string(v) == "null" {
+		return 0, fmt.Errorf("null 不是合法整数（限额清空请在外层按 null 语义处理）")
+	}
 	var n int64
 	if err := json.Unmarshal(v, &n); err == nil {
 		return n, nil
