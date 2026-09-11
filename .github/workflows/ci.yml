@@ -22,10 +22,15 @@ jobs:
           fi
       - name: go vet
         run: go vet ./...
-      - name: node --check（console.js）
+      - name: node（拼接语法检查 + 前端单测）
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: node --check internal/web/console.js
+      # console.js 已拆分为 internal/web/js/*.js，仓库不再有整份文件：
+      # 语法检查跑在拼接产物上，行为断言见 scripts/js-tests.mjs。
+      - run: |
+          go run scripts/assemble-js.go > /tmp/console.assembled.js
+          node --check /tmp/console.assembled.js
+          node scripts/js-tests.mjs
       - name: test
         run: go test ./...

@@ -51,7 +51,7 @@ func tableHeadBlock(t *testing.T, html, id string) string {
 // 预占→实扣、密度±MAD、读/写 各自合并为一格（改动前是 10 列/8 列，
 // 强关联读数被拆散到整行两端）。
 func TestLiveTabMergedCells(t *testing.T) {
-	js := string(consoleJS)
+	js := string(ConsoleJS())
 	for _, want := range []string{"cell-pair", "Token 预估 → 实际", "金额 预占 → 实扣", "缓存构成（读 / 写）"} {
 		// 标签在 HTML、类在 JS，分别断言。
 		if !strings.Contains(string(consoleHTML), want) && !strings.Contains(js, want) {

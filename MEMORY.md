@@ -9,7 +9,7 @@
 - 发版流程（**v0.6.2 起改为双提交**，用户明确指示）：①代码提交在前，message 不带版本号（前缀按变更类型 `feat:` / `fix:` / `perf:` 等）；②发版单独一个提交，message 固定为 `release: vX.Y.Z`（内容 = registry.json 版本号 + CHANGELOG.md 顶部新增版本条目 + AGENTS.md 项目状态里的版本号范围），打 `vX.Y.Z` 标签推送 → CI 自动构建四平台并创建 GitHub Release。推送后**不**监控 CI（仓库约定）。
 - 仓库文档与用户沟通使用中文。
 - **审计功能已整体弃用（2026-08 用户明确指示）**：本项目不需要审计功能。不再新增任何审计向功能（审计面板页、audit 导出/归档/保留期清理等一律不做）；存量 `audit_events` 表仅承载内部机制的既有留痕（route.ai_fallback / route.failover / 密钥操作回执等），维持现状，不在其上扩展。
-- **UI 改动禁止跑 playwright/浏览器自动化验证**（用户两次明确叫停：先投诉链式调用卡死，后直接要求「停止做这种测试」）。交付前只做 `$env:GOROOT='D:\Go'; go build ./...` + `node --check internal/web/console.js`，页面效果交用户自己打开目验（需要时提示 `go run scripts/devserver.go` → 127.0.0.1:18080/console，密钥 dev-secret）。写新交互代码时要静态自查事件绑定是否覆盖所有容器（教训：复制委托只挂了 #key-rows，抽屉里的同款按钮成死键）、flex 容器的滚动区要显式 flex:1+min-height:0（教训：抽屉底栏不贴底）。
+- **UI 改动禁止跑 playwright/浏览器自动化验证**（用户两次明确叫停：先投诉链式调用卡死，后直接要求「停止做这种测试」）。交付前只做 `$env:GOROOT='D:\Go'; go build ./...` + node 拼接产物语法检查（`go run scripts/assemble-js.go > %TEMP%\console.js && node --check %TEMP%\console.js`）+ `node scripts/js-tests.mjs`（前端纯函数行为断言），页面效果交用户自己打开目验（需要时提示 `go run scripts/devserver.go` → 127.0.0.1:18080/console，密钥 dev-secret）。写新交互代码时要静态自查事件绑定是否覆盖所有容器（教训：复制委托只挂了 #key-rows，抽屉里的同款按钮成死键）、flex 容器的滚动区要显式 flex:1+min-height:0（教训：抽屉底栏不贴底）。**本机 node 不在 PATH**：fnm 管装，位于 `/d/fnm/node-versions/v24.19.0/installation/`（Git Bash 里 `export PATH="/d/fnm/node-versions/v24.19.0/installation:$PATH"`）。
 
 ## Architecture decisions
 
@@ -18,6 +18,8 @@
 - 面板 Token 显示用 `fmtTok`（K/M/B 自动升级，阈值取 999.5 倍数避免 1000K）；概览「总消耗 Token」主值完整显示精确到个位。非 token 数字仍用 `fmtInt`（万/亿）。
 
 ## Discovered durable knowledge
+
+- **2026-09 console.js 拆分为 internal/web/js/*.js（构建期拼接）**：单文件 3922 行单 IIFE 拆成 10 段（文件名前缀即拼接顺序，00-head…99-boot），web.go `assembleJS()` 按显式清单 `jsParts` 拼接注入 HTML 占位符；拆分经「拼回产物与原 console.js 逐字节 cmp 一致」验证后才删旧文件。**改动约定**：①新增代码放对应分段，新增段文件必须登记进 jsParts（web 测试拒绝孤儿文件），并把 scripts/js-tests.mjs 里的段清单同步；②组件实例化/DOM 绑定只能进 99-boot 之前的既有「启动」相关段，「启动」段必须保持最末（web 测试钉住执行顺序，防 v0.7.4 TDZ 白屏复发）；③整份语法检查跑拼接产物（`go run scripts/assemble-js.go`），不再是仓库内的 console.js 文件；④前端纯函数（fmtTok/fmtInt/fmtUSD/esc 等）行为断言在 scripts/js-tests.mjs（node vm 沙箱垫 localStorage 后加载 10-utils.js），此前前端是 255 个 Go 测试里唯一的零单测层。版本历史同步迁出 AGENTS.md → CHANGELOG.md（AGENTS.md 78KB→4.5KB，逐版本细节查 CHANGELOG）。
 
 - **2026-09 `docs/routing.md` 重写（文档漂移教训）**：该手册是 v0.6.0 一次写成的速查稿，此后 v0.7.1（第三批变量 hour/weekday/has_tools/has_system/kid/key_label/caller_id、布尔字面量、请求次数限额）、v0.7.1/12 起 `route.failover` 与 `route.ai_fallback` **审计事件退役**（转移轨迹与 AI 回落改为随结算行落 `error_note`「原因」列）、计价模式预占/结算分叉（target 预占按链首选目标、结算按最终成功目标）等全部演进都没回写，读者按文档根本读不到真实行为——**面板「规则手册 ↗」链接直接指向该文件**，所以它是用户可见的一等交付物，改路由行为时须同批更新。重写定式：①变量表逐条对齐 `BuildRouteEnv` 的真实口径，特别标出 `input_tokens` 是混合密度粗估、封顶 `max_token_estimate`，**不**套用预占那套按模型学习的密度折算（两套口径不同，旧版含糊带过极易被误读为同一套）；②补齐「保存期拦什么 / 不拦什么」——语法、别名形态与三类撞名、`ai_judge` 需先配评判模型会拦；**未知变量与条件类型错误是求值期错误、保存期不拦**，保存成功后可能每条请求都失败，这是头号踩坑点；③加权语义写全（抽中者恒排首、其余按权重降序、同权重保持声明序、重复名与空列表报错、`priority` 不查重）；④冷却补 `MarkRouteSuccess`（成功即清冷却，不必等满）与 429 `Retry-After` 钳制 1s~10min；⑤新增「观测与排障」节（请求明细 / 上游路由 / 目标健康三个观测面 + 现象→原因对照表）。**校验方式**：文档里的示例脚本用真实 `routelang.Compile` + `Eval` 跑一遍（临时测试注册全部示例，通过后删除）——纯人工阅读会漏掉拼错的变量名与不合法的链形态。教训：**面向用户的长文档要么随行为同批改，要么会在几个版本内变成误导源**；参考手册类文档至少要把「保存期拦 / 求值期拦」和「口径与直觉不同处」写死在显眼位置。
 
