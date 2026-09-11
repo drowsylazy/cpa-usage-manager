@@ -157,6 +157,7 @@ backup:                               # 每日自动备份（默认关闭）
   keep: 7                             # 保留份数
   hour: 4                             # 每日触发的本地小时
   max_bytes: 268435456                # 备份/恢复单文件上限（默认 256MiB）
+  include_peppers: false              # 自动备份附带 .peppers 侧车（0600），跨机恢复免手工迁移 pepper
 
 response_compression: true            # 管理面板响应 gzip
 response_compression_min_bytes: 1024

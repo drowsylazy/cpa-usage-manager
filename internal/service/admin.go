@@ -3,7 +3,9 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/drowsylazy/cpa-usage-manager/internal/config"
 	"github.com/drowsylazy/cpa-usage-manager/internal/money"
 	"github.com/drowsylazy/cpa-usage-manager/internal/store"
 )
@@ -86,6 +89,11 @@ func (s *Service) Backup(ctx context.Context, w io.Writer, actor string) (store.
 
 // RunAutoBackup 写出一份定时备份文件（与 /backup 下载同格式）并按 keep
 // 轮转删除最旧份。返回文件路径。dir 不存在时按 0700 创建。
+//
+// backup.include_peppers 开启时，另写同名 .peppers 侧车（0600，JSON 对象
+// id→base64，LoadPeppers 可直接解析）：快照本身不含 key-peppers，恢复到
+// 其他机器时缺了它密钥会全部不可用。侧车与快照同样敏感，写失败只记审计
+// 不中断备份——快照价值独立成立。
 func (s *Service) RunAutoBackup(ctx context.Context, dir string, keep int) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("创建备份目录失败: %w", err)
@@ -110,15 +118,47 @@ func (s *Service) RunAutoBackup(ctx context.Context, dir string, keep int) (stri
 		_ = os.Remove(tmpPath)
 		return "", err
 	}
+	sidecar := ""
+	if s.cfg.Backup.IncludePeppers {
+		if p, err := s.writePepperSidecar(final); err != nil {
+			// 快照已成立，侧车失败不回滚：审计里留痕让缺口可见。
+			sidecar = "失败: " + err.Error()
+		} else {
+			sidecar = p
+		}
+	}
 	s.rotateAutoBackups(dir, keep)
+	detail := map[string]any{"bytes": res.Bytes, "path": final}
+	if s.cfg.Backup.IncludePeppers {
+		detail["peppers_sidecar"] = sidecar
+	}
 	_ = s.st.AppendAudit(ctx, store.AuditEvent{
 		Actor: "auto", Action: "system.auto_backup", EntityType: "system", EntityID: "database",
-		Detail: map[string]any{"bytes": res.Bytes, "path": final},
+		Detail: detail,
 	})
 	return final, nil
 }
 
+// writePepperSidecar 把当前 pepper 集序列化为 LoadPeppers 兼容的 JSON 对象
+//（id→base64），写到 .bak 同名 .peppers 侧车（0600）。返回侧车路径。
+func (s *Service) writePepperSidecar(bakPath string) (string, error) {
+	m := make(map[string]string, len(s.peppers.Items))
+	for id, p := range s.peppers.Items {
+		m[id] = base64.StdEncoding.EncodeToString(p.Value)
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return "", err
+	}
+	path := bakPath + ".peppers"
+	if err := os.WriteFile(path, raw, config.PepperFilePerm); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
 // rotateAutoBackups 删除超出 keep 份数的最旧备份（文件名时间戳降序，尾部即最旧）。
+// .peppers 侧车跟随其 .bak 同步删除；孤儿侧车（.bak 已不在，如上次运行中途崩溃）一并清掉。
 func (s *Service) rotateAutoBackups(dir string, keep int) {
 	entries, err := os.ReadDir(dir)
 	if err != nil || keep < 1 {
@@ -134,8 +174,23 @@ func (s *Service) rotateAutoBackups(dir string, keep int) {
 		return
 	}
 	sort.Strings(names) // 时间戳命名，字典序即时间序
-	for _, n := range names[:len(names)-keep] {
+	stale := names[:len(names)-keep]
+	kept := make(map[string]bool, len(names)-len(stale))
+	for _, n := range names[len(stale):] {
+		kept[n] = true
+	}
+	for _, n := range stale {
 		_ = os.Remove(filepath.Join(dir, n))
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, "cpa-usage-manager_") || !strings.HasSuffix(name, ".bak.peppers") {
+			continue
+		}
+		bak := strings.TrimSuffix(name, ".peppers")
+		if !kept[bak] {
+			_ = os.Remove(filepath.Join(dir, name))
+		}
 	}
 }
 
@@ -171,18 +226,65 @@ func (s *Service) ResetModelDensity(ctx context.Context, model, actor string) er
 
 // Restore 用上传的快照替换库内容，并记审计。
 //
-// 注意：备份文件不含 key-peppers。恢复到另一台机器时必须同时带上
-// data_dir/key-peppers，否则 Key 密文无法解密（哈希校验仍可用）。
+// 备份文件不含 key-peppers。恢复完成后立即用当前 pepper 集对库内全部密文
+// 做一次解密自检：检不出的 Key 数与人读告警填进 RestoreResult（pepper 不
+// 匹配时 HMAC 校验同样失败，表现为所有 Key 401——必须在恢复响应里当场
+// 说清，而不是等用户把「密钥失效」误判成恢复本身的问题）。
 func (s *Service) Restore(ctx context.Context, src io.Reader, actor string) (store.RestoreResult, error) {
 	res, err := s.st.RestoreFrom(ctx, src, s.backupMaxBytes())
 	if err != nil {
 		return store.RestoreResult{}, err
 	}
+	if bad, err := s.checkKeyDecryptability(ctx); err == nil && bad > 0 {
+		res.UndecryptableKeys = bad
+		res.PepperWarning = fmt.Sprintf(
+			"检测到 %d 个密钥无法用当前 key-peppers 解密：若备份来自其他机器，请恢复对应的 key-peppers 文件后重启宿主，否则这些密钥将无法鉴权也无法查看明文。", bad)
+	}
+	detail := map[string]any{"bytes": res.Bytes, "tables": res.Tables}
+	if res.UndecryptableKeys > 0 {
+		detail["undecryptable_keys"] = res.UndecryptableKeys
+	}
 	_ = s.st.AppendAudit(ctx, store.AuditEvent{
 		Actor: actor, Action: "system.restore", EntityType: "system", EntityID: "database",
-		Detail: map[string]any{"bytes": res.Bytes, "tables": res.Tables},
+		Detail: detail,
 	})
 	return res, nil
+}
+
+// checkKeyDecryptability 用当前 pepper 集试解库内全部密文，返回解不开的
+// Key 数。逐 Key 先按其 pepper_id 取 pepper、缺失时退回全集合尝试（轮换
+// 场景下记录的 id 可能已不在集合里但值仍在）。无密文的旧 Key 跳过不计。
+// 自检失败（读库出错）由调用方按 err==nil 之外的分支静默放行——恢复本身
+// 已成功，不能因自检故障报 400 让用户误以为恢复失败。
+func (s *Service) checkKeyDecryptability(ctx context.Context) (int, error) {
+	materials, err := s.st.ListKeyMaterials(ctx)
+	if err != nil {
+		return 0, err
+	}
+	bad := 0
+	for _, m := range materials {
+		if len(m.EncryptedMaterial) == 0 {
+			continue
+		}
+		if !s.canDecrypt(m.PepperID, m.EncryptedMaterial) {
+			bad++
+		}
+	}
+	return bad, nil
+}
+
+func (s *Service) canDecrypt(pepperID string, ciphertext []byte) bool {
+	if p, ok := s.peppers.Items[pepperID]; ok {
+		if _, err := decrypt(p.Value, ciphertext); err == nil {
+			return true
+		}
+	}
+	for _, p := range s.peppers.Items {
+		if _, err := decrypt(p.Value, ciphertext); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // Reset 按范围清空统计，并记审计。

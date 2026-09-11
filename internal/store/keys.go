@@ -323,6 +323,37 @@ func keyFilterWhere(f KeyFilter, nowMS int64) ([]string, []any) {
 	return where, args
 }
 
+// KeyMaterial 是密钥安全材料的最小读取视图，专供恢复后的可解密性自检
+// （service 层用当前 pepper 集逐个试解 EncryptedMaterial）。
+type KeyMaterial struct {
+	KID               string
+	PepperID          string
+	EncryptedMaterial []byte
+}
+
+// ListKeyMaterials 读出全部 Key 的安全材料。恢复自检是低频管理动作，
+// 全量装载可接受；不返回 key_hash 等其余敏感列。
+func (s *Store) ListKeyMaterials(ctx context.Context) ([]KeyMaterial, error) {
+	var out []KeyMaterial
+	err := s.Read(ctx, func(qr Querier) error {
+		rows, err := qr.QueryContext(ctx,
+			`SELECT kid, pepper_id, encrypted_material FROM plugin_keys ORDER BY kid`)
+		if err != nil {
+			return fmt.Errorf("读取密钥材料失败: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var m KeyMaterial
+			if err := rows.Scan(&m.KID, &m.PepperID, &m.EncryptedMaterial); err != nil {
+				return fmt.Errorf("扫描密钥材料失败: %w", err)
+			}
+			out = append(out, m)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
 // ListKeys 按条件列出 Key，返回结果与匹配总数。
 func (s *Store) ListKeys(ctx context.Context, f KeyFilter) ([]PluginKey, int64, error) {
 	nowMS := time.Now().UTC().UnixMilli()

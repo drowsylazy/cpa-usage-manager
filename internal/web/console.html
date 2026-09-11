@@ -362,7 +362,7 @@
 
   <div class="split even">
     <article class="panel">
-      <div class="panel-head"><div><h2 class="panel-title">备份与恢复</h2><p class="panel-sub">备份不含 key-peppers，换机时须一并复制 data_dir/key-peppers</p></div></div>
+      <div class="panel-head"><div><h2 class="panel-title">备份与恢复</h2><p class="panel-sub">备份不含 key-peppers（配置 backup.include_peppers 可让自动备份附带 .peppers 侧车）；换机时须一并迁移 pepper 文件，恢复后不可解密会当场告警</p></div></div>
       <div class="panel-body stack">
         <div class="btn-row">
           <button type="button" class="btn primary" id="backup-btn">

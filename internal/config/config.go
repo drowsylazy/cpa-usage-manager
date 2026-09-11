@@ -173,6 +173,12 @@ type BackupConfig struct {
 	// 历史默认曾是 64MiB——默认保留期一年、高频部署的 requests 表完全
 	// 可能超过它，届时备份与恢复双双失败，而那正是最需要备份的时候。
 	MaxBytes int64 `yaml:"max_bytes"`
+	// IncludePeppers 开启后，自动备份在 .bak 旁写出同名 .peppers 侧车文件
+	// （0600，内容为当前 pepper 集）。快照本身不含 key-peppers：恢复到其他
+	// 机器时缺了它，密钥的 HMAC 校验与密文解密都会失败（密钥全部不可用）。
+	// 侧车与快照同样敏感，目录已在 data_dir（0700）内；默认关闭以维持
+	// 「备份不含 pepper」的旧口径，显式开启即确认该目录可承载密钥材料。
+	IncludePeppers bool `yaml:"include_peppers"`
 }
 
 // MaxBytesOrDefault 返回生效的备份上限（max_bytes 归一）。

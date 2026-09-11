@@ -3430,7 +3430,18 @@ $('restore-btn').addEventListener('click', () => {
       }
       const j = await res.json();
       const rows = j.tables ? Object.values(j.tables).reduce((a, b) => a + b, 0) : 0;
-      toast('恢复完成：' + fmtBytes(j.bytes || f.size) + ' · ' + rows + ' 行', 'ok');
+      // 恢复后服务端用当前 pepper 集做过可解密性自检：有问题必须在确认
+      // 弹窗里让用户当场看到，不能只给一条绿色成功 toast。
+      if (j.pepper_warning) {
+        openSheet({
+          title: '恢复完成，但密钥解密异常', danger: true, okText: '知道了',
+          body: '<p>' + esc(j.pepper_warning) + '</p>'
+            + '<p class="note">不可解密密钥数：' + fmtInt(j.undecryptable_keys || 0)
+            + '。恢复其他机器的备份时，需要把其 <span class="mono">data_dir/key-peppers</span> 一并复制过来。</p>',
+        });
+      } else {
+        toast('恢复完成：' + fmtBytes(j.bytes || f.size) + ' · ' + rows + ' 行', 'ok');
+      }
       loaders.system().catch(() => {});
     },
   });
