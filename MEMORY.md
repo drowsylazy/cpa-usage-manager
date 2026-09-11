@@ -2,11 +2,11 @@
 
 > **本文件是仓库内权威项目记忆（2026-02 迁入）**：任何 AI Agent 在本仓库工作前必须先通读本文件并以它为准；产出新的持久结论（架构决策、约定规则、踩坑教训）后应同步更新本文件。AGENTS.md 对此有明确要求。
 >
-> 仓库：F:\cpa-usage-manager（CLIProxyAPI 的 Go c-shared 插件）。权威设计规范是 DESIGN.md，版本历史在 AGENTS.md 第 5 节。
+> 仓库：F:\cpa-usage-manager（CLIProxyAPI 的 Go c-shared 插件）。权威设计规范是 DESIGN.md，完整版本历史在 CHANGELOG.md（2026-09 自 AGENTS.md 迁入，AGENTS.md 只留最新版本号与指引）。
 
 ## Rules
 
-- 发版流程（**v0.6.2 起改为双提交**，用户明确指示）：①代码提交在前，message 不带版本号（前缀按变更类型 `feat:` / `fix:` / `perf:` 等）；②发版单独一个提交，message 固定为 `release: vX.Y.Z`（内容 = registry.json 版本号 + AGENTS.md 版本历史/范围 + 本流程规则），打 `vX.Y.Z` 标签推送 → CI 自动构建四平台并创建 GitHub Release。推送后**不**监控 CI（仓库约定）。
+- 发版流程（**v0.6.2 起改为双提交**，用户明确指示）：①代码提交在前，message 不带版本号（前缀按变更类型 `feat:` / `fix:` / `perf:` 等）；②发版单独一个提交，message 固定为 `release: vX.Y.Z`（内容 = registry.json 版本号 + CHANGELOG.md 顶部新增版本条目 + AGENTS.md 项目状态里的版本号范围），打 `vX.Y.Z` 标签推送 → CI 自动构建四平台并创建 GitHub Release。推送后**不**监控 CI（仓库约定）。
 - 仓库文档与用户沟通使用中文。
 - **审计功能已整体弃用（2026-08 用户明确指示）**：本项目不需要审计功能。不再新增任何审计向功能（审计面板页、audit 导出/归档/保留期清理等一律不做）；存量 `audit_events` 表仅承载内部机制的既有留痕（route.ai_fallback / route.failover / 密钥操作回执等），维持现状，不在其上扩展。
 - **UI 改动禁止跑 playwright/浏览器自动化验证**（用户两次明确叫停：先投诉链式调用卡死，后直接要求「停止做这种测试」）。交付前只做 `$env:GOROOT='D:\Go'; go build ./...` + `node --check internal/web/console.js`，页面效果交用户自己打开目验（需要时提示 `go run scripts/devserver.go` → 127.0.0.1:18080/console，密钥 dev-secret）。写新交互代码时要静态自查事件绑定是否覆盖所有容器（教训：复制委托只挂了 #key-rows，抽屉里的同款按钮成死键）、flex 容器的滚动区要显式 flex:1+min-height:0（教训：抽屉底栏不贴底）。
