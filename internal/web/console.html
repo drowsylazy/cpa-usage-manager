@@ -367,7 +367,7 @@
         <tbody id="densities-rows"></tbody>
       </table>
     </div>
-    <p class="note tbl-foot" id="densities-note">密度 = 近期成功请求的 请求体字节 ÷ 完整输入上下文 token 的中位数，±MAD 是样本离散度；缓存构成决定预占输入的金额拆档（读/写按各自档位价计，其余按输入价）。样本只来自执行器路径的请求（被动统计与历史行不带请求体长度）。</p>
+    <p class="note tbl-foot" id="densities-note">密度 = 近期成功请求的 请求体字节 ÷ 完整输入上下文 token 的中位数，±MAD 是样本离散度；缓存构成决定预占输入的金额拆档（读/写按各自档位价计，其余按输入价）。样本只来自执行器路径的请求：标「盲区」的模型流量全走被动统计（不带请求体长度），密度学习接不过来，预占按固定混合密度兜底。</p>
   </article>
 </section>
 

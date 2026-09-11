@@ -197,7 +197,13 @@ async function loadDensities() {
   }
   rows.innerHTML = items.map(x => {
     let cells;
-    if (!x.samples) {
+    if (!x.samples && x.no_body_len) {
+      // 盲区行：该模型有活跃流量但全走被动统计路径（不带 body_len），
+      // 永远进不了密度样本——预占正按固定混合密度兜底，如实标出。
+      cells = '<td class="num">—</td><td class="num">—</td><td class="num">0</td>'
+        + '<td><span class="pill warn" title="近 7 天 ' + fmtInt(x.no_body_len)
+        + ' 条请求走被动统计路径（无请求体长度），无法进入密度样本；预占按固定混合密度估算">盲区</span></td>';
+    } else if (!x.samples) {
       // 重置后不足 3 条新样本：密度读数无意义，显示待学习态（不再触发
       // 漂移/状态列，避免把 0 当成真实读数）。
       cells = '<td class="num">—</td><td class="num">—</td><td class="num">0</td>'

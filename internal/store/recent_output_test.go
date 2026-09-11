@@ -375,7 +375,7 @@ func TestModelDensities(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// 模型 c：只有失败行，不出现。
+	// 模型 c：只有失败行（零 token，不构成盲区也不构成样本），不出现。
 
 	got, err := s.ModelDensities(ctx, 200)
 	if err != nil {
@@ -398,6 +398,51 @@ func TestModelDensities(t *testing.T) {
 	}
 	if got[1].MilliDensity != 4000 || got[1].Samples != 3 {
 		t.Fatalf("模型 b 读数异常: %+v", got[1])
+	}
+}
+
+// TestModelDensitiesBlindSpot 锁盲区暴露：某模型近 7 天有带完整上下文的
+// 流量但全部 body_len=0（被动统计路径）——它进不了密度样本，预占静默走
+// 固定混合密度兜底。读数列表必须把该模型以 NoBodyLen 行返回，让盲区可见
+// 且可量化；零 token 行（无上下文）不算盲区。
+func TestModelDensitiesBlindSpot(t *testing.T) {
+	s := openTestStore(t, filepath.Join(t.TempDir(), "cpa.db"), "density-blind")
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// 模型 blind：3 条近期被动行，带上下文但无 body_len。
+	for i := 0; i < 3; i++ {
+		r := Request{ID: "blind-" + time.Duration(i).String(), TS: now.Add(-time.Duration(i) * time.Hour),
+			Model: "blind", Result: ResultOK, InputTokens: 10_000, TotalTokens: 10_000, ContextTokens: 10_000}
+		if err := s.RecordPassiveUsage(ctx, r, PassiveDedupeHint{Models: []string{"blind"}, Near: r.TS}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 模型 stale：只有 30 天前的旧行（超出盲区窗口），不应出现。
+	r := Request{ID: "stale-1", TS: now.Add(-30 * 24 * time.Hour),
+		Model: "stale", Result: ResultOK, InputTokens: 10_000, TotalTokens: 10_000, ContextTokens: 10_000}
+	if err := s.RecordPassiveUsage(ctx, r, PassiveDedupeHint{Models: []string{"stale"}, Near: r.TS}); err != nil {
+		t.Fatal(err)
+	}
+	// 模型 zero：近期行但零上下文（与 TestModelDensities 的失败行同类），不算盲区。
+	r = Request{ID: "zero-1", TS: now.Add(-time.Hour),
+		Model: "zero", Result: ResultError}
+	if err := s.RecordPassiveUsage(ctx, r, PassiveDedupeHint{Models: []string{"zero"}, Near: r.TS}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.ModelDensities(ctx, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("只应返回 blind 一个盲区模型: %+v", got)
+	}
+	if got[0].Model != "blind" || got[0].Samples != 0 || got[0].NoBodyLen != 3 {
+		t.Fatalf("盲区行应带 NoBodyLen=3 且无样本: %+v", got[0])
+	}
+	if got[0].MilliDensity != 0 || got[0].MilliMAD != 0 {
+		t.Fatalf("盲区行不应伪造密度读数: %+v", got[0])
 	}
 }
 

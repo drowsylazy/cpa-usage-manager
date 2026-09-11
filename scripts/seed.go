@@ -341,6 +341,29 @@ func main() {
 		}
 	}
 
+	// ── 盲区模型：被动统计路径（body_len=0）────────────────────
+	// 模拟只经宿主被动回调、不经过插件执行器的渠道：请求行带完整上下文
+	// 但永远没有 body_len，进不了密度样本。让「估算密度」面板的盲区徽标
+	// 在拟真数据下可见（近 7 天有流量即触发）。
+	for i := 0; i < 8; i++ {
+		ts := now.Add(-time.Duration(i*14+2) * time.Hour)
+		in := int64(8000 + rng.Intn(30000))
+		out := int64(200 + rng.Intn(4000))
+		r := store.Request{
+			ID: fmt.Sprintf("seed-blind-%d-%d", now.UnixNano(), i), TS: ts,
+			CallerID: store.DefaultCallerID,
+			Model:    "openrouter/blind-proxy", Provider: "openrouter", Source: "被动统计",
+			AuthType: "api_key", Result: store.ResultOK,
+			InputTokens: in, OutputTokens: out, TotalTokens: in + out,
+			BodyLen: 0,
+		}
+		r.AuthLabel = r.AuthID
+		if err := st.RecordUsage(ctx, r); err != nil {
+			log.Fatalf("写入盲区请求: %v", err)
+		}
+		inserted++
+	}
+
 	// ── 额度计数器：走真实 预占→结算 路径喂到目标占用比 ──────────
 	// RecordUsage 只写请求与聚合，不动 Key 的累计器；不补这一步的话面板上
 	// 所有额度仪表都停在 0%，看不出 warn/alarm 配色，也测不到 token 限额。

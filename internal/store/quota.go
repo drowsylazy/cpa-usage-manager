@@ -799,6 +799,11 @@ type ModelDensity struct {
 	// 供「金额拆档」读数：预占输入金额正按此份额拆到缓存档计价。
 	CacheReadBP   int64 `json:"cache_read_bp,omitempty"`
 	CacheCreateBP int64 `json:"cache_create_bp,omitempty"`
+	// NoBodyLen 是该模型近 7 天 body_len=0（被动统计路径，无请求体长度）
+	// 且带完整上下文的请求行数。仅在密度样本为 0 时返回：它量化「预占
+	// 只能走固定混合密度兜底」的盲区——被动行永远进不了密度样本，除非
+	// 流量走执行器路径。面板对 >0 的行显示盲区徽标而非普通读数。
+	NoBodyLen int64 `json:"no_body_len,omitempty"`
 }
 
 // ModelDensities 返回全部有密度样本的模型读数（每模型最多取近期 limit 条
@@ -819,12 +824,18 @@ func (s *Store) ModelDensities(ctx context.Context, limit int) ([]ModelDensity, 
 	}
 	seen := make(map[string]bool, len(epochs))
 	var models []string
+	blindSince := time.Now().UTC().Add(-7 * 24 * time.Hour).UnixMilli()
 	err = s.Read(ctx, func(q Querier) error {
+		// 模型全集 = 有密度样本的 ∪ 近 7 天有被动流量（body_len=0 但带完整
+		// 上下文）的：后者进不了样本，但在盲区检查里可能以 NoBodyLen 行
+		// 露出。零上下文行（失败/零用量）两边都不算。
 		rows, err := q.QueryContext(ctx,
 			`SELECT DISTINCT model FROM requests
-			 WHERE result = ? AND body_len > 0
-			   AND context_tokens > 0
-			 ORDER BY model`, ResultOK)
+			 WHERE result = ? AND body_len > 0 AND context_tokens > 0
+			 UNION
+			 SELECT DISTINCT model FROM requests
+			 WHERE body_len = 0 AND context_tokens > 0 AND ts >= ?
+			 ORDER BY model`, ResultOK, blindSince)
 		if err != nil {
 			return err
 		}
@@ -861,7 +872,20 @@ func (s *Store) ModelDensities(ctx context.Context, limit int) ([]ModelDensity, 
 		}
 		est, ok := EstimateDensity(samples)
 		if !ok && since.IsZero() {
-			continue // 无样本且从未重置：不该出现在列表里
+			// 无样本且从未重置：模型不在学习列表里。但它可能仍有活跃流量
+			//（被动统计路径不带 body_len，永远进不了样本）——把这个盲区
+			// 量化暴露出来：近 7 天有带上下文的请求却学不到密度的模型，
+			// 预占正静默走固定混合密度兜底。查询失败不致接口失败。
+			var n int64
+			if err := s.Read(ctx, func(q Querier) error {
+				return q.QueryRowContext(ctx,
+					`SELECT COUNT(*) FROM requests
+					 WHERE model = ? AND body_len = 0 AND context_tokens > 0 AND ts >= ?`,
+					m, blindSince).Scan(&n)
+			}); err == nil && n > 0 {
+				out = append(out, ModelDensity{Model: m, NoBodyLen: n})
+			}
+			continue
 		}
 		row := ModelDensity{Model: m, MilliDensity: est.Milli, MilliMAD: est.MAD, Samples: int64(est.Samples), Drifted: est.Drifted}
 		if !since.IsZero() {
