@@ -100,6 +100,20 @@ const maxDimensionLimit = 500
 // 返回前 maxDimensionLimit 组（按费用/Token/名称排序），合计查询把 Total
 // 与分组数下推到 SQL——Total/Count 始终覆盖全部分组，内存峰值 O(limit)。
 func (s *Service) GroupByDimension(ctx context.Context, f UsageFilter, dimension string, limit int) (DimensionReport, error) {
+	if limit <= 0 || limit > maxDimensionLimit {
+		limit = maxDimensionLimit
+	}
+	return s.groupByDimension(ctx, f, dimension, limit)
+}
+
+// summaryGroupLimit 是内部汇总场景的分组上限：分组数受真实 Key 基数约束
+// （含已删除 Key 残留在 rollups 里的少量溢出），不需要面板的 500 截断。
+const summaryGroupLimit = 10000
+
+// groupByDimension 是 GroupByDimension 的内部实现，limit 由调用方保证有界，
+// 不做面板截断。报告汇总（UsageSummaryByKey）必须走这里：Key 数超过
+// maxDimensionLimit 时曾被截断 500 组，超出的 Key 在汇总里静默显示 0。
+func (s *Service) groupByDimension(ctx context.Context, f UsageFilter, dimension string, limit int) (DimensionReport, error) {
 	dimension = strings.TrimSpace(dimension)
 	if dimension == "" {
 		dimension = "model"
@@ -120,9 +134,6 @@ func (s *Service) GroupByDimension(ctx context.Context, f UsageFilter, dimension
 		clause, args = requestFilter(f)
 	}
 
-	if limit <= 0 || limit > maxDimensionLimit {
-		limit = maxDimensionLimit
-	}
 	rowQuery := `SELECT ` + column + `, ` + agg + `
 		FROM ` + table + clause + ` GROUP BY 1` +
 		` ORDER BY 11 DESC, 10 DESC, 1` +
@@ -346,7 +357,9 @@ func (s *Service) UsageSummaryByKey(ctx context.Context, f UsageFilter, now time
 	if err != nil {
 		return nil, err
 	}
-	usage, err := s.GroupByDimension(ctx, f, "key_id", 0)
+	// 绕过面板 500 截断：分组数受真实 Key 基数约束，截断会让超出的 Key
+	// 在汇总里静默显示 0（数据正确性）。
+	usage, err := s.groupByDimension(ctx, f, "key_id", summaryGroupLimit)
 	if err != nil {
 		return nil, err
 	}
