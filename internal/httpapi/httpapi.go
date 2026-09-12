@@ -155,6 +155,10 @@ func (a *API) console(w http.ResponseWriter, r *http.Request) {
 }
 func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// 管理 API 一律 no-store：签发/解密/备份/恢复/重置是既有约定，
+		// 但读接口（keys/preferences/reservations/audit 等）同样含 kid、
+		// 余额等敏感数据——统一在 route 收口处设置，逐 handler 补漏容易再漏。
+		w.Header().Set("Cache-Control", "no-store")
 		if a.managementKey != "" && r.Header.Get("Authorization") != "Bearer "+a.managementKey {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -353,25 +357,19 @@ func (a *API) keys(w http.ResponseWriter, r *http.Request) {
 
 // keyCandidates 是请求明细密钥筛选的轻量候选接口：全量 Key 的 kid+label，
 // 不含额度/统计字段。服务端分页后 /keys 只覆盖当前页，联想候选改走这里。
+// 走 store 的专用轻量查询——此前 ListKeys 全列取回 2000 行 PluginKey
+// （额度/周期计数/统计字段全部丢弃），每次进用量页/实时页都白付一次。
 func (a *API) keyCandidates(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		w.WriteHeader(405)
 		return
 	}
-	items, _, e := a.st.ListKeys(r.Context(), store.KeyFilter{Limit: 2000})
+	items, e := a.st.ListKeyCandidates(r.Context(), 2000)
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 500)
 		return
 	}
-	type cand struct {
-		KID   string `json:"kid"`
-		Label string `json:"label"`
-	}
-	out := make([]cand, 0, len(items))
-	for _, k := range items {
-		out = append(out, cand{KID: k.KID, Label: k.Label})
-	}
-	jsonOut(w, map[string]any{"items": out}, 200)
+	jsonOut(w, map[string]any{"items": items}, 200)
 }
 
 // heldReservations 返回在途预占（进行中请求）视图：kid、模型、已耗时、
@@ -413,7 +411,7 @@ func (a *API) reservationsAccuracy(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(405)
 		return
 	}
-	items, e := a.st.ReservationAccuracy(r.Context(), 20000)
+	items, e := a.svc.ReservationAccuracy(r.Context(), 20000)
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 500)
 		return

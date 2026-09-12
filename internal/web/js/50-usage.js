@@ -101,9 +101,10 @@ function fillReqSuggestions() {
     .then(r => reqModelCombo.setOptions((r.rows || []).filter(x => x.value)
       .map(x => ({ value: x.value, label: x.value }))))
     .catch(() => {});
-  // 密钥候选走 /keys/candidates 轻量接口（全量 kid+标签），不再受 /keys 分页限制。
-  api('/keys/candidates')
-    .then(r => reqKeyCombo.setOptions((r.items || []).map(k => ({
+  // 密钥候选走 /keys/candidates 轻量接口（全量 kid+标签），不再受 /keys 分页
+  // 限制；loadKeyCandidates 会话级缓存，重复进页零网络往返。
+  loadKeyCandidates()
+    .then(items => reqKeyCombo.setOptions(items.map(k => ({
       value: k.kid, label: k.label || '(无标签)', sub: k.kid,
     }))))
     .catch(() => {});

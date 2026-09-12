@@ -262,10 +262,9 @@ $('densities-rows').addEventListener('click', e => {
 });
 $('held-refresh').addEventListener('click', () => { loadDensities().catch(() => {}); });
 loaders.live = async () => {
-  // 密钥标签走全量候选（keysView.cache 只有当前分页页）。
-  api('/keys/candidates')
-    .then(r => { keyCandidates = r.items || []; })
-    .catch(() => {});
+  // 密钥标签走全量候选（keysView.cache 只有当前分页页）；会话级缓存，
+  // 已拉过则零网络往返。
+  loadKeyCandidates().catch(() => {});
   await loadHeld();
   await loadRecent();
   await loadAccuracy();

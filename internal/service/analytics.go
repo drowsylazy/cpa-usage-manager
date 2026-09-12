@@ -584,3 +584,22 @@ func shareInt(total int64, weights []int64, k int) int64 {
 	}
 	return shares[k]
 }
+
+// resAccuracyTTL 是预占精度分位数缓存的最长存活时间。
+const resAccuracyTTL = time.Minute
+
+// ReservationAccuracy 返回按模型聚合的预占精度分位数（P50/P95 实际占比），
+// 带服务端 60s TTL 缓存：实时页每 5s 轮询本读数，后端每次全量扫至多 2 万行
+// 预占在 Go 侧算分位数，样本积累后是轮询里最重的一笔；分位数读数本就钝化，
+// 缓存与轮询频率解耦后扫描压力从每 5s 一次降到每分钟一次。
+func (s *Service) ReservationAccuracy(ctx context.Context, limit int) ([]store.ReservationAccuracy, error) {
+	if c := s.resAccuracySnap.Load(); c != nil && time.Since(c.at) < resAccuracyTTL {
+		return c.items, nil
+	}
+	items, err := s.st.ReservationAccuracy(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	s.resAccuracySnap.Store(&resAccuracySnapshot{items: items, at: time.Now()})
+	return items, nil
+}

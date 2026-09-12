@@ -5,11 +5,30 @@ const keysView = {
 };
 // keyLabelOf 由 kid 查密钥标签；无标签或缓存未热时返回空串，由调用方决定回落值。
 // keysView.cache 只有当前分页页，先查跨页候选缓存 keyCandidates（/keys/candidates 全量口径）。
+// keyCandidateMap 与候选列表同源维护：loadHeld 每 5s 渲染上百行都要查标签，
+// 对 2000 条候选线性 find 是持续的 O(行数×候选数) 开销。
 let keyCandidates = [];
+const keyCandidateMap = new Map();
+function setKeyCandidates(items) {
+  keyCandidates = items || [];
+  keyCandidateMap.clear();
+  for (const c of keyCandidates) keyCandidateMap.set(c.kid, c);
+}
+let keyCandPromise = null;
+// loadKeyCandidates 会话级缓存候选：用量页/实时页每次进入都拉 2000 条是
+// 重复网络往返。签发/编辑/撤销等密钥操作后经 refreshKeys 失效重拉。
+function loadKeyCandidates() {
+  if (!keyCandPromise) {
+    keyCandPromise = api('/keys/candidates')
+      .then(r => { setKeyCandidates(r.items || []); return keyCandidates; })
+      .catch(e => { keyCandPromise = null; throw e; });
+  }
+  return keyCandPromise;
+}
 function keyLabelOf(kid) {
   const inPage = keysView.cache.find(x => x.kid === kid);
   if (inPage) return inPage.label || '';
-  const c = keyCandidates.find(x => x.kid === kid);
+  const c = keyCandidateMap.get(kid);
   return c && c.label ? c.label : '';
 }
 
@@ -17,6 +36,8 @@ loaders.keys = async () => { await refreshKeys(); };
 // 密钥列表走服务端分页：limit/offset/status 都下推到 SQL，避免大基数用户
 // 一次拉上千条。status_counts 由后端附带，徽标与「共 N 枚」仍拿得到全量口径。
 async function refreshKeys() {
+  // 密钥可能刚被增删改：失效会话级候选缓存，下次用时重拉。
+  keyCandPromise = null;
   const q = new URLSearchParams({ limit: String(keysView.size), offset: String(keysView.page * keysView.size) });
   if (keysView.search) q.set('search', keysView.search);
   if (keysView.caller) q.set('caller_id', keysView.caller);

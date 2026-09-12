@@ -354,6 +354,39 @@ func (s *Store) ListKeyMaterials(ctx context.Context) ([]KeyMaterial, error) {
 	return out, err
 }
 
+// KeyCandidate 是密钥联想候选的轻量视图：仅 kid+label。
+type KeyCandidate struct {
+	KID   string `json:"kid"`
+	Label string `json:"label"`
+}
+
+// ListKeyCandidates 返回全量密钥的 kid+label（请求明细的密钥筛选联想用），
+// 与 /keys 的分页口径无关。此前走 ListKeys 全列取回再逐行丢弃额度/统计
+// 字段，Key 数多的部署每次面板交互都白付一次全列扫描 + 反序列化。
+func (s *Store) ListKeyCandidates(ctx context.Context, limit int) ([]KeyCandidate, error) {
+	if limit <= 0 || limit > 5000 {
+		limit = 2000
+	}
+	var out []KeyCandidate
+	err := s.Read(ctx, func(qr Querier) error {
+		rows, err := qr.QueryContext(ctx,
+			`SELECT kid, label FROM plugin_keys ORDER BY created_at DESC, kid LIMIT ?`, limit)
+		if err != nil {
+			return fmt.Errorf("列出 Key 候选失败: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var c KeyCandidate
+			if err := rows.Scan(&c.KID, &c.Label); err != nil {
+				return fmt.Errorf("扫描 Key 候选失败: %w", err)
+			}
+			out = append(out, c)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
 // ListKeys 按条件列出 Key，返回结果与匹配总数。
 func (s *Store) ListKeys(ctx context.Context, f KeyFilter) ([]PluginKey, int64, error) {
 	nowMS := time.Now().UTC().UnixMilli()

@@ -532,12 +532,16 @@ function renderTrend() {
     + '<div class="chart-tip" id="trend-tip" hidden></div>';
 
   const svg = box.querySelector('svg'), tip = $('trend-tip');
+  // 热区 NodeList 与渲染顺序一致（data-i 即下标），悬停只 toggle 前后两个
+  // 元素——每次 mousemove 全量 querySelectorAll（桶数上限 1200）是密桶
+  // 快速划过的卡顿源。
+  const hovers = svg.querySelectorAll('.bar-hover');
   let hotIdx = -1;
   function setHot(i) {
     if (i === hotIdx) return;
+    if (hotIdx >= 0 && hovers[hotIdx]) hovers[hotIdx].classList.remove('on');
+    if (i >= 0 && hovers[i]) hovers[i].classList.add('on');
     hotIdx = i;
-    svg.querySelectorAll('.bar-hover').forEach(r =>
-      r.classList.toggle('on', +r.dataset.i === i));
   }
   // showTip 鼠标与键盘共用：tooltip 上挂在柱顶，空间不足时下翻。
   function showTip(idx) {
@@ -557,12 +561,27 @@ function renderTrend() {
     tip.style.left = Math.max(90, Math.min(rect.width - 90, sx)) + 'px';
     tip.style.top = (wantAbove ? topPx - 8 : topPx + 8) + 'px';
   }
-  function hideTip() { tip.hidden = true; setHot(-1); }
+  function hideTip() {
+    if (tipFrame) { cancelAnimationFrame(tipFrame); tipFrame = 0; tipPending = null; }
+    tip.hidden = true;
+    setHot(-1);
+  }
+  // mousemove 用 rAF 合帧：tooltip 的 innerHTML 重建与 offsetHeight 读取
+  // 都强制布局，快速划过时逐事件执行是持续的重排压力。
+  let tipPending = null, tipFrame = 0;
   svg.addEventListener('mousemove', ev => {
-    const rect = svg.getBoundingClientRect();
-    const sx = (ev.clientX - rect.left) * (W / rect.width);
-    let idx = Math.floor((sx - padL) / slot);
-    showTip(Math.max(0, Math.min(n - 1, idx)));
+    tipPending = ev;
+    if (tipFrame) return;
+    tipFrame = requestAnimationFrame(() => {
+      tipFrame = 0;
+      const e = tipPending;
+      tipPending = null;
+      if (!e) return;
+      const rect = svg.getBoundingClientRect();
+      const sx = (e.clientX - rect.left) * (W / rect.width);
+      const idx = Math.floor((sx - padL) / slot);
+      showTip(Math.max(0, Math.min(n - 1, idx)));
+    });
   });
   svg.addEventListener('mouseleave', hideTip);
   // 键盘：Tab 进入热区即出 tooltip，左右键在桶之间移动
