@@ -263,7 +263,7 @@ func decode(r *http.Request, v any) error {
 }
 func noStore(w http.ResponseWriter) { w.Header().Set("Cache-Control", "no-store") }
 func (a *API) health(w http.ResponseWriter, r *http.Request) {
-	stats, e := a.st.Stats(r.Context())
+	stats, e := a.svc.Stats(r.Context())
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 500)
 		return
@@ -271,7 +271,7 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, map[string]any{"ok": true, "stats": stats}, 200)
 }
 func (a *API) overview(w http.ResponseWriter, r *http.Request) {
-	stats, e := a.st.Stats(r.Context())
+	stats, e := a.svc.Stats(r.Context())
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 500)
 		return
@@ -426,7 +426,7 @@ func (a *API) densities(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(405)
 		return
 	}
-	items, e := a.st.ModelDensities(r.Context(), 200)
+	items, e := a.svc.ModelDensities(r.Context(), 200)
 	if e != nil {
 		jsonOut(w, map[string]string{"error": e.Error()}, 500)
 		return

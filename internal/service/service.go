@@ -171,6 +171,18 @@ type Service struct {
 	// 的一笔；分位数读数本就钝化，60s 缓存与轮询频率解耦。
 	resAccuracySnap atomic.Pointer[resAccuracySnapshot]
 
+	// statsCountsSnap 是库规模计数（Stats 里的七个全表 COUNT）的 15s TTL
+	// 缓存：overview 是面板默认页、health 是监控探针，三个大表的 COUNT
+	// 各为一次全表扫描，读数是钝感展示不必逐次付代价；Writable/重试计数
+	// /文件体积不经此缓存，只读降级状态保持实时。
+	statsCountsSnap atomic.Pointer[statsCountsSnapshot]
+
+	// densitiesSnap 是密度学习面板读数的 30s TTL 缓存：实时页 5s 轮询该
+	// 读数，后端每次要扫模型全集（全表 GROUP BY）加每模型两组近期样本
+	// 查询；学习读数本就钝化，缓存与轮询频率解耦。ResetModelDensity 时
+	// 立即失效，重置后面板不能显示旧读数。
+	densitiesSnap atomic.Pointer[modelDensitiesSnapshot]
+
 	// 集中式预占心跳注册表：所有在途预占共用一个 goroutine 批量续期。
 
 	// 集中式预占心跳注册表：所有在途预占共用一个 goroutine 批量续期。

@@ -803,18 +803,24 @@ type Stats struct {
 	IORetries int64 `json:"io_retries"`
 }
 
-// Stats 读取库规模统计。
-func (s *Store) Stats(ctx context.Context) (Stats, error) {
-	out := Stats{Writable: s.Writable(), IORetries: s.Retries()}
-	v, err := s.CurrentSchemaVersion(ctx)
-	if err != nil {
-		return Stats{}, err
-	}
-	out.SchemaVersion = v
+// Counts 是 Stats 里代价最高的部分：requests/usage_rollups/audit_events
+// 三个 COUNT 各为一次全表扫描。单独拆出以便服务层做 TTL 缓存——面板对
+// 这几个读数是钝感展示，无需每次打开页面都付三次全表扫描。
+type Counts struct {
+	Keys         int64
+	Callers      int64
+	PricingRules int64
+	Requests     int64
+	Rollups      int64
+	AuditEvents  int64
+	HeldReserves int64
+}
 
-	// 七个计数合并为一条查询单次往返：系统页一次打开不再付七次读池调度
-	// 与七次全表扫描的往返开销（各 COUNT 仍分别为一次全表扫描，代价不变）。
-	err = s.Read(ctx, func(q Querier) error {
+// Counts 读取七个规模计数。
+func (s *Store) Counts(ctx context.Context) (Counts, error) {
+	var c Counts
+	// 七个计数合并为一条查询单次往返（各 COUNT 仍分别为一次全表扫描）。
+	err := s.Read(ctx, func(q Querier) error {
 		return q.QueryRowContext(ctx, `SELECT
 			(SELECT COUNT(*) FROM plugin_keys),
 			(SELECT COUNT(*) FROM callers),
@@ -823,12 +829,39 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 			(SELECT COUNT(*) FROM usage_rollups),
 			(SELECT COUNT(*) FROM audit_events),
 			(SELECT COUNT(*) FROM reservations WHERE status = 'held')`).
-			Scan(&out.Keys, &out.Callers, &out.PricingRules, &out.Requests,
-				&out.Rollups, &out.AuditEvents, &out.HeldReserves)
+			Scan(&c.Keys, &c.Callers, &c.PricingRules, &c.Requests,
+				&c.Rollups, &c.AuditEvents, &c.HeldReserves)
 	})
 	if err != nil {
-		return Stats{}, fmt.Errorf("统计失败: %w", err)
+		return Counts{}, fmt.Errorf("统计失败: %w", err)
 	}
+	return c, nil
+}
+
+// Stats 读取库规模统计。
+func (s *Store) Stats(ctx context.Context) (Stats, error) {
+	c, err := s.Counts(ctx)
+	if err != nil {
+		return Stats{}, err
+	}
+	return s.StatsFromCounts(ctx, c)
+}
+
+// StatsFromCounts 组装 Stats，但规模计数用调用方提供的值——服务层对
+// Counts 做 TTL 缓存后经此入口拼装，Writable/IORetries/文件体积仍实时
+// 读取，只读降级等状态不受缓存影响。
+func (s *Store) StatsFromCounts(ctx context.Context, c Counts) (Stats, error) {
+	out := Stats{
+		Keys: c.Keys, Callers: c.Callers, PricingRules: c.PricingRules,
+		Requests: c.Requests, Rollups: c.Rollups, AuditEvents: c.AuditEvents,
+		HeldReserves: c.HeldReserves,
+		Writable:     s.Writable(), IORetries: s.Retries(),
+	}
+	v, err := s.CurrentSchemaVersion(ctx)
+	if err != nil {
+		return Stats{}, err
+	}
+	out.SchemaVersion = v
 	if fi, err := os.Stat(s.opts.Path); err == nil {
 		out.FileBytes = fi.Size()
 	}

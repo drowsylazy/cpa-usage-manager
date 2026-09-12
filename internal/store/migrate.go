@@ -8,7 +8,7 @@ import (
 
 // SchemaVersion 是本代码期望的数据库 schema 版本。
 // 打开库时若发现库版本更高，说明是被更新版插件写过的库，拒绝降级使用。
-const SchemaVersion = 18
+const SchemaVersion = 19
 
 // migration 是一次版本化迁移。
 type migration struct {
@@ -507,6 +507,25 @@ var migrations = []migration{
 			`ALTER TABLE requests ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0`,
 			// 历史行就地回填：不依赖新流量，升级后读数立刻可用。
 			migration18Backfill,
+		},
+	},
+	{
+		version: 19,
+		name:    "reservation_finished_at",
+		stmts: []string{
+			// ---- 已完结预占的排序键 ----
+			// 「最近预占」与「预占精度」都按 COALESCE(settled_at, released_at)
+			// 倒序取数，表达式排序无法走索引：精度读数每次重建都全量扫至多
+			// 2 万行已结算预占。落库时冗余写一份完结时刻（settle/release 各
+			// 写入点同步维护），两个读数都能索引序直接取 LIMIT 条。
+			// 不做 status 部分索引：status='settled' 蕴含不出 IN('settled',
+			// 'released')（EXPLAIN 实锤退回临时排序），普通索引对两种 WHERE
+			// 都稳定可用；held 行 finished_at 为 NULL，回填后不会出现。
+			`ALTER TABLE reservations ADD COLUMN finished_at INTEGER`,
+			// 历史行就地回填：不依赖新流量，升级后读数立刻可用。
+			`UPDATE reservations SET finished_at = COALESCE(settled_at, released_at)
+			 WHERE status IN ('settled','released') AND finished_at IS NULL`,
+			`CREATE INDEX idx_reservations_finished ON reservations(finished_at DESC)`,
 		},
 	},
 }

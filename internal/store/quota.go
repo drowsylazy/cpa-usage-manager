@@ -51,8 +51,8 @@ func (s *Store) HoldReservation(ctx context.Context, p HoldReservationParams) (R
 			// 先清僵尸预占再做额度统计：崩溃/重启残留的 held 行若不清，
 			// 会永久占用该 Key 的并发名额与周期额度。
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE reservations SET status='released',released_at=? WHERE status='held' AND (heartbeat_at < ? OR expires_at < ?)`,
-				p.Now.UTC().UnixMilli(), p.SweepStaleBefore.UTC().UnixMilli(), p.SweepStaleBefore.UTC().UnixMilli()); err != nil {
+				`UPDATE reservations SET status='released',released_at=?,finished_at=? WHERE status='held' AND (heartbeat_at < ? OR expires_at < ?)`,
+				p.Now.UTC().UnixMilli(), p.Now.UTC().UnixMilli(), p.SweepStaleBefore.UTC().UnixMilli(), p.SweepStaleBefore.UTC().UnixMilli()); err != nil {
 				return fmt.Errorf("清扫陈旧预占失败: %w", err)
 			}
 		}
@@ -197,8 +197,8 @@ func (s *Store) HoldReservation(ctx context.Context, p HoldReservationParams) (R
 			//（SweepStaleBefore）；这里只在「即将拒绝」时按行自身 expires_at
 			// 补救一次并复核——不引入额外策略参数，正常通过路径零开销。
 			if _, e := tx.ExecContext(ctx,
-				`UPDATE reservations SET status='released',released_at=?,heartbeat_at=? WHERE status='held' AND expires_at < ?`,
-				p.Now.UTC().UnixMilli(), p.Now.UTC().UnixMilli(), p.Now.UTC().UnixMilli()); e != nil {
+				`UPDATE reservations SET status='released',released_at=?,heartbeat_at=?,finished_at=? WHERE status='held' AND expires_at < ?`,
+				p.Now.UTC().UnixMilli(), p.Now.UTC().UnixMilli(), p.Now.UTC().UnixMilli(), p.Now.UTC().UnixMilli()); e != nil {
 				return e
 			}
 			checkErr = recheck()
@@ -318,7 +318,7 @@ func (s *Store) SettleReservation(ctx context.Context, id string, cost money.Mic
 			out = r
 			return nil
 		}
-		if _, err = s.execHotTx(ctx, tx, `UPDATE reservations SET status='settled',settled_micro_usd=?,settled_tokens=?,settled_at=?,heartbeat_at=? WHERE id=? AND status='held'`, int64(cost), billableTokens, now.UTC().UnixMilli(), now.UTC().UnixMilli(), id); err != nil {
+		if _, err = s.execHotTx(ctx, tx, `UPDATE reservations SET status='settled',settled_micro_usd=?,settled_tokens=?,settled_at=?,heartbeat_at=?,finished_at=? WHERE id=? AND status='held'`, int64(cost), billableTokens, now.UTC().UnixMilli(), now.UTC().UnixMilli(), now.UTC().UnixMilli(), id); err != nil {
 			return err
 		}
 		cy := CyclesFor(now)
@@ -408,7 +408,7 @@ func (s *Store) ReleaseReservation(ctx context.Context, id string, now time.Time
 			return err
 		}
 		if r.Status == ReservationHeld {
-			if _, err = tx.ExecContext(ctx, `UPDATE reservations SET status='released',released_at=?,heartbeat_at=? WHERE id=? AND status='held'`, now.UTC().UnixMilli(), now.UTC().UnixMilli(), id); err != nil {
+			if _, err = tx.ExecContext(ctx, `UPDATE reservations SET status='released',released_at=?,heartbeat_at=?,finished_at=? WHERE id=? AND status='held'`, now.UTC().UnixMilli(), now.UTC().UnixMilli(), now.UTC().UnixMilli(), id); err != nil {
 				return err
 			}
 			r.Status = ReservationReleased
@@ -449,7 +449,7 @@ func (s *Store) ReleaseStaleReservations(ctx context.Context, before time.Time) 
 func (s *Store) releaseStale(ctx context.Context, before time.Time) (int64, error) {
 	var n int64
 	err := s.Write(ctx, func(tx *sql.Tx) error {
-		r, err := tx.ExecContext(ctx, `UPDATE reservations SET status='released',released_at=? WHERE status='held' AND (heartbeat_at < ? OR expires_at < ?)`, time.Now().UTC().UnixMilli(), before.UTC().UnixMilli(), before.UTC().UnixMilli())
+		r, err := tx.ExecContext(ctx, `UPDATE reservations SET status='released',released_at=?,finished_at=? WHERE status='held' AND (heartbeat_at < ? OR expires_at < ?)`, time.Now().UTC().UnixMilli(), time.Now().UTC().UnixMilli(), before.UTC().UnixMilli(), before.UTC().UnixMilli())
 		if err != nil {
 			return err
 		}
@@ -513,6 +513,35 @@ func (s *Store) ListAudit(ctx context.Context, limit, offset int) ([]AuditEvent,
 		return nil, err
 	}
 	return out, nil
+}
+
+// IterateAudit 逐行遍历最近 limit 条审计事件并回调 fn，不整表装载——
+// 审计 CSV 导出上限 10 万行，全量装进内存是数十 MB 峰值。排序与 ListAudit
+// 同口径（ts DESC, id DESC）；导出列不含明细，detail_json 不读不解析。
+func (s *Store) IterateAudit(ctx context.Context, limit int, fn func(AuditEvent) error) error {
+	if limit <= 0 {
+		limit = 100
+	}
+	return s.Read(ctx, func(q Querier) error {
+		rows, err := q.QueryContext(ctx,
+			`SELECT id,ts,actor,action,entity_type,entity_id FROM audit_events ORDER BY ts DESC,id DESC LIMIT ?`, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e AuditEvent
+			var ts int64
+			if err := rows.Scan(&e.ID, &ts, &e.Actor, &e.Action, &e.EntityType, &e.EntityID); err != nil {
+				return err
+			}
+			e.TS = time.UnixMilli(ts).UTC()
+			if err := fn(e); err != nil {
+				return err
+			}
+		}
+		return rows.Err()
+	})
 }
 
 // HeldReservation 是在途预占的展示行（GET /reservations/held）。
@@ -830,16 +859,16 @@ func (s *Store) ModelDensities(ctx context.Context, limit int) ([]ModelDensity, 
 	var models []string
 	blindSince := time.Now().UTC().Add(-7 * 24 * time.Hour).UnixMilli()
 	err = s.Read(ctx, func(q Querier) error {
-		// 模型全集 = 有密度样本的 ∪ 近 7 天有被动流量（body_len=0 但带完整
-		// 上下文）的：后者进不了样本，但在盲区检查里可能以 NoBodyLen 行
-		// 露出。零上下文行（失败/零用量）两边都不算。
+		// 模型全集单遍扫描 = 有密度样本的 ∪ 近 7 天有被动流量（body_len=0
+		// 但带完整上下文）的：后者进不了样本，但在盲区检查里可能以 NoBodyLen
+		// 行露出。零上下文行（失败/零用量）两边都不算。此前是两条 DISTINCT
+		// 各扫一遍全表再 UNION，实时页 5s 轮询下扫描代价翻倍；OR + GROUP BY
+		// 一遍完成，去重语义不变。
 		rows, err := q.QueryContext(ctx,
-			`SELECT DISTINCT model FROM requests
-			 WHERE result = ? AND body_len > 0 AND context_tokens > 0
-			 UNION
-			 SELECT DISTINCT model FROM requests
-			 WHERE body_len = 0 AND context_tokens > 0 AND ts >= ?
-			 ORDER BY model`, ResultOK, blindSince)
+			`SELECT model FROM requests
+			 WHERE (result = ? AND body_len > 0 AND context_tokens > 0)
+			    OR (body_len = 0 AND context_tokens > 0 AND ts >= ?)
+			 GROUP BY model`, ResultOK, blindSince)
 		if err != nil {
 			return err
 		}
@@ -864,6 +893,40 @@ func (s *Store) ModelDensities(ctx context.Context, limit int) ([]ModelDensity, 
 		}
 	}
 	sort.Strings(models)
+	// 盲区计数收敛为单条 GROUP BY：此前无样本且未重置的模型逐模型 COUNT
+	// （每模型一次索引探测，模型多时是第三层 N+1）。仅在确有候选时执行，
+	// 全部模型都有样本或基线时零开销。
+	blindCandidates := 0
+	for _, m := range models {
+		if _, hasEpoch := epochs[m]; !hasEpoch {
+			blindCandidates++
+		}
+	}
+	blindCounts := make(map[string]int64)
+	if blindCandidates > 0 {
+		err = s.Read(ctx, func(q Querier) error {
+			rows, err := q.QueryContext(ctx,
+				`SELECT model, COUNT(*) FROM requests
+				 WHERE body_len = 0 AND context_tokens > 0 AND ts >= ?
+				 GROUP BY model`, blindSince)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var m string
+				var n int64
+				if err := rows.Scan(&m, &n); err != nil {
+					return err
+				}
+				blindCounts[m] = n
+			}
+			return rows.Err()
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
 	out := make([]ModelDensity, 0, len(models))
 	for _, m := range models {
 		var since time.Time
@@ -880,13 +943,7 @@ func (s *Store) ModelDensities(ctx context.Context, limit int) ([]ModelDensity, 
 			//（被动统计路径不带 body_len，永远进不了样本）——把这个盲区
 			// 量化暴露出来：近 7 天有带上下文的请求却学不到密度的模型，
 			// 预占正静默走固定混合密度兜底。查询失败不致接口失败。
-			var n int64
-			if err := s.Read(ctx, func(q Querier) error {
-				return q.QueryRowContext(ctx,
-					`SELECT COUNT(*) FROM requests
-					 WHERE model = ? AND body_len = 0 AND context_tokens > 0 AND ts >= ?`,
-					m, blindSince).Scan(&n)
-			}); err == nil && n > 0 {
+			if n := blindCounts[m]; n > 0 {
 				out = append(out, ModelDensity{Model: m, NoBodyLen: n})
 			}
 			continue
@@ -924,9 +981,9 @@ type RecentReservation struct {
 // ListRecentReservations 返回最近 limit 条已完结（settled/released）预占，
 // 按完结时刻倒序。released 涵盖三种收尾：执行器放弃/上游无响应释放、
 // 心跳或过期清扫——都表示没有走到结算，settled_micro_usd 即为 0。
-// 走 idx_reservations_settled 无法覆盖 released，故全表扫描 status 前缀
-// 走 idx_reservations_key_status 的 status 列；已完结行随保留期被
-// ApplyRetention 回收，量级有限。
+// 完结时刻读落库的 finished_at 派生列（v19，settle/release 各写入点同步
+// 维护），idx_reservations_finished 部分索引让本查询索引序直接取 LIMIT
+// 条，不再按 status 前缀全量扫已完结行。
 func (s *Store) ListRecentReservations(ctx context.Context, limit int) ([]RecentReservation, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 25
@@ -935,10 +992,10 @@ func (s *Store) ListRecentReservations(ctx context.Context, limit int) ([]Recent
 	err := s.Read(ctx, func(q Querier) error {
 		rows, err := q.QueryContext(ctx,
 			`SELECT id, key_id, model, status, held_micro_usd, settled_micro_usd, reserved_tokens, settled_tokens,
-			        created_at, COALESCE(settled_at, released_at)
+			        created_at, finished_at
 			 FROM reservations
 			 WHERE status IN ('settled','released')
-			 ORDER BY COALESCE(settled_at, released_at) DESC LIMIT ?`, limit)
+			 ORDER BY finished_at DESC LIMIT ?`, limit)
 		if err != nil {
 			return err
 		}
@@ -990,7 +1047,7 @@ func (s *Store) ReservationAccuracy(ctx context.Context, limit int) ([]Reservati
 			`SELECT model, reserved_tokens, settled_tokens
 			 FROM reservations
 			 WHERE status = 'settled' AND reserved_tokens > 0 AND settled_tokens > 0
-			 ORDER BY COALESCE(settled_at, released_at) DESC LIMIT ?`, limit)
+			 ORDER BY finished_at DESC LIMIT ?`, limit)
 		if err != nil {
 			return err
 		}

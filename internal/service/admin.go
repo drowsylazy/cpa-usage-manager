@@ -217,6 +217,8 @@ func (s *Service) ResetModelDensity(ctx context.Context, model, actor string) er
 	s.shareCalMu.Lock()
 	s.shareCal = nil
 	s.shareCalMu.Unlock()
+	// 面板读数缓存同样失效：重置后该模型要显示「待学习」。
+	s.densitiesSnap.Store(nil)
 	_ = s.st.AppendAudit(ctx, store.AuditEvent{
 		Actor: actor, Action: "density.reset", EntityType: "model", EntityID: model,
 		Detail: map[string]any{"since": at.Format(time.RFC3339)},
@@ -523,14 +525,14 @@ func (s *Service) ExportCSV(ctx context.Context, w io.Writer, req ExportRequest)
 			return "", err
 		}
 	case "audit":
-		events, err := s.st.ListAudit(ctx, limit, 0)
-		if err != nil {
+		// 流式写出：逐行遍历不整表装载（上限 10 万行时全量装载约需数十
+		// MB 峰值），与 requests 导出同一口径。
+		header := []string{"id", "ts", "actor", "action", "entity_type", "entity_id"}
+		if err := cw.Write(header); err != nil {
 			return "", err
 		}
-		header := []string{"id", "ts", "actor", "action", "entity_type", "entity_id"}
-		if err := writeCSV(cw, header, len(events), func(i int) []string {
-			e := events[i]
-			return []string{itoa(e.ID), e.TS.Format(time.RFC3339), e.Actor, e.Action, e.EntityType, e.EntityID}
+		if err := s.st.IterateAudit(ctx, limit, func(e store.AuditEvent) error {
+			return cw.Write([]string{itoa(e.ID), e.TS.Format(time.RFC3339), e.Actor, e.Action, e.EntityType, e.EntityID})
 		}); err != nil {
 			return "", err
 		}

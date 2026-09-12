@@ -588,6 +588,58 @@ func shareInt(total int64, weights []int64, k int) int64 {
 // resAccuracyTTL 是预占精度分位数缓存的最长存活时间。
 const resAccuracyTTL = time.Minute
 
+// statsCountsTTL 是库规模计数缓存的最长存活时间。
+const statsCountsTTL = 15 * time.Second
+
+// modelDensitiesTTL 是密度学习面板读数缓存的最长存活时间。
+const modelDensitiesTTL = 30 * time.Second
+
+type statsCountsSnapshot struct {
+	counts store.Counts
+	at     time.Time
+}
+
+type modelDensitiesSnapshot struct {
+	items []store.ModelDensity
+	at    time.Time
+}
+
+// ModelDensities 返回密度学习面板读数，带服务端 30s TTL 缓存：实时页每 5s
+// 轮询本读数，后端每次要扫模型全集（全表 GROUP BY）加每模型两组近期样本
+// 查询；学习读数本就钝化，缓存与轮询频率解耦。ResetModelDensity 写入新
+// 基线时立即失效——重置后面板不能显示旧读数。
+func (s *Service) ModelDensities(ctx context.Context, limit int) ([]store.ModelDensity, error) {
+	if snap := s.densitiesSnap.Load(); snap != nil && time.Since(snap.at) < modelDensitiesTTL {
+		return snap.items, nil
+	}
+	items, err := s.st.ModelDensities(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	s.densitiesSnap.Store(&modelDensitiesSnapshot{items: items, at: time.Now()})
+	return items, nil
+}
+
+// Stats 组装库规模统计：代价最高的七个全表 COUNT（requests/usage_rollups/
+// audit_events 各一次全表扫描）走 15s TTL 缓存——overview 是面板默认页、
+// health 是监控探针，读数是钝感展示，不必逐次付三次全表扫描；Writable/
+// 重试计数/文件体积经 store.StatsFromCounts 实时读取，只读降级状态不受
+// 缓存影响。
+func (s *Service) Stats(ctx context.Context) (store.Stats, error) {
+	var c store.Counts
+	if snap := s.statsCountsSnap.Load(); snap != nil && time.Since(snap.at) < statsCountsTTL {
+		c = snap.counts
+	} else {
+		var err error
+		c, err = s.st.Counts(ctx)
+		if err != nil {
+			return store.Stats{}, err
+		}
+		s.statsCountsSnap.Store(&statsCountsSnapshot{counts: c, at: time.Now()})
+	}
+	return s.st.StatsFromCounts(ctx, c)
+}
+
 // ReservationAccuracy 返回按模型聚合的预占精度分位数（P50/P95 实际占比），
 // 带服务端 60s TTL 缓存：实时页每 5s 轮询本读数，后端每次全量扫至多 2 万行
 // 预占在 Go 侧算分位数，样本积累后是轮询里最重的一笔；分位数读数本就钝化，
