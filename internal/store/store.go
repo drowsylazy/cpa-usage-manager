@@ -878,6 +878,31 @@ func (s *Store) StatsFromCounts(ctx context.Context, c Counts) (Stats, error) {
 // Path 返回数据库文件路径。
 func (s *Store) Path() string { return s.opts.Path }
 
+// WalBytes 返回 WAL 侧车文件当前体积，读不到视为 0。
+func (s *Store) WalBytes() int64 {
+	if fi, err := os.Stat(s.opts.Path + "-wal"); err == nil {
+		return fi.Size()
+	}
+	return 0
+}
+
+// PassiveCheckpoint 做一次非阻塞的 wal_checkpoint(PASSIVE)：把能推进的
+// WAL 页推回主库，但不等待读者、不截断 WAL 文件。wal_autocheckpoint 在
+// 长读事务占着快照时会持续失效，WAL 无界增长是库膨胀的第一信号——
+// 后台循环检测到超限时经此入口兜底；TRUNCATE（真正回收磁盘空间）仍留给
+// 手动维护与备份前置。
+func (s *Store) PassiveCheckpoint(ctx context.Context) error {
+	if !s.Writable() {
+		return ErrReadOnly
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if _, err := s.writeDB.ExecContext(ctx, `PRAGMA wal_checkpoint(PASSIVE)`); err != nil {
+		return fmt.Errorf("WAL 被动 checkpoint 失败: %w", err)
+	}
+	return nil
+}
+
 // 时间工具 ---------------------------------------------------------------
 
 // nowMillis 返回当前 UTC Unix 毫秒。

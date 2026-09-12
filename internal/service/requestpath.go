@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -329,7 +330,43 @@ const (
 
 	shareCalTTL     = 60 * time.Second
 	shareCalSamples = 200
+
+	// calCacheMaxEntries 是三个校准缓存的单缓存的容量上限：这些缓存按
+	// 模型分桶且只有 TTL——过期条目要等同模型再次访问才被覆盖，模型
+	// 多样性大的部署（路由/评判放大模型名）会只涨不清。与 judgeLRU
+	// 同款定容哲学，量级按「同时活跃的模型数」取整。
+	calCacheMaxEntries = 512
 )
+
+// trimCalCache 在超过容量上限时先摘过期条目，仍超则按写入时刻淘汰最旧的
+// 一半（TTL 内的活跃模型保留）。返回同一 map（就地删除），供各写入点在
+// 插入新条目后调用；持有对应缓存锁调用。
+func trimCalCache[E any](m map[string]E, at func(E) time.Time, now time.Time, ttl time.Duration, max int) map[string]E {
+	if len(m) < max {
+		return m
+	}
+	for k, e := range m {
+		if now.Sub(at(e)) >= ttl {
+			delete(m, k)
+		}
+	}
+	if len(m) < max {
+		return m
+	}
+	type stamp struct {
+		k  string
+		at time.Time
+	}
+	entries := make([]stamp, 0, len(m))
+	for k, e := range m {
+		entries = append(entries, stamp{k, at(e)})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].at.Before(entries[j].at) })
+	for _, e := range entries[:len(entries)/2] {
+		delete(m, e.k)
+	}
+	return m
+}
 
 // outputCalEntry 是 outCal 缓存桶：p95 为加权分位值，ok=false 表示
 // 样本不足（<3 条成功请求），调用方应回退保守口径而非使用 p95=0。
@@ -417,6 +454,7 @@ func (s *Service) outputP95Cached(model string) (int64, bool) {
 		s.outCal = make(map[string]outputCalEntry)
 	}
 	s.outCal[model] = outputCalEntry{p95: p95, ok: ok, at: now}
+	s.outCal = trimCalCache(s.outCal, func(e outputCalEntry) time.Time { return e.at }, now, outputCalTTL, calCacheMaxEntries)
 	s.outCalMu.Unlock()
 	return p95, ok
 }
@@ -552,6 +590,7 @@ func (s *Service) densityMedianCached(model string) (int64, int64, bool) {
 		s.denCal = make(map[string]densityCalEntry)
 	}
 	s.denCal[model] = densityCalEntry{milliDensity: est.Milli, mad: est.MAD, drifted: est.Drifted, ok: ok, at: now}
+	s.denCal = trimCalCache(s.denCal, func(e densityCalEntry) time.Time { return e.at }, now, densityCalTTL, calCacheMaxEntries)
 	s.denCalMu.Unlock()
 	return est.Milli, est.MAD, ok
 }
@@ -582,6 +621,7 @@ func (s *Service) cacheSharesCached(model string) (readBP, createBP int64, ok bo
 		s.shareCal = make(map[string]cacheShareCalEntry)
 	}
 	s.shareCal[model] = cacheShareCalEntry{readBP: readBP, createBP: createBP, ok: ok, at: now}
+	s.shareCal = trimCalCache(s.shareCal, func(e cacheShareCalEntry) time.Time { return e.at }, now, shareCalTTL, calCacheMaxEntries)
 	s.shareCalMu.Unlock()
 	return readBP, createBP, ok
 }

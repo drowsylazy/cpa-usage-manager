@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -345,6 +346,7 @@ func (s *Service) Maintain(ctx context.Context, vacuum bool, actor string) (stor
 	if derr != nil {
 		return res, fmt.Errorf("重复请求对账失败（保留清理已完成）: %w", derr)
 	}
+	freeOSMemoryAfterBulk()
 	return res, nil
 }
 
@@ -370,7 +372,16 @@ func (s *Service) RunAutoRetention(ctx context.Context) (store.RetentionResult, 
 			"reservations": res.Reservations, "audit": res.AuditEvents,
 		},
 	})
+	freeOSMemoryAfterBulk()
 	return res, nil
+}
+
+// freeOSMemoryAfterBulk 在批量维护（保留批删/VACUUM/对账）后把 Go 堆还给
+// OS：插件常驻宿主进程，大扫描与聚合产生的堆平时靠 GC 惰性回收，长驻
+// RSS 下不去。触发频率至多一天一次（自动循环）加手动维护，单次 STW
+// 代价可忽略。
+func freeOSMemoryAfterBulk() {
+	debug.FreeOSMemory()
 }
 
 // Dedupe 单独执行历史重复行对账，供系统页「对账去重」按钮调用。

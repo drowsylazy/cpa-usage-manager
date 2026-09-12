@@ -1565,6 +1565,11 @@ func rawObjectHasKey(raw []byte, want string) bool {
 // notifySweepLoop 每分钟做一次周期扫描：告警（额度越线/密钥过期 → shoutrrr
 // 端点）与定期报告（日/周/月报到期发送）。两者内部各自以租约持有者身份执行。
 func notifySweepLoop(svc *service.Service, stop <-chan struct{}) {
+	// walCheckpointThreshold 是触发被动 checkpoint 的 WAL 体积阈值：
+	// wal_autocheckpoint（4000 页 ≈ 16MiB）在长读事务占着快照时会持续
+	// 失效，WAL 无界增长是库膨胀的第一信号。每分钟看一眼，超限做一次
+	// 非阻塞 PASSIVE checkpoint 兜底；TRUNCATE 只留给手动维护/备份前置。
+	const walCheckpointThreshold = 64 << 20
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for {
@@ -1576,6 +1581,13 @@ func notifySweepLoop(svc *service.Service, stop <-chan struct{}) {
 			_, _ = svc.RunNotifySweep(ctx)
 			_, _ = svc.RunReportsSweep(ctx)
 			cancel()
+			if st := svc.Store(); st.Writable() && st.WalBytes() > walCheckpointThreshold {
+				pctx, pcancel := context.WithTimeout(context.Background(), 15*time.Second)
+				if err := st.PassiveCheckpoint(pctx); err != nil {
+					log.Printf("cpa-usage-manager: WAL 被动 checkpoint 失败（下轮重试）: %v", err)
+				}
+				pcancel()
+			}
 		}
 	}
 }
