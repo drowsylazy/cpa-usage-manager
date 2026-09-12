@@ -47,15 +47,18 @@ func (c *MetaFXCache) SaveRate(ctx context.Context, r fx.Rate) error {
 	return c.st.SetMeta(ctx, fxMetaKey, string(b))
 }
 
-// FX 返回懒初始化的汇率服务。汇率只用于面板展示，不参与结算。
+// FX 返回懒初始化的汇率服务。汇率只用于面板展示与 CNY 规则的锁定汇率
+// 折算，后者在每请求热路径上——命中路径走 atomic 加载，零锁零拷贝。
 func (s *Service) FX() *fx.Service {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.fxSvc == nil {
-		client := &http.Client{Timeout: fx.DefaultTimeout, Transport: sharedTransport}
-		s.fxSvc = fx.NewService(NewMetaFXCache(s.st), fx.DefaultTTL, fx.DefaultProviders(client)...)
+	if p := s.fxSvc.Load(); p != nil {
+		return p
 	}
-	return s.fxSvc
+	client := &http.Client{Timeout: fx.DefaultTimeout, Transport: sharedTransport}
+	svc := fx.NewService(NewMetaFXCache(s.st), fx.DefaultTTL, fx.DefaultProviders(client)...)
+	if s.fxSvc.CompareAndSwap(nil, svc) {
+		return svc
+	}
+	return s.fxSvc.Load()
 }
 
 // ExchangeRate 返回当前 USD→CNY 汇率（永不失败，最坏退化到兜底值）。

@@ -250,6 +250,11 @@ const (
 	dupHostTailWindow = int64(30_000) // 毫秒
 	// dupTokenTolerance 是配对时两侧 token 计数的允许偏差（见 tokenCountsClose）。
 	dupTokenTolerance = int64(64)
+	// dupExecutorLatencyCap 是探测下界假设的执行器延迟上限：ts 下界按
+	// h.done - C - cap 收窄索引范围，真实执行器行 latency 超过 cap 时
+	// 探测会漏判（重复行由 Maintain 的 DedupeRequests 兜底合并，不出可见重复）。
+	// 流式请求受 streamIdleTimeout（10 分钟无进度即断）约束，2h 已是数倍冗余。
+	dupExecutorLatencyCap = 2 * time.Hour
 )
 
 // modelMatchFragment 生成「model IN (…) OR model LIKE '%/模型'」的匹配片段。
@@ -343,11 +348,11 @@ func (s *Store) FindDuplicateExecutor(ctx context.Context, models []string, near
 		found bool
 	)
 	err := s.Read(ctx, func(q Querier) error {
-		twin, ok, err := duplicateProbeTx(ctx, q, models, near, latencyMS, totalTokens, inputTokens, true)
+		id2, ok, err := duplicateProbeIDTx(ctx, q, models, near, latencyMS, totalTokens, inputTokens, true)
 		if err != nil || !ok {
 			return err
 		}
-		id, found = twin.ID, true
+		id, found = id2, true
 		return nil
 	})
 	if err != nil {
@@ -377,40 +382,12 @@ func (s *Store) BackfillRequestUsageByID(ctx context.Context, id string, b Usage
 //	h.total/h.input 与 e 侧计数差 <= dupTokenTolerance（任一侧为 0 时不约束：
 //	结算行缺 token、宿主回调被裁剪都属正常）
 func duplicateProbeTx(ctx context.Context, q Querier, models []string, near time.Time, latencyMS int64, hTokens, hInput int64, executorRow bool) (Request, bool, error) {
-	models = normalizeModels(models)
-	if len(models) == 0 {
+	p := buildDupProbe(models, executorRow, near, latencyMS, hTokens, hInput)
+	if p.empty {
 		return Request{}, false, nil
 	}
-	frag, margs := modelMatchFragment(models)
-	keyCond := `key_id = ''`
-	if executorRow {
-		keyCond = `key_id <> ''`
-	}
-	hTS := near.UnixMilli()
-	var hLatency int64
-	if latencyMS > 0 {
-		hLatency = latencyMS
-	}
-	hDone := hTS + hLatency
-	args := make([]any, 0, len(margs)+13)
-	args = append(args, margs...)
-	args = append(args,
-		hTS+dupTSWindow.Milliseconds(),            // e.ts <= h.ts + W  ⇔ h.ts >= e.ts - W
-		hTS-dupHostTailWindow,                     // e.ts + e.latency >= h.ts - T
-		hDone-dupCompleteWindow,                   // e.ts + e.latency >= h.done - C
-		hDone+dupCompleteWindow+dupHostTailWindow, // e.ts + e.latency <= h.done + C + T
-		hTokens, hTokens, dupTokenTolerance, // total_tokens = 0 OR h = 0 OR |e-h| <= tol
-		hInput, hInput, dupTokenTolerance, // input_tokens = 0 OR h = 0 OR |e-h| <= tol
-		hTS)
 	rows, err := q.QueryContext(ctx,
-		`SELECT `+requestColumns+` FROM requests
-		 WHERE `+keyCond+` AND `+frag+`
-		   AND ts <= ?
-		   AND ts + latency_ms >= ?
-		   AND ts + latency_ms BETWEEN ? AND ?
-		   AND (total_tokens = 0 OR ? = 0 OR ABS(total_tokens - ?) <= ?)
-		   AND (input_tokens = 0 OR ? = 0 OR ABS(input_tokens - ?) <= ?)
-		 ORDER BY ABS(ts - ?) LIMIT 8`, args...)
+		`SELECT `+requestColumns+` FROM requests WHERE `+p.where+` ORDER BY ABS(ts - ?) LIMIT 8`, p.args...)
 	if err != nil {
 		return Request{}, false, err
 	}
@@ -426,6 +403,79 @@ func duplicateProbeTx(ctx context.Context, q Querier, models []string, near time
 		return Request{}, false, err
 	}
 	return Request{}, false, nil
+}
+
+// duplicateProbeIDTx 是 duplicateProbeTx 的轻量变体：谓词一致，但只取 id，
+// 供判重快路径（FindDuplicateExecutor）免去 34 列全行扫描与清洗。
+func duplicateProbeIDTx(ctx context.Context, q Querier, models []string, near time.Time, latencyMS int64, hTokens, hInput int64, executorRow bool) (string, bool, error) {
+	p := buildDupProbe(models, executorRow, near, latencyMS, hTokens, hInput)
+	if p.empty {
+		return "", false, nil
+	}
+	var id string
+	rows, err := q.QueryContext(ctx,
+		`SELECT id FROM requests WHERE `+p.where+` ORDER BY ABS(ts - ?) LIMIT 8`, p.args...)
+	if err != nil {
+		return "", false, err
+	}
+	defer rows.Close()
+	if rows.Next() {
+		if err := rows.Scan(&id); err != nil {
+			return "", false, err
+		}
+		return id, true, nil
+	}
+	return "", false, rows.Err()
+}
+
+// dupProbe 是双写判重探测的谓词与参数（见 duplicateProbeTx 注释）。
+type dupProbe struct {
+	where string
+	args  []any
+	empty bool
+}
+
+// buildDupProbe 构造判重探测谓词。ts 同时带上下界：上界是既有语义
+// （h.ts >= e.ts - W），下界 h.done - C - dupExecutorLatencyCap 收窄
+// idx_requests_ts 的扫描范围——实测无下界时 SQLite 只用 (ts<?) 单侧约束，
+// 365 天保留期下探测退化为对全部历史行的范围扫描（EXPLAIN QUERY PLAN 实锤）。
+func buildDupProbe(models []string, executorRow bool, near time.Time, latencyMS int64, hTokens, hInput int64) dupProbe {
+	models = normalizeModels(models)
+	if len(models) == 0 {
+		return dupProbe{empty: true}
+	}
+	frag, margs := modelMatchFragment(models)
+	keyCond := `key_id = ''`
+	if executorRow {
+		keyCond = `key_id <> ''`
+	}
+	hTS := near.UnixMilli()
+	var hLatency int64
+	if latencyMS > 0 {
+		hLatency = latencyMS
+	}
+	hDone := hTS + hLatency
+	args := make([]any, 0, len(margs)+14)
+	args = append(args, margs...)
+	args = append(args,
+		hDone-dupCompleteWindow-dupExecutorLatencyCap.Milliseconds(), // ts >= 完成时刻下界 - 执行器延迟上限
+		hTS+dupTSWindow.Milliseconds(),                               // e.ts <= h.ts + W  ⇔ h.ts >= e.ts - W
+		hTS-dupHostTailWindow,                                        // e.ts + e.latency >= h.ts - T
+		hDone-dupCompleteWindow,                                      // e.ts + e.latency >= h.done - C
+		hDone+dupCompleteWindow+dupHostTailWindow,                    // e.ts + e.latency <= h.done + C + T
+		hTokens, hTokens, dupTokenTolerance, // total_tokens = 0 OR h = 0 OR |e-h| <= tol
+		hInput, hInput, dupTokenTolerance, // input_tokens = 0 OR h = 0 OR |e-h| <= tol
+		hTS)
+	return dupProbe{
+		where: keyCond + ` AND ` + frag + `
+		   AND ts >= ?
+		   AND ts <= ?
+		   AND ts + latency_ms >= ?
+		   AND ts + latency_ms BETWEEN ? AND ?
+		   AND (total_tokens = 0 OR ? = 0 OR ABS(total_tokens - ?) <= ?)
+		   AND (input_tokens = 0 OR ? = 0 OR ABS(input_tokens - ?) <= ?)`,
+		args: args,
+	}
 }
 
 // PassiveDedupeHint 携带被动入库时的事务内双查参数。

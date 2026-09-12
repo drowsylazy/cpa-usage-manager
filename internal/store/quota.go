@@ -625,6 +625,9 @@ func (s *Store) SetDensityEpoch(ctx context.Context, model string, at time.Time)
 //
 // 返回**新样本在前**（时间倒序）：调用方要区分「全窗基准」与「近期窗口」
 // （漂移探测），升序返回会把两者搅在一起。需要升序的调用方自行排序。
+//
+// body_len >= 1024 的噪声过滤下推进 SQL：LIMIT 在过滤后生效，短请求体
+// 占比高时不会白取回将被丢弃的行、样本量也不再缩水。
 func (s *Store) RecentDensities(ctx context.Context, model string, limit int, since time.Time) ([]int64, error) {
 	if limit <= 0 || limit > 2000 {
 		limit = 200
@@ -633,9 +636,9 @@ func (s *Store) RecentDensities(ctx context.Context, model string, limit int, si
 	err := s.Read(ctx, func(q Querier) error {
 		rows, err := q.QueryContext(ctx,
 			`SELECT body_len, context_tokens FROM requests
-			 WHERE model = ? AND result = ? AND ts > ? AND body_len > 0
+			 WHERE model = ? AND result = ? AND ts > ? AND body_len >= ?
 			   AND context_tokens > 0
-			 ORDER BY ts DESC LIMIT ?`, model, ResultOK, since.UTC().UnixMilli(), limit)
+			 ORDER BY ts DESC LIMIT ?`, model, ResultOK, since.UTC().UnixMilli(), densityMinBodyLen, limit)
 		if err != nil {
 			return err
 		}
@@ -645,15 +648,16 @@ func (s *Store) RecentDensities(ctx context.Context, model string, limit int, si
 			if err := rows.Scan(&bodyLen, &ctxTok); err != nil {
 				return err
 			}
-			if bodyLen < 1024 {
-				continue // 极短请求体的密度噪声大（包装 JSON 占比过高），不进样本
-			}
 			out = append(out, bodyLen*1000/ctxTok)
 		}
 		return rows.Err()
 	})
 	return out, err
 }
+
+// densityMinBodyLen 是密度样本的最小请求体长度：极短请求体的密度噪声大
+// （包装 JSON 占比过高），不进样本。
+const densityMinBodyLen = 1024
 
 // DensityEstimate 是密度学习的点估计：milli 为采纳的密度（×1000），
 // Drifted 标记近期窗口判定组成突变、已改跟近期（如 agent compact 后

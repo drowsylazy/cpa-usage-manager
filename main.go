@@ -212,15 +212,15 @@ type rpcExecutorRequest struct {
 	Alt             string
 	Headers         http.Header
 	Query           url.Values
-	OriginalRequest []byte
+	OriginalRequest json.RawMessage
 	SourceFormat    string
-	Payload         []byte
+	Payload         json.RawMessage
 	Metadata        map[string]any
 	StreamID        string `json:"stream_id,omitempty"`
 	HostCallbackID  string `json:"host_callback_id,omitempty"`
 }
 type rpcExecutorResponse struct {
-	Payload  []byte
+	Payload  json.RawMessage
 	Headers  http.Header
 	Metadata map[string]any
 }
@@ -228,20 +228,20 @@ type rpcExecutorResponse struct {
 // ---------- 宿主回调 ----------
 
 type rpcHostModelExecutionRequest struct {
-	EntryProtocol  string      `json:"entry_protocol"`
-	ExitProtocol   string      `json:"exit_protocol"`
-	Model          string      `json:"model"`
-	Stream         bool        `json:"stream"`
-	Body           []byte      `json:"body"`
-	Headers        http.Header `json:"headers"`
-	Query          url.Values  `json:"query"`
-	Alt            string      `json:"alt"`
-	HostCallbackID string      `json:"host_callback_id,omitempty"`
+	EntryProtocol  string          `json:"entry_protocol"`
+	ExitProtocol   string          `json:"exit_protocol"`
+	Model          string          `json:"model"`
+	Stream         bool            `json:"stream"`
+	Body           json.RawMessage `json:"body"`
+	Headers        http.Header     `json:"headers"`
+	Query          url.Values      `json:"query"`
+	Alt            string          `json:"alt"`
+	HostCallbackID string          `json:"host_callback_id,omitempty"`
 }
 type rpcHostModelExecutionResponse struct {
-	StatusCode int         `json:"status_code"`
-	Headers    http.Header `json:"headers"`
-	Body       []byte      `json:"body"`
+	StatusCode int             `json:"status_code"`
+	Headers    http.Header     `json:"headers"`
+	Body       json.RawMessage `json:"body"`
 }
 type rpcHostModelStreamResponse struct {
 	StatusCode int         `json:"status_code"`
@@ -252,21 +252,51 @@ type rpcHostModelStreamReadRequest struct {
 	StreamID string `json:"stream_id"`
 }
 type rpcHostModelStreamReadResponse struct {
-	Payload []byte `json:"payload"`
-	Error   string `json:"error"`
-	Done    bool   `json:"done"`
+	Payload json.RawMessage `json:"payload"`
+	Error   string          `json:"error"`
+	Done    bool            `json:"done"`
 }
 type rpcHostModelStreamCloseRequest struct {
 	StreamID string `json:"stream_id"`
 }
 type rpcStreamEmitRequest struct {
-	StreamID string `json:"stream_id"`
-	Payload  []byte `json:"payload,omitempty"`
-	Error    string `json:"error,omitempty"`
+	StreamID string          `json:"stream_id"`
+	Payload  json.RawMessage `json:"payload,omitempty"`
+	Error    string          `json:"error,omitempty"`
 }
 type rpcStreamCloseRequest struct {
 	StreamID string `json:"stream_id"`
 	Error    string `json:"error,omitempty"`
+}
+
+// rawBytes / rawOf 是信封 []byte 字段线上格式的手工编解码：宿主侧
+// pluginapi 结构体同为 Go encoding/json 序列化，[]byte 字段在线上是
+// base64 JSON 字符串。插件侧透传字段改用 json.RawMessage 后，宿主发来的
+// base64 字符串原样转发（零编解码）；真正要解析内容的路径经 rawBytes 解
+// 一次，插件自造的字节经 rawOf 编一次。base64 字母表无 JSON 转义字符，
+// 引号内可安全直取。
+func rawBytes(raw json.RawMessage) []byte {
+	raw = json.RawMessage(bytes.TrimSpace(raw))
+	if len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' {
+		return nil
+	}
+	out := make([]byte, base64.StdEncoding.DecodedLen(len(raw)-2))
+	n, err := base64.StdEncoding.Decode(out, raw[1:len(raw)-1])
+	if err != nil {
+		return nil
+	}
+	return out[:n]
+}
+
+func rawOf(b []byte) json.RawMessage {
+	if len(b) == 0 {
+		return nil
+	}
+	raw := make([]byte, base64.StdEncoding.EncodedLen(len(b))+2)
+	raw[0] = '"'
+	base64.StdEncoding.Encode(raw[1:len(raw)-1], b)
+	raw[len(raw)-1] = '"'
+	return raw
 }
 
 // ---------- 请求拦截 / 生命周期 ----------
@@ -399,6 +429,7 @@ func cliproxyPluginFree(p unsafe.Pointer, _ C.size_t) {
 func cliproxyPluginShutdown() {
 	runtimeState.Lock()
 	st := runtimeState.st
+	svc := runtimeState.svc
 	notifyStop := runtimeState.notifyStop
 	backupStop := runtimeState.backupStop
 	fxStop := runtimeState.fxStop
@@ -418,18 +449,39 @@ func cliproxyPluginShutdown() {
 	if fxStop != nil {
 		close(fxStop)
 	}
+	// 与 configure 同序：趁旧库仍可写先释放图片预占，再关库。
+	if svc != nil {
+		drainImageHolds(svc)
+	}
 	if st != nil {
 		_ = st.Close()
 	}
+	resetUsageClaims()
+}
+
+// drainImageHolds 在 reconfigure/关停前排空图片预占登记表：停心跳、放弃认领、
+// 尽力释放预占（旧库仍可写时生效）。迟到的 request.complete 找不到条目会
+// 干净落空，宿主用量经被动路径进新库；登记表整体重建，顺带归还 map 内存。
+func drainImageHolds(svc *service.Service) {
 	imageHoldsMu.Lock()
-	for _, h := range imageHolds {
-		if h.stopHeart != nil {
-			h.stopHeart()
-		}
+	holds := make([]imageHold, 0, len(imageHolds))
+	for id, h := range imageHolds {
+		holds = append(holds, h)
+		delete(imageHolds, id)
 	}
 	imageHolds = map[string]imageHold{}
 	imageHoldsMu.Unlock()
-	resetUsageClaims()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, h := range holds {
+		if h.stopHeart != nil {
+			h.stopHeart()
+		}
+		h.claim.release(0)
+		if _, err := svc.Release(ctx, h.reservation.ID); err != nil {
+			warnf("收口图片预占 %s 失败: %v", h.reservation.ID, err)
+		}
+	}
 }
 
 func writeResponse(out *C.cpa_buffer, raw []byte) {
@@ -499,7 +551,9 @@ func callHost(method string, payload any) (json.RawMessage, error) {
 	if callCode != 0 {
 		return nil, fmt.Errorf("host callback %s returned code=%d", method, int(callCode))
 	}
-	return append(json.RawMessage(nil), env.Result...), nil
+	// env.Result 是 rawResponse 的子切片且两者都不再被其他处引用，
+	// 直接返回子切片即可（此前多付一次整包拷贝，响应体达 MB 级时可感知）。
+	return env.Result, nil
 }
 
 // hostCall 是宿主回调的可替换入口：生产恒为 callHost；路由 failover 的
@@ -538,7 +592,7 @@ func dispatch(method string, body []byte) ([]byte, error) {
 	case "executor.execute_stream":
 		return executeStream(body)
 	case "executor.count_tokens":
-		return okEnvelope(rpcExecutorResponse{Payload: []byte(`{"input_tokens":0}`)})
+		return okEnvelope(rpcExecutorResponse{Payload: rawOf([]byte(`{"input_tokens":0}`))})
 	case "management.register":
 		return okEnvelope(managementRegistration())
 	case "management.handle":
@@ -611,6 +665,12 @@ func configure(inline string) error {
 	if err = cfg.EnsureDataDir(); err != nil {
 		return err
 	}
+	// 旧在途的图片预占先收口（旧库仍可写时释放预占）：request.complete 若在
+	// reconfigure 后才到，其预占/认领属于已关闭的旧库，结算只会静默失败。
+	// 主动释放认领后，迟到的宿主用量经被动路径落进新库，不再挂在死条目上。
+	if old := runtimeState.svc; old != nil {
+		drainImageHolds(old)
+	}
 	if runtimeState.st != nil {
 		_ = runtimeState.st.Close()
 	}
@@ -619,6 +679,12 @@ func configure(inline string) error {
 	if old := runtimeState.svc; old != nil {
 		old.Close()
 	}
+	// 清空认领注册表：在途请求的 claim 对象仍被其执行 goroutine 持有并照常
+	// 结算，但宿主迟到的用量回调不再 attach 到旧库口径，而是直接走被动入库
+	// （新旧句柄同库文件，被动侧判重探测会把重复行吸收进执行器行）。
+	// 仍在飞行的流式读泵结算时旧库已关：认领回落被动统计，仅执行器视角字段
+	// （latency/body_len 等）缺失，属可接受损耗并留 warn 日志可查。
+	resetUsageClaims()
 	// 旧通知循环引用的 svc 包着已关闭的库，无论后面成败都要在这里停下。
 	if runtimeState.notifyStop != nil {
 		close(runtimeState.notifyStop)
@@ -654,8 +720,8 @@ func configure(inline string) error {
 	// 评判调用以 openai 协议、无头信息直连 host.model.execute，非流式。
 	svc.SetJudgeExecutor(func(_ context.Context, model string, body []byte) ([]byte, int, error) {
 		judgeReq := rpcExecutorRequest{SourceFormat: "openai", Format: "openai"}
-		respBody, _, status, err := hostModelExecute("", judgeReq, model, body, false)
-		return respBody, status, err
+		respRaw, _, status, err := hostModelExecute("", judgeReq, model, rawOf(body), false)
+		return rawBytes(respRaw), status, err
 	})
 	// 租约被接管（多进程部署中出现第二个写者）时本实例降级只读，
 	// 经通知端点上报；回调在心跳协程里触发，须立即返回，故异步发送。
@@ -986,7 +1052,7 @@ func execute(body []byte) ([]byte, error) {
 		}
 		return errorEnvelope("reserve_rejected", err.Error()), nil
 	}
-	reservation, err := svc.Reserve(ctx, service.ReservationRequest{KeyID: key.KID, CallerID: key.CallerID, Model: plan.Model, EstimatedTokens: plan.TokenEstimate, EstimatedInput: plan.InputEstimate, EstimatedOutput: plan.OutputEstimate, EstimatedImages: plan.ImageCount, Actor: "quota"})
+	reservation, err := svc.Reserve(ctx, service.ReservationRequest{KeyID: key.KID, CallerID: key.CallerID, Model: plan.Model, EstimatedTokens: plan.TokenEstimate, EstimatedInput: plan.InputEstimate, EstimatedOutput: plan.OutputEstimate, EstimatedImages: plan.ImageCount, Actor: "quota", PreKey: &key})
 	if err != nil {
 		if errors.Is(err, service.ErrModelNotAllowed) {
 			return errorEnvelope("model_not_allowed", err.Error()), nil
@@ -998,21 +1064,25 @@ func execute(body []byte) ([]byte, error) {
 
 	// 登记认领：宿主随后的 usage.handle 由本次请求消费，不再被动入库。
 	claim := registerUsageClaim(key.KID, plan.Model, req.Model)
-	hostBody, headers, status, errHost := hostModelExecute(req.HostCallbackID, req, strings.TrimSpace(req.Model), request, false)
+	// 请求体直连不改写：透传宿主发来的原串（零编解码）；响应体原样回传，
+	// 只为用量嗅探与错误注记解一次字节。
+	hostBodyRaw, headers, status, errHost := hostModelExecute(req.HostCallbackID, req, strings.TrimSpace(req.Model), requestBodyRaw(req), false)
 	if errHost != nil {
 		// 未落库任何请求行：放弃认领，宿主若上报失败用量仍走被动统计。
 		claim.release(0)
 		_, _ = svc.Release(ctx, reservation.ID)
 		return errorEnvelope("upstream_error", errHost.Error()), nil
 	}
+	hostBody := rawBytes(hostBodyRaw)
 	completedAt := time.Now()
-	parsed, _ := usageparse.Parse(hostBody)
+	// 单次遍历同时取用量与顶层 model（替代 Parse + SniffModel 两遍整包解析）。
+	parsed, upstreamModel, _ := usageparse.ParseWithModel(hostBody)
 	// 非流式响应体几乎总带 usage，这里只做非阻塞探测：宿主记账发生在
 	// 本次调用返回之后，同步等待只会白等一个超时。缺失的明细由认领在
 	// 宽限期内按请求 ID 回填。
 	// HTTP 错误或空响应体 = 上游未产生响应数据，零用量时按零成本结算。
-	settleReservation(svc, plan, reservation, req, startedAt, time.Time{}, completedAt, status, parsed, usageparse.SniffModel(hostBody), hostErrorNote(status, hostBody), claim, status >= http.StatusBadRequest || len(hostBody) == 0)
-	return okEnvelope(rpcExecutorResponse{Payload: hostBody, Headers: headers})
+	settleReservation(svc, plan, reservation, req, startedAt, time.Time{}, completedAt, status, parsed, upstreamModel, hostErrorNote(status, hostBody), claim, status >= http.StatusBadRequest || len(hostBody) == 0)
+	return okEnvelope(rpcExecutorResponse{Payload: hostBodyRaw, Headers: headers})
 }
 
 func executeStream(body []byte) ([]byte, error) {
@@ -1096,7 +1166,7 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 	if err != nil {
 		return err
 	}
-	reservation, err := svc.Reserve(ctx, service.ReservationRequest{KeyID: key.KID, CallerID: key.CallerID, Model: plan.Model, EstimatedTokens: plan.TokenEstimate, EstimatedInput: plan.InputEstimate, EstimatedOutput: plan.OutputEstimate, EstimatedImages: plan.ImageCount, Actor: "quota"})
+	reservation, err := svc.Reserve(ctx, service.ReservationRequest{KeyID: key.KID, CallerID: key.CallerID, Model: plan.Model, EstimatedTokens: plan.TokenEstimate, EstimatedInput: plan.InputEstimate, EstimatedOutput: plan.OutputEstimate, EstimatedImages: plan.ImageCount, Actor: "quota", PreKey: &key})
 	if err != nil {
 		return err
 	}
@@ -1106,12 +1176,13 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 	// 登记认领：宿主随后的 usage.handle 由本次请求消费，不再被动入库。
 	claim := registerUsageClaim(key.KID, plan.Model, req.Model)
 	request = requestBodyWithStreamUsage(request, req.SourceFormat, req.Format)
+	// 请求体注入过 stream_options，须编一次 base64；流块则原样透传（见读泵）。
 	raw, err := callHost("host.model.execute_stream", rpcHostModelExecutionRequest{
 		EntryProtocol:  service.FirstNonEmpty(req.SourceFormat, "openai"),
 		ExitProtocol:   service.FirstNonEmpty(req.Format, req.SourceFormat, "openai"),
 		Model:          strings.TrimSpace(req.Model),
 		Stream:         true,
-		Body:           request,
+		Body:           rawOf(request),
 		Headers:        req.Headers,
 		Query:          req.Query,
 		Alt:            req.Alt,
@@ -1170,7 +1241,8 @@ func runStream(req rpcExecutorRequest, pluginStreamID string, closeStream func(s
 		if len(chunk.Payload) > 0 {
 			// 用量逐块增量解析，不在本地留存流副本（旧版曾缓冲整条流用于
 			// 结算兜底，每请求最多数 MB，是内存占用的主要来源）。
-			acc.FeedChunk(chunk.Payload)
+			// 块原样透传给宿主（零编解码），只为用量嗅探解一次字节。
+			acc.FeedChunk(rawBytes(chunk.Payload))
 			lastProgress.Store(time.Now().UnixNano())
 			if firstChunkAt.IsZero() {
 				firstChunkAt = time.Now()
@@ -1332,6 +1404,17 @@ func hostErrorNote(status int, hostBody []byte) string {
 }
 
 func requestBody(req rpcExecutorRequest) []byte {
+	if b := rawBytes(req.OriginalRequest); len(b) > 0 {
+		return b
+	}
+	return rawBytes(req.Payload)
+}
+
+// requestBodyRaw 返回宿主发来的请求体原串（base64 字符串形态的
+// json.RawMessage），供不改写内容时向 host.model.execute 直接透传——
+// 直连路径整条请求体零编解码；要解析内容（额度估算/路由改写）的调用方
+// 另经 requestBody 解一次字节。
+func requestBodyRaw(req rpcExecutorRequest) json.RawMessage {
 	if len(req.OriginalRequest) > 0 {
 		return req.OriginalRequest
 	}
@@ -1561,7 +1644,11 @@ func fxRefreshLoop(svc *service.Service, stop <-chan struct{}) {
 	}
 }
 
-func hostModelExecute(hostCallbackID string, req rpcExecutorRequest, model string, body []byte, stream bool) ([]byte, http.Header, int, error) {
+// hostModelExecute 经宿主执行一次非流式模型调用。body 与返回的响应体都是
+// 信封线上格式（base64 JSON 字符串）的 json.RawMessage：调用方没有改写需求
+// 时直接透传宿主发来的原串，响应体原样进入执行器响应——两端都零编解码；
+// 只有要解析内容的路径（用量嗅探/错误注记）才 rawBytes 解一次。
+func hostModelExecute(hostCallbackID string, req rpcExecutorRequest, model string, body json.RawMessage, stream bool) (json.RawMessage, http.Header, int, error) {
 	raw, err := hostCall("host.model.execute", rpcHostModelExecutionRequest{
 		EntryProtocol:  service.FirstNonEmpty(req.SourceFormat, "openai"),
 		ExitProtocol:   service.FirstNonEmpty(req.Format, req.SourceFormat, "openai"),
@@ -1583,7 +1670,7 @@ func hostModelExecute(hostCallbackID string, req rpcExecutorRequest, model strin
 	return resp.Body, resp.Headers, resp.StatusCode, nil
 }
 
-func emitPluginStreamChunk(streamID string, payload []byte) error {
+func emitPluginStreamChunk(streamID string, payload json.RawMessage) error {
 	_, err := hostCall("host.stream.emit", rpcStreamEmitRequest{StreamID: streamID, Payload: payload})
 	return err
 }
@@ -1667,7 +1754,7 @@ func interceptAfter(body []byte) ([]byte, error) {
 		}
 		return okEnvelope(rejectResponse(http.StatusPaymentRequired, err.Error()))
 	}
-	reservation, err := svc.Reserve(ctx, service.ReservationRequest{KeyID: key.KID, CallerID: key.CallerID, Model: plan.Model, EstimatedTokens: plan.TokenEstimate, EstimatedImages: plan.ImageCount, Actor: "quota"})
+	reservation, err := svc.Reserve(ctx, service.ReservationRequest{KeyID: key.KID, CallerID: key.CallerID, Model: plan.Model, EstimatedTokens: plan.TokenEstimate, EstimatedImages: plan.ImageCount, Actor: "quota", PreKey: &key})
 	if err != nil {
 		if errors.Is(err, service.ErrModelNotAllowed) {
 			return okEnvelope(rejectResponse(http.StatusForbidden, err.Error(), "model_not_allowed"))

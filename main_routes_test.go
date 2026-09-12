@@ -191,7 +191,7 @@ func TestExecuteRoutedLoopFailover(t *testing.T) {
 		}
 		resp := rpcHostModelExecutionResponse{
 			StatusCode: 200,
-			Body:       json.RawMessage(`{"model":"target-b","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`),
+			Body:       rawOf([]byte(`{"model":"target-b","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)),
 		}
 		return json.Marshal(resp)
 	})
@@ -324,7 +324,7 @@ func TestStreamDialFailover(t *testing.T) {
 		case "host.model.stream_read":
 			streamReads++
 			if streamReads == 1 {
-				resp := rpcHostModelStreamReadResponse{Payload: []byte(`data: {"usage":{"prompt_tokens":9}}` + "\n\n")}
+				resp := rpcHostModelStreamReadResponse{Payload: rawOf([]byte(`data: {"usage":{"prompt_tokens":9}}` + "\n\n"))}
 				return json.Marshal(resp)
 			}
 			resp := rpcHostModelStreamReadResponse{Done: true}
@@ -644,4 +644,88 @@ func TestRequestBodyWithStreamUsage(t *testing.T) {
 			t.Fatalf("claude 不应注入: %s", out)
 		}
 	})
+}
+
+// TestRawBytesRawOfWireContract 钉住信封 []byte 字段的线上格式：宿主侧
+// pluginapi 结构体为 Go encoding/json 序列化，[]byte 线上是 base64 JSON
+// 字符串。透传字段改 json.RawMessage 后，rawOf/rawBytes 必须与该格式互逆。
+func TestRawBytesRawOfWireContract(t *testing.T) {
+	cases := [][]byte{
+		[]byte(`{"model":"m","usage":{"prompt_tokens":1}}`),
+		[]byte("data: {\"usage\":{}}\n\n"),
+		{0x00, 0xff, 0xfe, 'x'}, // 非文本字节也须无损往返
+		[]byte(`中文 body`),
+		nil, // 空体：rawOf 为 nil，rawBytes 也为 nil
+		[]byte{},
+	}
+	for i, c := range cases {
+		raw := rawOf(c)
+		if len(c) == 0 {
+			if raw != nil {
+				t.Fatalf("case %d: 空体应返回 nil", i)
+			}
+			continue
+		}
+		// 与 encoding/json 的默认编码对齐：marshal 一个 []byte 字段对比。
+		std, err := json.Marshal(map[string][]byte{"body": c})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := json.RawMessage(std[8 : len(std)-1]) // 剥掉 {"body":、引号与尾}
+		if string(raw) != string(want) {
+			t.Fatalf("case %d: rawOf 与 encoding/json 不一致:\n got %s\nwant %s", i, raw, want)
+		}
+		if got := rawBytes(raw); string(got) != string(c) {
+			t.Fatalf("case %d: 往返不一致: got %q want %q", i, got, c)
+		}
+	}
+	// 非字符串形态（防御）：null / 裸 JSON 对象一律返回 nil，不做猜测性解析。
+	for _, bad := range []json.RawMessage{nil, json.RawMessage("null"), json.RawMessage(`{}`), json.RawMessage(`"unterminated`)} {
+		if b := rawBytes(bad); len(b) > 0 && bad == nil {
+			t.Errorf("nil 输入不应产出字节")
+		} else if bad != nil && string(bad) != "null" && len(b) > 0 {
+			t.Errorf("%s 不应解出字节", bad)
+		}
+	}
+}
+
+// TestRewriteTopLevelModel 钉住字节级 model 替换的保真语义：键序与其余
+// 内容原样保留（map 往返会重排序键并 HTML 转义 <>&，对宿主是可见变异）；
+// 无 model 键整键插入；值非字符串退回 map 路径后仍产出合法 JSON。
+func TestRewriteTopLevelModel(t *testing.T) {
+	// 键序与 HTML 字符保真：message 内容里的 <>& 不被转义，键序不变。
+	// （替换区间固定输出 ": "，故 model 键冒号后多一个空格，属合法 JSON。）
+	body := []byte(`{"model":"auto","messages":[{"role":"user","content":"a<b>&c"}],"zz":1}`)
+	out, ok := rewriteTopLevelModel(body, "target-x")
+	if !ok {
+		t.Fatal("顶层 model 字符串值应可字节级替换")
+	}
+	want := `{"model": "target-x","messages":[{"role":"user","content":"a<b>&c"}],"zz":1}`
+	if string(out) != want {
+		t.Fatalf("字节保真失败:\n got %s\nwant %s", out, want)
+	}
+	// 值中含引号转义的新模型名。
+	out, ok = rewriteTopLevelModel(body, `ta"rget`)
+	if !ok || !json.Valid(out) {
+		t.Fatalf("含转义字符的目标名应产出合法 JSON: ok=%v out=%s", ok, out)
+	}
+	var m map[string]any
+	if json.Unmarshal(out, &m) != nil || m["model"] != `ta"rget` {
+		t.Fatalf("改写后 model 值错误: %v", m["model"])
+	}
+	// 顶层无 model 键：整键插入后仍是合法 JSON 且其余键不动。
+	body2 := []byte(`{"a":1,"stream":true}`)
+	out, ok = rewriteTopLevelModel(body2, "m2")
+	if !ok || json.Unmarshal(out, &m) != nil || m["model"] != "m2" || m["a"] != float64(1) {
+		t.Fatalf("无 model 键应整键插入: ok=%v out=%s", ok, out)
+	}
+	// model 值非字符串：ok=false 走保底。
+	if _, ok = rewriteTopLevelModel([]byte(`{"model":123}`), "x"); ok {
+		t.Fatal("非字符串 model 值应返回 ok=false")
+	}
+	// 空对象插入。
+	out, ok = rewriteTopLevelModel([]byte(`{}`), "m3")
+	if !ok || json.Unmarshal(out, &m) != nil || m["model"] != "m3" {
+		t.Fatalf("空对象应可插入 model: ok=%v out=%s", ok, out)
+	}
 }

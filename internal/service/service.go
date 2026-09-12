@@ -145,8 +145,10 @@ type Service struct {
 	cfg     config.Config
 	peppers PepperSet
 	mu      sync.RWMutex
-	// fxSvc 懒初始化，只在面板请求汇率时创建。
-	fxSvc *fx.Service
+	// fxSvc 懒初始化（atomic，零锁命中）：FX() 在 CNY 计价规则的
+	// Reserve/Settle 热路径每请求调用，不能走全局 s.mu 写锁——那会把
+	// 所有请求与 Config() 等读路径串行化。
+	fxSvc atomic.Pointer[fx.Service]
 
 	// models.dev 价格簿搜索缓存：整本目录较大，10 分钟内复用同一份。
 	catalogMu  sync.Mutex
@@ -163,6 +165,13 @@ type Service struct {
 	// HoldReservation 的清扫在写锁事务内执行，节流到每 sweepInterval 一次，
 	// 避免高并发下每个 Reserve 都附带一条 UPDATE。
 	lastSweepAt atomic.Int64
+
+	// resAccuracySnap 是预占精度分位数的 TTL 缓存：实时页 5s 轮询该读数，
+	// 每次全量扫至多 2 万行预占在 Go 侧算分位数——样本积累后是轮询里最重
+	// 的一笔；分位数读数本就钝化，60s 缓存与轮询频率解耦。
+	resAccuracySnap atomic.Pointer[resAccuracySnapshot]
+
+	// 集中式预占心跳注册表：所有在途预占共用一个 goroutine 批量续期。
 
 	// 集中式预占心跳注册表：所有在途预占共用一个 goroutine 批量续期。
 	// beatsStop 是该 goroutine 的退出通道，由 Close 关闭——reconfigure 换新
@@ -218,10 +227,48 @@ type Service struct {
 	judgeTrk judgeTracker
 }
 
-// pricingSnapshot 是一份不可变的计价规则快照。
-type pricingSnapshot struct {
-	rules []store.PricingRule
+// resAccuracySnapshot 是预占精度分位数缓存的一份不可变快照（读侧
+// ReservationAccuracy，实现见 analytics.go）。
+type resAccuracySnapshot struct {
+	items []store.ReservationAccuracy
 	at    time.Time
+}
+
+// pricingSnapshot 是一份不可变的计价规则快照，按匹配优先序（priority DESC,
+// id ASC）构建。exact 规则按小写模式分桶供 matchPricing O(1) 命中——
+// models.dev 同步后 exact 规则可达数千条，每请求线性扫描随规则数线性放大；
+// glob/regexp 是管理员低频手写的少量规则，保留线性扫描。
+// pos 是规则在全局优先序里的位置：桶内取首、桶间（exact vs glob/regexp）
+// 按 pos 裁决，与旧的全序扫描语义一致。
+type pricingSnapshot struct {
+	exact  map[string][]pricingCandidate
+	linear []pricingCandidate
+	at     time.Time
+}
+
+type pricingCandidate struct {
+	rule store.PricingRule
+	pos  int
+}
+
+func buildPricingSnapshot(rules []store.PricingRule, at time.Time) *pricingSnapshot {
+	snap := &pricingSnapshot{
+		exact: make(map[string][]pricingCandidate, len(rules)/2+1),
+		at:    at,
+	}
+	for i, r := range rules {
+		if !r.Enabled {
+			continue
+		}
+		c := pricingCandidate{rule: r, pos: i}
+		if r.MatchKind == store.MatchExact {
+			key := strings.ToLower(strings.TrimSpace(r.Pattern))
+			snap.exact[key] = append(snap.exact[key], c)
+			continue
+		}
+		snap.linear = append(snap.linear, c)
+	}
+	return snap
 }
 
 const (
@@ -435,12 +482,24 @@ type ReservationRequest struct {
 	// PricingOverride 非空时跳过按 Model 的规则匹配，直接采用该计价规则
 	// （别名路由 mode=target：执行器已按首选目标匹配）。
 	PricingOverride *store.PricingRule
+	// PreKey 携带调用方鉴权时已取回的 Key 记录副本：执行器路径在
+	// ResolveIdentity 已读过该行，Reserve 内再按 KeyID 重查是每请求的
+	// 第二次同键 SELECT。非 nil 且 KID 与 KeyID 一致时跳过重查。
+	PreKey *store.PluginKey
 }
 
 func (s *Service) Reserve(ctx context.Context, r ReservationRequest) (store.Reservation, error) {
-	k, err := s.st.GetKey(ctx, r.KeyID)
-	if err != nil {
-		return store.Reservation{}, err
+	var (
+		k   store.PluginKey
+		err error
+	)
+	if r.PreKey != nil && r.PreKey.KID == r.KeyID {
+		k = *r.PreKey
+	} else {
+		k, err = s.st.GetKey(ctx, r.KeyID)
+		if err != nil {
+			return store.Reservation{}, err
+		}
 	}
 	now := time.Now().UTC()
 	if !k.Usable(now) {
@@ -767,37 +826,49 @@ func (s *Service) LookupPricing(ctx context.Context, model string) (store.Pricin
 }
 
 func (s *Service) matchPricing(ctx context.Context, model string) (store.PricingRule, bool, error) {
-	rules, err := s.pricingRules(ctx)
+	snap, err := s.pricingRules(ctx)
 	if err != nil {
 		return store.PricingRule{}, false, err
 	}
-	for _, r := range rules {
-		if r.Matches(model) {
-			return r, !r.IsFallback(), nil
+	// 语义与旧的全序扫描一致：全部命中候选里取全局优先序（priority DESC,
+	// id ASC）最前者。exact 桶 O(1) 命中且桶内值按优先序排列；glob/regexp
+	// 线性扫描收集命中；两族之间按 pos 裁决。
+	var best *pricingCandidate
+	if cands := snap.exact[strings.ToLower(strings.TrimSpace(model))]; len(cands) > 0 {
+		best = &cands[0]
+	}
+	for i := range snap.linear {
+		c := &snap.linear[i]
+		if (best == nil || c.pos < best.pos) && c.rule.Matches(model) {
+			best = c
 		}
 	}
-	return store.PricingRule{}, false, nil
+	if best == nil {
+		return store.PricingRule{}, false, nil
+	}
+	return best.rule, !best.rule.IsFallback(), nil
 }
 
 // pricingRules 返回按匹配顺序排列的启用规则快照：命中内存快照时零 DB 往返，
 // 过期（或被写回调失效）时重新加载。ListPricingRules 的 SQL 已按
 // priority DESC, id ASC 排序，与匹配顺序一致，无需再排。
 // 重载经 double-checked locking 合并：TTL 过期瞬间只放行一个构建者。
-func (s *Service) pricingRules(ctx context.Context) ([]store.PricingRule, error) {
+func (s *Service) pricingRules(ctx context.Context) (*pricingSnapshot, error) {
 	if snap := s.pricingSnap.Load(); snap != nil && time.Since(snap.at) < pricingCacheTTL {
-		return snap.rules, nil
+		return snap, nil
 	}
 	s.pricingReloadMu.Lock()
 	defer s.pricingReloadMu.Unlock()
 	if snap := s.pricingSnap.Load(); snap != nil && time.Since(snap.at) < pricingCacheTTL {
-		return snap.rules, nil
+		return snap, nil
 	}
 	rules, err := s.st.ListPricingRules(ctx, true)
 	if err != nil {
 		return nil, err
 	}
-	s.pricingSnap.Store(&pricingSnapshot{rules: rules, at: time.Now()})
-	return rules, nil
+	snap := buildPricingSnapshot(rules, time.Now())
+	s.pricingSnap.Store(snap)
+	return snap, nil
 }
 func (s *Service) Price(model string, u usageparse.Usage) (money.Micro, bool, error) {
 	usd, _, _, p, e := s.PriceNative(model, u)

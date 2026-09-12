@@ -660,3 +660,51 @@ func TestContextTokens(t *testing.T) {
 		t.Errorf("exclusive 口径完整上下文 = %d, 期望 5500", got)
 	}
 }
+
+func TestParseWithModel(t *testing.T) {
+	// JSON 体：usage 与顶层 model 一次遍历同时返回。
+	body := []byte(`{"model":"gpt-x","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}}`)
+	u, model, ok := ParseWithModel(body)
+	if !ok || u.InputTokens != 100 || u.OutputTokens != 20 {
+		t.Fatalf("ParseWithModel usage = %+v, ok=%v", u, ok)
+	}
+	if model != "gpt-x" {
+		t.Errorf("model = %q, 期望 gpt-x", model)
+	}
+	// 顶层无 model 字段：返回空串。
+	u2, model2, ok2 := ParseWithModel([]byte(`{"usage":{"prompt_tokens":1}}`))
+	if !ok2 || model2 != "" {
+		t.Errorf("无 model 字段: ok=%v model=%q", ok2, model2)
+	}
+	_ = u2
+	// 裸 JSON 顶层带前后空白：与 Parse 同口径，model 仍可取到。
+	_, model3, ok3 := ParseWithModel([]byte("  \n {\"model\":\" claude-x \",\"usage\":{\"input_tokens\":5}}"))
+	if !ok3 || model3 != "claude-x" {
+		t.Errorf("带空白 JSON: ok=%v model=%q", ok3, model3)
+	}
+	// SSE 体：model 取首个声明（与 Accumulator.Model 同口径）。
+	sse := []byte("data: {\"model\":\"m1\",\"usage\":{\"prompt_tokens\":7}}\n\ndata: {\"model\":\"m1\",\"usage\":{\"completion_tokens\":3}}\n\n")
+	u4, model4, ok4 := ParseWithModel(sse)
+	if !ok4 || u4.InputTokens != 7 || u4.OutputTokens != 3 || model4 != "m1" {
+		t.Errorf("SSE: ok=%v usage=%+v model=%q", ok4, u4, model4)
+	}
+	// 空体与 usage 缺失体：ok=false。
+	if _, _, ok5 := ParseWithModel(nil); ok5 {
+		t.Error("空体不应 ok")
+	}
+	if _, _, ok6 := ParseWithModel([]byte(`{"choices":[]}`)); ok6 {
+		t.Error("无 usage 容器不应 ok")
+	}
+	// 与 Parse 的用量结果一致性：同一批形状两入口必须等值。
+	for _, c := range []string{
+		`{"message":{"usage":{"input_tokens":200,"cache_read_input_tokens":50}}}`,
+		`{"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":2}}`,
+		`{"response":{"usage":{"total_tokens":9}}}`,
+	} {
+		pu, pok := Parse([]byte(c))
+		wu, _, wok := ParseWithModel([]byte(c))
+		if pok != wok || pu != wu {
+			t.Errorf("Parse 与 ParseWithModel 不一致: %q → (%+v,%v) vs (%+v,%v)", c, pu, pok, wu, wok)
+		}
+	}
+}

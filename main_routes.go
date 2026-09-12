@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -91,6 +92,7 @@ func resolveRouting(ctx context.Context, svc *service.Service, key *store.Plugin
 	resReq := service.ReservationRequest{
 		KeyID: key.KID, CallerID: key.CallerID, Model: plan.Model,
 		EstimatedTokens: plan.TokenEstimate, EstimatedInput: plan.InputEstimate, EstimatedOutput: plan.OutputEstimate, EstimatedImages: plan.ImageCount, Actor: "quota",
+		PreKey: key,
 	}
 	if plan.Priced && match.Route.PricingMode == "target" {
 		override := plan.Rule
@@ -191,32 +193,54 @@ func modelRegister(svc *service.Service) ([]byte, error) {
 	return okEnvelope(resp)
 }
 
-// bodyRewriter 把「格式判定 + 整包解析」提到候选循环外：解析一次，
-// 每个候选只改 model 字段后重新序列化。failover N 个目标从 N 次往返
-// 降为 1 次解析 + N 次序列化；非 JSON 体原样透传（ok=false）。
+// bodyRewriter 把「格式判定」提到候选循环外：每个候选只做顶层 model 值的
+// 字节级定点替换（+N 候选各一次小段拷贝），其余字节原样保留——整包 map
+// 往返会重排序键并 HTML 转义 <>&，对宿主是可见的请求体变异（与
+// requestBodyWithStreamUsage 同一教训），且 N 目标 failover 时是 N 次全量
+// Marshal。非 JSON 体原样透传。
 type bodyRewriter struct {
 	raw       []byte
 	stream    bool
 	openaiFam bool
-	ok        bool
-	m         map[string]any
+	srcFormat string
+	outFormat string
+	jsonObj   bool
+	// m 惰性使用：仅当字节级改写不适用（顶层无 model 键或值非字符串）时
+	// 退回整包 map 序列化，保底与旧行为完全一致。
+	m map[string]any
 }
 
 func newBodyRewriter(raw []byte, sourceFormat, outputFormat string, stream bool) *bodyRewriter {
-	b := &bodyRewriter{raw: raw, stream: stream}
+	b := &bodyRewriter{raw: raw, stream: stream, srcFormat: sourceFormat, outFormat: outputFormat}
 	format := strings.ToLower(service.FirstNonEmpty(outputFormat, sourceFormat))
 	b.openaiFam = !strings.Contains(format, "claude") && !strings.Contains(format, "gemini")
-	if len(raw) == 0 || json.Unmarshal(raw, &b.m) != nil {
-		return b
-	}
-	b.ok = true
+	b.jsonObj = len(bytes.TrimSpace(raw)) > 0 && bytes.TrimSpace(raw)[0] == '{'
 	return b
 }
 
-// build 返回目标为 targetModel 的请求体（共享底层 map，按候选逐次改写）。
+// build 返回目标为 targetModel 的请求体。
 func (b *bodyRewriter) build(targetModel string) []byte {
-	if b == nil || !b.ok {
+	if b == nil || !b.jsonObj {
 		return b.raw
+	}
+	out, ok := rewriteTopLevelModel(b.raw, targetModel)
+	if !ok {
+		return b.buildViaMap(targetModel)
+	}
+	if b.stream && b.openaiFam {
+		// 流式 openai 系注入 include_usage：字节级、幂等、含「已存在但不
+		// 是对象」的覆盖分支（与旧 map 口径一致）。
+		out = requestBodyWithStreamUsage(out, b.srcFormat, b.outFormat)
+	}
+	return out
+}
+
+// buildViaMap 是字节级改写不适用的保底路径：整包 map 序列化（会重排键）。
+func (b *bodyRewriter) buildViaMap(targetModel string) []byte {
+	if b.m == nil {
+		if json.Unmarshal(b.raw, &b.m) != nil {
+			return b.raw
+		}
 	}
 	b.m["model"] = targetModel
 	if b.stream && b.openaiFam {
@@ -234,6 +258,83 @@ func (b *bodyRewriter) build(targetModel string) []byte {
 		return b.raw
 	}
 	return updated
+}
+
+// rewriteTopLevelModel 把顶层 "model" 字符串值替换为 targetModel：字节级
+// 定点替换，键序与其余内容（含转义形态）不变。顶层无 model 键时在起始 {
+// 后整键插入（与 requestBodyWithStreamUsage 的插入分支同形）；值非字符串
+// 或解析失败时 ok=false，调用方退回 map 路径。
+func rewriteTopLevelModel(raw []byte, targetModel string) ([]byte, bool) {
+	newVal, err := json.Marshal(targetModel)
+	if err != nil {
+		return nil, false
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if t, err := dec.Token(); err != nil {
+		return nil, false
+	} else if d, isDelim := t.(json.Delim); !isDelim || d != '{' {
+		return nil, false
+	}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, false
+		}
+		// 键 token 读完后 InputOffset 停在键的闭引号处；值区间自此起
+		// （其间只可能是冒号与空白）。
+		valStart := int(dec.InputOffset())
+		key, _ := keyTok.(string)
+		valTok, err := dec.Token()
+		if err != nil {
+			return nil, false
+		}
+		if key == "model" {
+			if _, isStr := valTok.(string); !isStr {
+				return nil, false
+			}
+			end := int(dec.InputOffset())
+			out := make([]byte, 0, valStart+2+len(newVal)+len(raw)-end)
+			out = append(out, raw[:valStart]...)
+			out = append(out, ':', ' ')
+			out = append(out, newVal...)
+			out = append(out, raw[end:]...)
+			return out, true
+		}
+		if d, isDelim := valTok.(json.Delim); isDelim && (d == '{' || d == '[') {
+			// 跳过嵌套容器值（只扫 token，不物化）。
+			depth := 1
+			for depth > 0 {
+				t, err := dec.Token()
+				if err != nil {
+					return nil, false
+				}
+				if dd, isDelim := t.(json.Delim); isDelim {
+					if dd == '{' || dd == '[' {
+						depth++
+					} else {
+						depth--
+					}
+				}
+			}
+		}
+	}
+	// 顶层无 model 键：在起始 { 后整键插入（空对象不带前导逗号）。
+	i := bytes.IndexByte(raw, '{')
+	if i < 0 {
+		return nil, false
+	}
+	insert := append([]byte(`"model":`), newVal...)
+	j := i + 1
+	for j < len(raw) && (raw[j] == ' ' || raw[j] == '\t' || raw[j] == '\n' || raw[j] == '\r') {
+		j++
+	}
+	out := make([]byte, 0, len(raw)+len(insert)+1)
+	out = append(out, raw[:i+1]...)
+	out = append(out, insert...)
+	if j < len(raw) && raw[j] != '}' {
+		out = append(out, ',')
+	}
+	return append(out, raw[i+1:]...), true
 }
 
 // preparePayload 单发场景的便捷封装。
@@ -350,14 +451,17 @@ func executeRoutedLoop(ctx context.Context, re *routedExecution, req rpcExecutor
 	rw := newBodyRewriter(request, req.SourceFormat, req.Format, false)
 	for i, tgt := range re.chain {
 		finalTgt := targetWithSuffix(tgt, re.match.Suffix)
-		payload := rw.build(finalTgt)
-		hostBody, headers, status, errHost := hostModelExecute(req.HostCallbackID, req, finalTgt, payload, false)
-		upstream := service.FirstNonEmpty(usageparse.SniffModel(hostBody), bareTargetName(finalTgt))
+		payload := rawOf(rw.build(finalTgt))
+		hostBodyRaw, headers, status, errHost := hostModelExecute(req.HostCallbackID, req, finalTgt, payload, false)
+		hostBody := rawBytes(hostBodyRaw)
+		upstream := bareTargetName(finalTgt)
 		if errHost == nil && status < 400 {
 			svc.MarkRouteSuccess(route.ID, tgt)
-			parsed, _ := usageparse.Parse(hostBody)
+			// 单次遍历同时取用量与顶层 model（替代 Parse + SniffModel 两遍整包解析）。
+			parsed, model, _ := usageparse.ParseWithModel(hostBody)
+			upstream = service.FirstNonEmpty(model, upstream)
 			settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), status, parsed, upstream, re.failoverNote(), re.claim, len(hostBody) == 0)
-			return okEnvelope(rpcExecutorResponse{Payload: hostBody, Headers: headers})
+			return okEnvelope(rpcExecutorResponse{Payload: hostBodyRaw, Headers: headers})
 		}
 		if i < len(re.chain)-1 && routeFailureEligible(status, routeFailureCause(status, errHost), errHost) {
 			svc.MarkRouteFail(route.ID, tgt, cooldownSecondsFor(route.CooldownSeconds, status, headers))
@@ -370,9 +474,10 @@ func executeRoutedLoop(ctx context.Context, re *routedExecution, req rpcExecutor
 			_, _ = svc.Release(ctx, re.reservation.ID)
 			return errorEnvelope("upstream_error", errHost.Error()), nil
 		}
-		parsed, _ := usageparse.Parse(hostBody)
+		parsed, model, _ := usageparse.ParseWithModel(hostBody)
+		upstream = service.FirstNonEmpty(model, upstream)
 		settleReservation(svc, re.plan, re.reservation, req, startedAt, time.Time{}, time.Now(), status, parsed, upstream, re.failoverNote(), re.claim, true)
-		return okEnvelope(rpcExecutorResponse{Payload: hostBody, Headers: headers})
+		return okEnvelope(rpcExecutorResponse{Payload: hostBodyRaw, Headers: headers})
 	}
 	// 不可达：ResolveChain 保证链非空，末次迭代必为终局分支。
 	return errorEnvelope("upstream_error", "路由候选链为空"), nil
@@ -392,7 +497,7 @@ const (
 func dialHostStream(re *routedExecution, req rpcExecutorRequest, rw *bodyRewriter, index int) (rpcHostModelStreamResponse, dialOutcome, error) {
 	tgt := re.chain[index]
 	finalTgt := targetWithSuffix(tgt, re.match.Suffix)
-	payload := rw.build(finalTgt)
+	payload := rawOf(rw.build(finalTgt))
 	raw, err := hostCall("host.model.execute_stream", rpcHostModelExecutionRequest{
 		EntryProtocol:  service.FirstNonEmpty(req.SourceFormat, "openai"),
 		ExitProtocol:   service.FirstNonEmpty(req.Format, req.SourceFormat, "openai"),
@@ -473,7 +578,7 @@ func pumpRoutedStream(re *routedExecution, req rpcExecutorRequest, startedAt tim
 			return errors.New(chunk.Error)
 		}
 		if len(chunk.Payload) > 0 {
-			acc.FeedChunk(chunk.Payload)
+			acc.FeedChunk(rawBytes(chunk.Payload))
 			lastProgress.Store(time.Now().UnixNano())
 			if firstChunkAt.IsZero() {
 				firstChunkAt = time.Now()

@@ -442,3 +442,58 @@ func TestDedupeRequestsFullChainLatencyPair(t *testing.T) {
 		t.Fatalf("token 不相容的被动行应保留: %v", err)
 	}
 }
+
+// TestProbeSkipsBeyondExecutorLatencyCap 钉住探测下界假设：执行器行延迟
+// 超过 dupExecutorLatencyCap（2h）时不参与配对——ts 下界是为让
+// idx_requests_ts 走有界范围扫描（无下界时 EXPLAIN 实锤只取 ts<? 单侧约束，
+// 退化为全历史扫描），漏判由 Maintain 的 DedupeRequests 兜底合并。
+func TestProbeSkipsBeyondExecutorLatencyCap(t *testing.T) {
+	s := openTestStore(t, filepath.Join(t.TempDir(), "cpa.db"), "owner-a")
+	ctx := context.Background()
+	base := time.UnixMilli(1_700_000_000_000).UTC()
+
+	// 执行器行延迟 3h（> cap）：被动侧不得并入。
+	exec := Request{
+		ID: "exec-marathon", TS: base, KeyID: "kid1", CallerID: "default",
+		Model: "slow/long-stream", Result: ResultOK,
+		LatencyMS: 3 * 3600 * 1000, CostMicroUSD: 42, Priced: true,
+		InputTokens: 700, OutputTokens: 300, TotalTokens: 1000,
+	}
+	if err := s.RecordUsage(ctx, exec); err != nil {
+		t.Fatalf("写入执行器行失败: %v", err)
+	}
+	host := Request{
+		ID: "host-of-marathon", TS: base.Add(1200 * time.Millisecond), Model: "long-stream",
+		Provider: "openai", Result: ResultOK,
+		InputTokens: 700, OutputTokens: 300, TotalTokens: 1000,
+		LatencyMS: 3*3600*1000 + 1200,
+	}
+	hint := PassiveDedupeHint{Models: []string{"long-stream"}, Near: host.TS, LatencyMS: host.LatencyMS}
+	if err := s.RecordPassiveUsage(ctx, host, hint); err != nil {
+		t.Fatalf("被动入库失败: %v", err)
+	}
+	// 超出 cap 的行不被事务内探测吸收：宿主行独立落库（对账兜底负责后续合并）。
+	if _, err := s.GetRequest(ctx, host.ID); err != nil {
+		t.Fatalf("超出延迟上限的执行器行不应被并入，宿主行应独立落库: %v", err)
+	}
+	// 对照组：同形状但延迟 5min（< cap）仍正常配对吸收。
+	exec2 := exec
+	exec2.ID = "exec-normal"
+	exec2.Model = "slow/short-stream"
+	exec2.LatencyMS = 5 * 60 * 1000
+	if err := s.RecordUsage(ctx, exec2); err != nil {
+		t.Fatalf("写入对照执行器行失败: %v", err)
+	}
+	host2 := host
+	host2.ID = "host-of-normal"
+	host2.Model = "short-stream"
+	host2.TS = base.Add(2 * 1200 * time.Millisecond)
+	host2.LatencyMS = 5*60*1000 + 1200
+	hint2 := PassiveDedupeHint{Models: []string{"short-stream"}, Near: host2.TS, LatencyMS: host2.LatencyMS}
+	if err := s.RecordPassiveUsage(ctx, host2, hint2); err != nil {
+		t.Fatalf("对照被动入库失败: %v", err)
+	}
+	if _, err := s.GetRequest(ctx, host2.ID); err == nil {
+		t.Fatal("cap 内的执行器行应照常被并入，宿主行不得独立落库")
+	}
+}

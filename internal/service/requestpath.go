@@ -213,17 +213,21 @@ type effortMeta struct {
 
 // ParseRequestMeta 对请求体做一次类型化解析。body 非 JSON 对象时除
 // BodyLen/InputEstimate 外返回零值（与旧实现的 map 解析失败分支等价）。
+// estimateInputTokens 是 O(body) 全量字节扫描，整个函数只扫一次：
+// Unmarshal 后的重置只是覆盖 JSON 里同名键（字段名大小写不敏感匹配）
+// 可能注入的值，不重扫 body。
 func ParseRequestMeta(body []byte) RequestMeta {
-	m := RequestMeta{BodyLen: len(body), InputEstimate: estimateInputTokens(body)}
+	estimate := estimateInputTokens(body)
+	m := RequestMeta{BodyLen: len(body), InputEstimate: estimate}
 	if len(body) == 0 || json.Unmarshal(body, &m) != nil {
-		return RequestMeta{BodyLen: len(body), InputEstimate: estimateInputTokens(body)}
+		return RequestMeta{BodyLen: len(body), InputEstimate: estimate}
 	}
 	m.Model = strings.TrimSpace(m.Model)
 	m.ResolvedTier = FirstNonEmpty(m.ServiceTier, m.Tier)
 	m.ResolvedThinking = FirstNonEmpty(m.Reasoning.Effort, m.Thinking.Effort, m.ReasoningEffort)
 	m.HasTools = rawNonEmpty(m.Tools)
 	m.HasSystem = rawNonEmpty(m.System) || rawNonEmpty(m.SystemInstruction)
-	m.InputEstimate = estimateInputTokens(body)
+	m.InputEstimate = estimate
 	return m
 }
 

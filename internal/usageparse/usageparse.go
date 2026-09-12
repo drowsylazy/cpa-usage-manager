@@ -223,28 +223,29 @@ type rawGemini struct {
 // ParseJSON 从一段 JSON（完整响应体或单个流式事件）中解析用量。
 // 返回 ok=false 表示未找到任何 usage 容器。
 func ParseJSON(body []byte) (Usage, bool) {
-	if len(body) == 0 || len(body) > MaxBodyBytes {
-		return Usage{}, false
-	}
+	u, _, ok := parseJSONWithModel(bytes.TrimSpace(body))
+	return u, ok
+}
+
+// ParseWithModel 自动判别 JSON 与 SSE 两种载荷形式，一次遍历同时返回
+// 用量与载荷声明的模型名。供非流式主路径替代 Parse + SniffModel 的
+// 两次独立整包解析；model 为空串表示载荷未声明。
+func ParseWithModel(body []byte) (Usage, string, bool) {
 	trimmed := bytes.TrimSpace(body)
-	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return Usage{}, false
+	if len(trimmed) == 0 {
+		return Usage{}, "", false
 	}
-	if !bytes.Contains(trimmed, usageKeyProbe) {
-		return Usage{}, false
-	}
-	var acc Usage
-	found := false
-	for _, c := range findUsageContainers(trimmed, 0) {
-		if u, ok := decodeContainer(c.raw, c.gemini); ok {
-			acc.merge(u)
-			found = true
+	if trimmed[0] == '{' {
+		if u, model, ok := parseJSONWithModel(trimmed); ok {
+			return u, model, true
 		}
 	}
-	if !found {
-		return Usage{}, false
+	var a Accumulator
+	for _, payload := range SSEPayloads(body) {
+		a.Feed(payload)
 	}
-	return acc, true
+	u, ok := a.Result()
+	return u, a.model, ok
 }
 
 // container 是搜索到的一个 usage 对象。
@@ -259,16 +260,55 @@ type container struct {
 // 完整解析，不影响正确性。
 var usageKeyProbe = []byte(`"usage`)
 
-// findUsageContainers 在 JSON 树中递归查找 usage / usageMetadata 容器。
-//
+// parseJSONWithModel 是 ParseJSON 的单遍变体：顶层对象只解出一次，
+// 顺带抓取顶层 "model" 字符串字段（与 sniffModel 同口径）。
+func parseJSONWithModel(trimmed []byte) (Usage, string, bool) {
+	if len(trimmed) == 0 || len(trimmed) > MaxBodyBytes {
+		return Usage{}, "", false
+	}
+	if trimmed[0] != '{' {
+		return Usage{}, "", false
+	}
+	if !bytes.Contains(trimmed, usageKeyProbe) {
+		return Usage{}, "", false
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &top); err != nil {
+		return Usage{}, "", false
+	}
+	model := topLevelModel(top)
+	var acc Usage
+	found := false
+	for _, c := range findContainersIn(top, 0) {
+		if u, ok := decodeContainer(c.raw, c.gemini); ok {
+			acc.merge(u)
+			found = true
+		}
+	}
+	if !found {
+		return Usage{}, model, false
+	}
+	return acc, model, true
+}
+
+// topLevelModel 从已解出的顶层对象里抓 "model" 字符串字段。
+func topLevelModel(obj map[string]json.RawMessage) string {
+	raw, ok := obj["model"]
+	if !ok {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	return strings.TrimSpace(s)
+}
+
+// findContainersIn 在已解出的对象层里收集 usage 容器并继续下探。
 // 递归而非只看顶层，是为了同时覆盖 Claude 的 {"message":{"usage":…}}、
 // Responses 的 {"response":{"usage":…}} 等包裹形状。
-func findUsageContainers(raw json.RawMessage, depth int) []container {
+func findContainersIn(obj map[string]json.RawMessage, depth int) []container {
 	if depth > maxSearchDepth {
-		return nil
-	}
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &obj); err != nil {
 		return nil
 	}
 	var out []container
@@ -287,6 +327,18 @@ func findUsageContainers(raw json.RawMessage, depth int) []container {
 		}
 	}
 	return out
+}
+
+// findUsageContainers 在 JSON 树中递归查找 usage / usageMetadata 容器。
+func findUsageContainers(raw json.RawMessage, depth int) []container {
+	if depth > maxSearchDepth {
+		return nil
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil
+	}
+	return findContainersIn(obj, depth)
 }
 
 // decodeContainer 解码单个 usage 容器。
