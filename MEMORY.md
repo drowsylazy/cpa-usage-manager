@@ -19,6 +19,18 @@
 
 ## Discovered durable knowledge
 
+- **2026-09 性能批四（存储与内存，schema v19）**：
+  - **SQLite 部分索引的蕴含判定坑（EXPLAIN 实锤）**：查询 `WHERE status='settled' ORDER BY finished_at DESC` 用不上 `WHERE status IN ('settled','released')` 的部分索引——planner 的蕴含检查推不出「等值 ⇒ IN」，实测退回 `idx_reservations_settled` + `USE TEMP B-TREE FOR ORDER BY`。**排序键索引一律用普通索引**（NULL 行不进排序主体、索引序对任意 WHERE 稳定可用），不要为了省体量上 status 部分索引。钉：TestReservationFinishedAtReads（EXPLAIN 断言走 idx_reservations_finished）。
+  - **v19 `reservations.finished_at` 派生列**：「最近预占」与「预占精度」都按 `COALESCE(settled_at, released_at)` 表达式排序无法走索引，精度读数每次重建全量扫至多 2 万行。落库冗余写完结时刻——**settle/release 共 5 个 UPDATE 写入点必须同步维护**（HoldReservation 僵尸清扫/拒绝补救/SettleReservation/ReleaseReservation/releaseStale），漏一处该行就从读数里消失；历史行迁移就地回填。恢复快照 `INSERT INTO main.t SELECT *` 靠 validateSnapshot 的**精确版本一致**校验兜底（版本不同在校验层即拒），加列不引入列数错位新坑。
+  - **自动保留清理循环**（autoRetentionLoop，本地 5 点触发，与备份默认 4 点错开；启动补跑当天名额、仅租约持有者执行）：retention_days 此前只有面板手动维护入口才真正执行，requests/usage_rollups/audit_events 实际涨过保留期。只做 ApplyRetention + ReleaseStaleReservations，**不含 DedupeRequests**——那是 v0.2.2 前历史遗留行的对账兜底，全年窗口自连接逐日跑代价不成比例，留在手动入口。注意 RetentionResult.Reservations 只计 retention 删量、陈旧释放数不并入（与 Maintain 同口径）。
+  - **服务层 TTL 缓存模式的扩展形**：Stats 七个全表 COUNT（overview 是面板默认页 + health 是监控探针）拆出 `store.Counts`，服务层 15s TTL 缓存后经 `store.StatsFromCounts` 拼装——**Writable/IORetries/文件体积保持实时**（只读降级状态不能被缓存拖住）。这种「重计数走缓存 + 状态实时读」拆分是给带状态读数加缓存的标准形。ModelDensities 30s TTL + ResetModelDensity 立即失效（重置后面板不能显示旧读数）。钉：TestStatsCached / TestModelDensitiesCached。
+  - **ModelDensities 去重扫描而非窗口函数**：模型全集两条 DISTINCT 全表 UNION 合并为单条 OR+GROUP BY 一遍扫描；盲区计数逐模型 COUNT 收敛为单条 GROUP BY（仅在确有候选模型时执行）。逐模型样本查询**保留**——走 (model, ts) 索引每次只摸 LIMIT 行，窗口函数全表扫描 + 分区排序在模型数少时反而更贵；**N+1 要按每跳的索引代价评估，不能见 N+1 就上窗口函数**。
+  - **audit CSV 导出流式**：store.IterateAudit 逐行遍历回调（导出列不含 detail_json，顺带省掉 10 万次 JSON 解析），与 requests 导出的 IterateRequests 同口径；**新增导出类型一律流式**，上限 10 万行全量装载是数十 MB 峰值。
+  - **校准缓存定容**：outCal/denCal/shareCal 加 512 条上限（trimCalCache 泛型函数：先摘过期条目、仍超按写入时刻淘汰最旧一半）——只有 TTL 的按模型分桶 map，过期条目要等同模型再次访问才被覆盖，模型多样性大的部署（路由/评判放大模型名）会只涨不清。钉：TestTrimCalCache。
+  - **WAL 膨胀兜底**：notifySweepLoop 每分钟顺带看 WAL 体积，超 64MiB 做一次非阻塞 `wal_checkpoint(PASSIVE)`（wal_autocheckpoint 在长读事务占快照时会持续失效；TRUNCATE 会等读者，留给手动维护与备份前置）。
+  - **debug.FreeOSMemory**：Maintain/RunAutoRetention（保留批删/VACUUM/对账）之后把 Go 堆归还 OS——插件常驻宿主进程，大扫描产生的堆平时靠 GC 惰性回收、长驻 RSS 下不去；触发频率至多一天一次，单次 STW 代价可忽略。**GOMEMLIMIT 不设**：modernc sqlite page cache（写池 8MiB + 读池 5×2MiB）是 C 堆分配不受 Go GC 管，设了软限只会让 GC 空转。
+  - 测试种子坑：Windows time.Now() 粒度粗（约 0.5ms），同一循环内连造多个唯一 ID 用纳秒时间戳会撞 UNIQUE——用自增计数器。
+
 - **2026-09 性能批三（面板读路径 + 前端交互）**：
   - `/keys/candidates` 走 `store.ListKeyCandidates` 专用轻量查询（仅 kid+label）：此前 ListKeys 全列取回 2000 行 PluginKey 再逐行丢弃。前端配套：`loadKeyCandidates()` 会话级缓存（40-keys.js，用量页/实时页复用），`keyCandidateMap`（Map）替代对 2000 候选的线性 find，`refreshKeys` 开头失效缓存（密钥增删改后重拉）；70-system 的 `keyCandidates = r.items` 直赋值已改 `setKeyCandidates`/`loadKeyCandidates`——**勿再直赋 keyCandidates 变量，Map 会与列表失同步**。
   - `/reservations/accuracy` 加 service 层 60s TTL 缓存（`Service.ReservationAccuracy` + `resAccuracySnap`）：实时页 5s 轮询每次全量扫 2 万行算分位数，分位数本就钝化，与轮询解耦。钉：TestReservationAccuracyCached。面板读路径的「重查询 + 高频轮询」组合优先考虑服务端 TTL 缓存而非改前端频率。
