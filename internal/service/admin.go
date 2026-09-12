@@ -346,6 +346,31 @@ func (s *Service) Maintain(ctx context.Context, vacuum bool, actor string) (stor
 	return res, nil
 }
 
+// RunAutoRetention 执行保留清理与陈旧预占释放，供每日自动维护循环调用。
+// 与 Maintain（面板手动入口）的区别：不含 DedupeRequests（历史遗留行对账
+// 是低频兜底，全年窗口的自连接不适合逐日跑）也不含 VACUUM；审计留痕让
+// 自动清理的执行频次与删量在审计页可见。
+func (s *Service) RunAutoRetention(ctx context.Context) (store.RetentionResult, error) {
+	cfg := s.Config()
+	now := time.Now().UTC()
+	res, err := s.st.ApplyRetention(ctx, cfg.RetentionDays, cfg.AuditRetentionDays, now)
+	if err != nil {
+		return store.RetentionResult{}, err
+	}
+	if _, err := s.st.ReleaseStaleReservations(ctx, now.Add(-cfg.Quota.Stream.StaleReservationTimeout.Std())); err != nil {
+		return res, fmt.Errorf("释放陈旧预占失败（保留清理已完成）: %w", err)
+	}
+	_ = s.st.AppendAudit(ctx, store.AuditEvent{
+		Actor: "auto", Action: "system.auto_retention", EntityType: "system", EntityID: "retention",
+		Detail: map[string]any{
+			"retention_days": cfg.RetentionDays, "audit_retention_days": cfg.AuditRetentionDays,
+			"requests": res.Requests, "rollups": res.Rollups,
+			"reservations": res.Reservations, "audit": res.AuditEvents,
+		},
+	})
+	return res, nil
+}
+
 // Dedupe 单独执行历史重复行对账，供系统页「对账去重」按钮调用。
 // since 为零值时按保留期回溯。
 func (s *Service) Dedupe(ctx context.Context, since time.Time, actor string) (int, error) {

@@ -69,6 +69,8 @@ var runtimeState struct {
 	backupStop chan struct{}
 	// fxStop 关停汇率刷新 goroutine，同上。
 	fxStop chan struct{}
+	// retentionStop 关停每日自动保留清理 goroutine，同上。
+	retentionStop chan struct{}
 }
 
 type imageHold struct {
@@ -433,12 +435,14 @@ func cliproxyPluginShutdown() {
 	notifyStop := runtimeState.notifyStop
 	backupStop := runtimeState.backupStop
 	fxStop := runtimeState.fxStop
+	retentionStop := runtimeState.retentionStop
 	runtimeState.st = nil
 	runtimeState.svc = nil
 	runtimeState.api = nil
 	runtimeState.notifyStop = nil
 	runtimeState.backupStop = nil
 	runtimeState.fxStop = nil
+	runtimeState.retentionStop = nil
 	runtimeState.Unlock()
 	if notifyStop != nil {
 		close(notifyStop)
@@ -448,6 +452,9 @@ func cliproxyPluginShutdown() {
 	}
 	if fxStop != nil {
 		close(fxStop)
+	}
+	if retentionStop != nil {
+		close(retentionStop)
 	}
 	// 与 configure 同序：趁旧库仍可写先释放图片预占，再关库。
 	if svc != nil {
@@ -698,6 +705,10 @@ func configure(inline string) error {
 		close(runtimeState.fxStop)
 		runtimeState.fxStop = nil
 	}
+	if runtimeState.retentionStop != nil {
+		close(runtimeState.retentionStop)
+		runtimeState.retentionStop = nil
+	}
 	// 旧库已关、新库未开：失败路径必须把运行态整体置空，让后续请求拿到
 	// 干净的 service_unavailable，而不是对已关闭的库报错——后者会让
 	// usage.handle 的被动记录在 warn 日志之外静默丢失。
@@ -738,6 +749,9 @@ func configure(inline string) error {
 	fxStop := make(chan struct{})
 	runtimeState.fxStop = fxStop
 	go fxRefreshLoop(svc, fxStop)
+	retentionStop := make(chan struct{})
+	runtimeState.retentionStop = retentionStop
+	go autoRetentionLoop(svc, retentionStop)
 	if cfg.Backup.Enabled {
 		backupStop := make(chan struct{})
 		runtimeState.backupStop = backupStop
@@ -1640,6 +1654,53 @@ func fxRefreshLoop(svc *service.Service, stop <-chan struct{}) {
 			return
 		case <-ticker.C:
 			fire()
+		}
+	}
+}
+
+// autoRetentionLoop 每日一次自动执行保留清理（retention 批删 + 陈旧预占
+// 释放）。保留天数此前只有面板「维护」入口会真正执行：requests/
+// usage_rollups/audit_events 会一直涨过 retention_days，直到有人手动点
+// 维护。触发时刻固定在本地 5 点——备份默认 4 点，错开一档避免同时段
+// 双重写放大；启动时当天时刻已过且尚未执行则立即补一次（重启不漏当天）。
+// 不含 DedupeRequests：那是 v0.2.2 之前历史遗留行的对账兜底，全年窗口的
+// 自连接逐日跑代价不成比例，仍留在手动维护入口。仅租约持有者执行，
+// 多实例部署不重复删；只读实例不占当天名额，接管租约后照常补跑。
+func autoRetentionLoop(svc *service.Service, stop <-chan struct{}) {
+	const hour = 5
+	lastDay := ""
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	fire := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		res, err := svc.RunAutoRetention(ctx)
+		if err != nil {
+			log.Printf("cpa-usage-manager: 自动保留清理失败: %v", err)
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel2()
+			svc.NotifyErrorEvent(ctx2, "report", "自动保留清理失败: "+err.Error())
+			return
+		}
+		log.Printf("cpa-usage-manager: 自动保留清理完成: requests=%d rollups=%d reservations=%d audit=%d",
+			res.Requests, res.Rollups, res.Reservations, res.AuditEvents)
+	}
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			now := time.Now()
+			day := now.Format("2006-01-02")
+			if lastDay == day || now.Hour() < hour {
+				continue
+			}
+			lastDay = day
+			if svc.Store().Writable() {
+				fire()
+			} else {
+				lastDay = ""
+			}
 		}
 	}
 }
